@@ -16,6 +16,7 @@ package context
 import (
 	"fmt"
 	"math"
+	"sync/atomic"
 
 	"okhuman/internal/inject"
 	"okhuman/internal/types"
@@ -27,11 +28,13 @@ const SummaryMarker = "[历史总结]"
 // ToolResultMarker 孤儿 tool 降级 user 文本的前缀（与 8452 树一致，供对比）
 const ToolResultMarker = "[工具结果"
 
-// 全局注入解析器（server 包启动时 ConfigureInjectResolver；/reset 重建）
-var resolveInject *inject.Resolver
+// 全局注入解析器（server 包启动时 ConfigureInjectResolver；/reset 重建）。
+// 原子指针（2026-09-14 审计修：旧裸指针在 /inject 触发的压缩（读）与 /reset
+// 重建（写）并发时数据竞争）
+var resolveInject atomic.Pointer[inject.Resolver]
 
 // ConfigureInjectResolver 启动/重置时设置全局侧车解析器
-func ConfigureInjectResolver(r *inject.Resolver) { resolveInject = r }
+func ConfigureInjectResolver(r *inject.Resolver) { resolveInject.Store(r) }
 
 // ComposeOptions demote 模式（""=正常 / "newest"=只降最近注入 / "all"=全降）
 type ComposeOptions struct {
@@ -102,8 +105,8 @@ func resolveContentParts(parts []types.ContentPart, demote bool) []types.Content
 	for _, p := range parts {
 		if p.Type == "inject_ref" {
 			resolved := []types.ContentPart(nil)
-			if resolveInject != nil {
-				resolved = resolveInject.Resolve(p.Ref)
+			if r := resolveInject.Load(); r != nil {
+				resolved = r.Resolve(p.Ref)
 			}
 			if demote && resolved != nil {
 				out = append(out, types.ContentPart{Type: "text", Text: fmt.Sprintf("（附件 %s 本轮未发送，仅以文本提示保留）", p.Ref)})
@@ -200,13 +203,13 @@ func EstimateMessageTokens(m types.RawEntry, cpl float64) int {
 
 // ContextStats /health 的上下文统计
 type ContextStats struct {
-	Messages      int     `json:"messages"`
-	Summary       int     `json:"summary"`
-	MsgTokens     int     `json:"msg_tokens"`
-	SummaryTokens int     `json:"summary_tokens"`
-	TotalTokens   int     `json:"total_tokens"`
-	MsgChars      int     `json:"msg_chars"`
-	SummaryChars  int     `json:"summary_chars"`
+	Messages      int `json:"messages"`
+	Summary       int `json:"summary"`
+	MsgTokens     int `json:"msg_tokens"`
+	SummaryTokens int `json:"summary_tokens"`
+	TotalTokens   int `json:"total_tokens"`
+	MsgChars      int `json:"msg_chars"`
+	SummaryChars  int `json:"summary_chars"`
 }
 
 // ContextStatsOf 会话状态 → /health 统计

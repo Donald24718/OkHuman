@@ -13,7 +13,6 @@
 package server
 
 import (
-	"reflect"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -25,6 +24,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"okhuman/internal/agent"
@@ -70,24 +70,45 @@ type InjectInfo struct {
 	Note      *string `json:"note,omitempty"`
 }
 
+// agentRuntime CM/Agent/BG 三件套：/reset 整体重建，经 atomic.Pointer 原子换入
+// （2026-09-14 审计修：旧实现直接改 AgentState 字段——/inject 等不持运行锁的
+// HTTP 路径与 /reset 并发时读写同一字段 → 数据竞争，且注入消息可能落进已废弃
+// 的旧 CM 丢失）
+type agentRuntime struct {
+	CM    *ctxmgr.Manager
+	Agent *agent.Agent
+	BG    *background.BackgroundOrchestrator
+}
+
 // AgentState 单个 agent 的全部运行时状态（单实例）
 type AgentState struct {
-	Cfg            *config.Config
+	CfgRef         atomic.Pointer[config.Config] // 配置（COW：热更新生成新对象，旧对象不可变）
+	rt             atomic.Pointer[agentRuntime]  // 运行时三件套（/reset 原子换入）
 	PromptDir      string
-	LLMCfg         llm.ClientConfig // 当前 llm 客户端构造参数（热更新比对用）
 	LLM            llm.LlmClient
+	llmMu          sync.Mutex // 保护 LLM（配置热更重建写 / reset 读）
+	promptMu       sync.Mutex // 保护 SystemPrompt / PromptFiles / PromptFallback（提示词页重载写 / 只读端点读）
 	SystemPrompt   string
 	PromptFiles    []PromptFileInfo
 	PromptFallback bool
-	SessionNo      int
-	CM             *ctxmgr.Manager
-	Agent          *agent.Agent
+	SessionNo      atomic.Int32
 	Lock           *background.RunLock
-	BG             *background.BackgroundOrchestrator
 	logMu          sync.Mutex // 保护 CompressLog / DoomLog
 	CompressLog    []CompressLogEntry
 	DoomLog        []DoomLogEntry
 }
+
+// Cfg 当前配置（COW 读：拿到的是不可变对象，无需再锁）
+func (a *AgentState) Cfg() *config.Config { return a.CfgRef.Load() }
+
+// CM 当前上下文管理器（/reset 后指向新会话）
+func (a *AgentState) CM() *ctxmgr.Manager { return a.rt.Load().CM }
+
+// Agent 当前 agent 运行时（/reset 后指向新实例）
+func (a *AgentState) Agent() *agent.Agent { return a.rt.Load().Agent }
+
+// BG 当前后台编排器（/reset 后指向新实例）
+func (a *AgentState) BG() *background.BackgroundOrchestrator { return a.rt.Load().BG }
 
 // roundBuf 轮次事件缓冲（重放用）
 type roundBuf struct {
@@ -107,13 +128,22 @@ type drainResult struct {
 	Err   error
 }
 
+// subEntry 事件广播订阅（2026-09-14 审计修：带唯一 id——旧实现用
+// reflect.ValueOf(fn).Pointer() 判同，同一函数字面量产生的所有闭共享同一
+// 代码指针 → 任一 /events 连接断开时会把其他连接的订阅一并摘除）
+type subEntry struct {
+	ID uint64
+	Fn func(string)
+}
+
+var subSeq atomic.Uint64 // 订阅 id 发号器
+
 // AppState 单实例服务状态
 type AppState struct {
-	Cfg     *config.Config
-	Root    string // 项目根（webui 静态文件 / config/user.json 落盘用）
-	Agent   *AgentState
-	mu          sync.Mutex // 保护下面全部字段
-	BroadcastSubs []func(string)
+	Root          string // 项目根（webui 静态文件 / config/user.json 落盘用）
+	Agent         *AgentState
+	mu            sync.Mutex // 保护下面全部字段
+	BroadcastSubs []subEntry
 	MessageQueue  []string
 	ActiveDrain   *drainHandle
 	RoundBuf      *roundBuf
@@ -122,13 +152,13 @@ type AppState struct {
 	Injects       []InjectInfo
 }
 
-// NewAppState AppState 工厂（2026-08-31）：统一初始化事件广播集 + 消息队列 + 活动 drain + 轮次缓冲
+// NewAppState AppState 工厂（2026-08-31）：统一初始化事件广播集 + 消息队列 + 活动 drain + 轮次缓冲。
+// cfg 参数保留兼容（配置统一存于 AgentState.CfgRef）。
 func NewAppState(cfg *config.Config, root string, agent *AgentState) *AppState {
 	return &AppState{
-		Cfg:           cfg,
 		Root:          root,
 		Agent:         agent,
-		BroadcastSubs: []func(string){},
+		BroadcastSubs: []subEntry{},
 		MessageQueue:  []string{},
 		Injects:       []InjectInfo{},
 	}
@@ -141,35 +171,40 @@ func NewAppState(cfg *config.Config, root string, agent *AgentState) *AppState {
 // （入口恢复落盘状态用）。
 func CreateAgentState(cfg *config.Config, client llm.LlmClient, systemPrompt string, promptFiles []PromptFileInfo, promptFallback bool, promptDir string) *AgentState {
 	a := &AgentState{
-		Cfg:            cfg,
 		PromptDir:      promptDir,
-		LLMCfg:         llmCfgOf(cfg.LLM),
 		LLM:            client,
 		SystemPrompt:   systemPrompt,
 		PromptFiles:    promptFiles,
 		PromptFallback: promptFallback,
-		SessionNo:      1,
 		Lock:           background.NewRunLock(),
 		CompressLog:    []CompressLogEntry{},
 		DoomLog:        []DoomLogEntry{},
 	}
-	a.CM = makeCm(a)
-	a.Agent = agent.New(client, systemPrompt, a.CM)
-	a.BG = background.NewOrchestrator()
+	a.CfgRef.Store(cfg)
+	a.SessionNo.Store(1)
+	cm := makeCm(a)
+	a.rt.Store(&agentRuntime{CM: cm, Agent: agent.New(client, systemPrompt, cm), BG: background.NewOrchestrator()})
 	return a
 }
 
 // makeCm 建 ContextManager（落盘根 = 本实例目录，已含端口后缀：
 // session-records / tool-results 与 session.json 同处一个目录）
 func makeCm(a *AgentState) *ctxmgr.Manager {
-	m := ctxmgr.NewManager(a.LLM, ctxmgr.Cfg{
-		MaxTokens:       a.Cfg.Context.MaxTokens,
-		KeepRecentChars: a.Cfg.Context.KeepRecentChars,
-		HardTruncChars:  a.Cfg.Context.HardTruncChars,
-		StreamIdleMS:    a.Cfg.Context.StreamIdleMS,
-		CharsPerToken:   a.Cfg.Context.CharsPerToken,
-	}, a.SystemPrompt, a.Cfg.Data.Dir)
-	m.SetSessionNo(a.SessionNo)
+	cfg := a.Cfg()
+	a.llmMu.Lock()
+	client := a.LLM
+	a.llmMu.Unlock()
+	a.promptMu.Lock()
+	sp := a.SystemPrompt
+	a.promptMu.Unlock()
+	m := ctxmgr.NewManager(client, ctxmgr.Cfg{
+		MaxTokens:       cfg.Context.MaxTokens,
+		KeepRecentChars: cfg.Context.KeepRecentChars,
+		HardTruncChars:  cfg.Context.HardTruncChars,
+		StreamIdleMS:    cfg.Context.StreamIdleMS,
+		CharsPerToken:   cfg.Context.CharsPerToken,
+	}, sp, cfg.Data.Dir)
+	m.SetSessionNo(int(a.SessionNo.Load()))
 	m.AddCompressListener(func(e ctxmgr.CompressEvent) { pushCompressLog(a, e) })
 	return m
 }
@@ -196,11 +231,12 @@ func pushCompressLog(a *AgentState, e ctxmgr.CompressEvent) {
 
 // runOpt 本实例的 run 选项（用户消息 / 插件经 POST /chat 触发共用；每轮现取最新配置）
 func runOpt(a *AgentState, state *AppState) agent.RunOptions {
+	cfg := a.Cfg()
 	return agent.RunOptions{
-		DataDir:       a.Cfg.Data.Dir,
-		ResultLimit:   a.Cfg.Tools.ResultLimit,
-		DoomWarnAfter: a.Cfg.Doom.WarnAfter,
-		FgTimeoutMS:   a.Cfg.Tools.FgTimeoutMS,
+		DataDir:       cfg.Data.Dir,
+		ResultLimit:   cfg.Tools.ResultLimit,
+		DoomWarnAfter: cfg.Doom.WarnAfter,
+		FgTimeoutMS:   cfg.Tools.FgTimeoutMS,
 		// 轮内搭车（2026-09-14 统一）：与 drain（runDrain）共享同一队列、splice 原子取走，
 		// 携带用户追加消息 + 已 settle 后台任务的通知（同一队列、同一逻辑）。
 		// 安全：本回调只在 lock.Run 内被调用（runLoop 持锁），drain 的下一轮
@@ -217,13 +253,14 @@ func runOpt(a *AgentState, state *AppState) agent.RunOptions {
 			// 与用户追加消息同一队列、同一逻辑）。闭包按引用捕获 a/state，
 			// /reset 后自然指向新 agent/配置。
 			bg.OnSettled = func(t *types.PendingBackgroundTask) {
-				notice := a.Agent.FormatBackgroundNotice(t, agent.RunOptions{
-					ResultLimit: a.Cfg.Tools.ResultLimit,
-					DataDir:     a.Cfg.Data.Dir,
+				cfg := a.Cfg()
+				notice := a.Agent().FormatBackgroundNotice(t, agent.RunOptions{
+					ResultLimit: cfg.Tools.ResultLimit,
+					DataDir:     cfg.Data.Dir,
 				})
 				_, _ = enqueueAndWake(state, a, notice, makeOnEvent(state, a))
 			}
-			a.BG.OnBackgroundStart(bg)
+			a.BG().OnBackgroundStart(bg)
 		},
 	}
 }
@@ -239,19 +276,24 @@ func runBatch(a *AgentState, opt agent.RunOptions, message, kind string, label *
 			opt.Messages = messages
 		}
 	}
-	return a.Agent.Run(context.Background(), message, opt)
+	return a.Agent().Run(context.Background(), message, opt)
 }
 
 // broadcastEvent 广播一条事件给所有 SSE 订阅者（/events 常驻通道）。
 // 每个订阅者独立隔离——某个慢客户端写失败不影响其他订阅者。
 // 同时维护"轮次缓冲"（roundBuf）：run_start→run_end 的帧逐条记录，
 // 新订阅者连上且正在跑时重放（见 /events），刷新后不丢已流出内容。
+// maxRoundFrames 轮次缓冲帧数上限（2026-09-14 审计修：旧实现无界，超长 run
+// 的 delta 帧可把内存撑大；超限后停止追加——实时流不受影响，仅新连接重放
+// 不完整）
+const maxRoundFrames = 100000
+
 func broadcastEvent(state *AppState, e types.AgentEvent) {
 	if e["type"] == "run_start" {
 		state.mu.Lock()
 		idx := state.RunSeq + 1
 		state.RunSeq = idx
-		session := state.Agent.SessionNo
+		session := int(state.Agent.SessionNo.Load())
 		e["session"] = session
 		e["index"] = idx
 		state.mu.Unlock()
@@ -264,19 +306,19 @@ func broadcastEvent(state *AppState, e types.AgentEvent) {
 	if e["type"] == "run_start" {
 		// 注：run_msg 帧（本轮 user 消息文本）天然进缓冲——重放时随帧补发，
 		// 刷新后"在跑那轮"的 user 气泡不丢，无需额外重建。
-		state.RoundBuf = &roundBuf{Round: state.Agent.SessionNo, Frames: []string{payload}}
-	} else if state.RoundBuf != nil {
+		state.RoundBuf = &roundBuf{Round: int(state.Agent.SessionNo.Load()), Frames: []string{payload}}
+	} else if state.RoundBuf != nil && len(state.RoundBuf.Frames) < maxRoundFrames {
 		state.RoundBuf.Frames = append(state.RoundBuf.Frames, payload)
 	}
-	subs := append([]func(string){}, state.BroadcastSubs...)
+	subs := append([]subEntry(nil), state.BroadcastSubs...)
 	state.mu.Unlock()
 	if len(subs) == 0 {
 		return
 	}
-	for _, w := range subs {
+	for _, s := range subs {
 		func() {
 			defer func() { _ = recover() }() // 订阅者写失败：由其对端断开清理
-			w(payload)
+			s.Fn(payload)
 		}()
 	}
 }
@@ -328,7 +370,26 @@ func enqueueAndWake(state *AppState, a *AgentState, msg string, onEvent func(typ
 	state.mu.Unlock()
 	go func() {
 		defer close(h.done)
-		reply, ms, err := runDrain(state, a, h, onEvent)
+		// run 内部 panic 隔离（2026-09-14 审计修：旧实现 panic 直接崩掉整个
+		// HTTP 进程；现在转成错误结果——消息队列保留、下次入口重试，ActiveDrain
+		// 同步摘除避免后续入队挂在死 handle 上）
+		reply, ms, err := func() (string, int64, error) {
+			var r2 string
+			var m2 int64
+			var innerErr error
+			defer func() {
+				if r := recover(); r != nil {
+					state.mu.Lock()
+					if state.ActiveDrain == h {
+						state.ActiveDrain = nil
+					}
+					state.mu.Unlock()
+					innerErr = fmt.Errorf("run panic（已隔离，消息队列保留待重试）：%v", r)
+				}
+			}()
+			r2, m2, innerErr = runDrain(state, a, h, onEvent)
+			return r2, m2, innerErr
+		}()
 		h.res = drainResult{Reply: reply, MS: ms, Err: err}
 		if err != nil {
 			// 错误广播只在此处发生一次（drain 层，2026-08-31 修）：多个入口
@@ -340,7 +401,7 @@ func enqueueAndWake(state *AppState, a *AgentState, msg string, onEvent func(typ
 }
 
 // assembleBatch 把 drain 一批内积攒的全部消息组装成发给 LLM 的用户消息
-//（2026-09-14 从 runDrain 提出，便于单测）：1 条 = 该条本身（kind=user，
+// （2026-09-14 从 runDrain 提出，便于单测）：1 条 = 该条本身（kind=user，
 // 不加前缀）；>1 条 = 合并成一条【第 1 条】…【第 2 条】…（kind=merged，
 // label "N 条合并 / M 字符"）。这是「无车」新轮路径的组装；「有车」轮内
 // 搭车走 agent 的 TakePendingUsers，每条独立成 user 消息，不经过本函数。
@@ -368,33 +429,41 @@ func runDrain(state *AppState, a *AgentState, h *drainHandle, onEvent func(types
 	started := time.Now()
 	var reply string
 	for {
-		state.mu.Lock()
-		msgs := state.MessageQueue
-		state.MessageQueue = nil
-		if len(msgs) == 0 {
-			// 队列空且无并发入队（同一把锁）→ 本 drain 完成
-			if state.ActiveDrain == h {
-				state.ActiveDrain = nil
+		var msgs []string
+		var batchErr error
+		// splice + 发送在 RunLock 内原子完成（2026-09-14 审计 H1 修）：/reset 也持同一
+		// 锁清队列+重建 → 两者互斥——要么整批在 reset 前跑完（旧会话），要么 reset
+		// 已清空队列、本 drain 见空即退，不存在"splice 出的旧消息跑上新会话"的窗口。
+		// 锁序 RunLock→state.mu 与 enqueueAndWake（仅 state.mu）无环。
+		a.Lock.Run(func() error {
+			state.mu.Lock()
+			msgs = state.MessageQueue
+			state.MessageQueue = nil
+			if len(msgs) == 0 && state.ActiveDrain == h {
+				state.ActiveDrain = nil // 与 enqueueAndWake 同一把锁内摘除 → 无竞态窗口
 			}
 			state.mu.Unlock()
-			break // 防御：空队列不发 LLM 调用
-		}
-		state.mu.Unlock()
-		message, kind, label, messages := assembleBatch(msgs)
-		err := a.Lock.Run(func() error {
+			if len(msgs) == 0 {
+				return nil // 防御：空队列不发 LLM 调用
+			}
+			message, kind, label, messages := assembleBatch(msgs)
 			r, err := runBatch(a, runOpt(a, state), message, kind, label, messages, onEvent)
 			if err == nil {
 				reply = r
 			}
+			batchErr = err
 			return err
 		})
-		if err != nil {
+		if len(msgs) == 0 {
+			break // 空队列（ActiveDrain 已在锁内摘除）→ 本 drain 完成
+		}
+		if batchErr != nil {
 			state.mu.Lock()
 			if state.ActiveDrain == h {
 				state.ActiveDrain = nil
 			}
 			state.mu.Unlock()
-			return reply, time.Since(started).Milliseconds(), err
+			return reply, time.Since(started).Milliseconds(), batchErr
 		}
 	}
 	return reply, time.Since(started).Milliseconds(), nil
@@ -417,7 +486,7 @@ type PatchResult struct {
 //	需重启的段：server / data / system_prompt。
 //
 // 返回 { applied: 即时生效的段, restart: 需要重启才生效的段 }。
-func applyConfigPatch(cfg *config.Config, patch map[string]interface{}, a *AgentState) PatchResult {
+func applyConfigPatch(a *AgentState, patch map[string]interface{}) PatchResult {
 	applied := []string{}
 	restart := []string{}
 	has := func(s string) bool { _, ok := patch[s]; return ok }
@@ -444,32 +513,30 @@ func applyConfigPatch(cfg *config.Config, patch map[string]interface{}, a *Agent
 		applied = append(applied, "doom（死循环告警阈值，下轮运行生效）")
 	}
 
-	// 深合并进全局活对象（loadConfig 返回的对象即全局引用）；
-	// 单实例下 a.cfg 与全局同一引用，合并后本实例自动同步。
-	config.ApplyPatchInPlace(cfg, patch)
-
-	// llm 段：参数变化 → 重建客户端（agent 主循环 + 压缩共用同一实例）
-	if has("llm") {
-		nc := cfg.LLM
-		if nc.BaseURL != a.LLMCfg.BaseURL || nc.Model != a.LLMCfg.Model ||
-			nc.APIKey != a.LLMCfg.APIKey || nc.TimeoutMS != a.LLMCfg.TimeoutMS {
-			client := llm.NewOpenAiClient(llmCfgOf(nc))
-			a.LLM = client
-			a.LLMCfg = llmCfgOf(nc)
-			a.Agent.SetLLM(client)
-			a.CM.SetLLM(client)
-		}
+	// COW 热更新（2026-09-14 审计修：旧实现 ApplyPatchInPlace 原地改共享
+	// *Config——runOpt / 只读端点的并发读与写入数据竞争，字符串字段撕裂读可
+	// 致崩溃）：DeepMerge 生成全新不可变 Config，先更新从属对象（LLM 客户端 /
+	// 压缩参数），最后原子换入 CfgRef——读方要么拿旧配置要么拿新配置，完整一致。
+	old := a.Cfg()
+	nc := config.DeepMerge(old, patch)
+	if has("llm") && llmCfgOf(nc.LLM) != llmCfgOf(old.LLM) {
+		client := llm.NewOpenAiClient(llmCfgOf(nc.LLM))
+		a.llmMu.Lock()
+		a.LLM = client
+		a.llmMu.Unlock()
+		a.Agent().SetLLM(client)
+		a.CM().SetLLM(client)
 	}
-	// context 段：压缩参数热更新
 	if has("context") {
-		a.CM.SetCfg(ctxmgr.Cfg{
-			MaxTokens:       cfg.Context.MaxTokens,
-			KeepRecentChars: cfg.Context.KeepRecentChars,
-			HardTruncChars:  cfg.Context.HardTruncChars,
-			StreamIdleMS:    cfg.Context.StreamIdleMS,
-			CharsPerToken:   cfg.Context.CharsPerToken,
+		a.CM().SetCfg(ctxmgr.Cfg{
+			MaxTokens:       nc.Context.MaxTokens,
+			KeepRecentChars: nc.Context.KeepRecentChars,
+			HardTruncChars:  nc.Context.HardTruncChars,
+			StreamIdleMS:    nc.Context.StreamIdleMS,
+			CharsPerToken:   nc.Context.CharsPerToken,
 		})
 	}
+	a.CfgRef.Store(nc)
 	// tools / doom 段：由 runOpt 每轮现取，无需动作
 	return PatchResult{Applied: dedupe(applied), Restart: dedupe(restart)}
 }
@@ -489,6 +556,11 @@ func dedupe(xs []string) []string {
 // reloadAgentPrompt 加载提示词（WebUI 提示词页重载用）：
 // 目录取自 a.PromptDir；无目录 → 保持现状（fallback 内置提示词）。
 func reloadAgentPrompt(a *AgentState) prompt.Loaded {
+	// promptMu 全程持锁（2026-09-14 审计修：SystemPrompt / PromptFiles /
+	// PromptFallback 与只读端点（/status /prompts）的并发读竞态；重载含读盘
+	// 阻塞，持锁时间略长但可接受——提示词页低频操作）
+	a.promptMu.Lock()
+	defer a.promptMu.Unlock()
 	if a.PromptDir == "" {
 		files := make([]prompt.File, 0, len(a.PromptFiles))
 		for _, f := range a.PromptFiles {
@@ -502,8 +574,8 @@ func reloadAgentPrompt(a *AgentState) prompt.Loaded {
 		a.SystemPrompt = r.Prompt
 		a.PromptFiles = nil
 		a.PromptFallback = true
-		a.CM.SetSystemPrompt(r.Prompt)
-		a.Agent.SetSystemPrompt(r.Prompt)
+		a.CM().SetSystemPrompt(r.Prompt)
+		a.Agent().SetSystemPrompt(r.Prompt)
 		return r
 	}
 	var mdNames []string
@@ -534,8 +606,8 @@ func reloadAgentPrompt(a *AgentState) prompt.Loaded {
 	a.SystemPrompt = p
 	a.PromptFiles = files
 	a.PromptFallback = fallback
-	a.CM.SetSystemPrompt(p)
-	a.Agent.SetSystemPrompt(p)
+	a.CM().SetSystemPrompt(p)
+	a.Agent().SetSystemPrompt(p)
 	pfiles := make([]prompt.File, 0, len(files))
 	for _, f := range files {
 		pfiles = append(pfiles, prompt.File{Name: f.Name, Chars: f.Chars})
@@ -555,7 +627,7 @@ type Hooks struct {
 type App struct {
 	state    *AppState
 	hooks    *Hooks
-	resolver *inject.Resolver
+	resolver atomic.Pointer[inject.Resolver] // /drop 清缓存（读）与 /reset 重建（写）并发时原子安全（2026-09-14 审计修）
 }
 
 // New 构建单实例应用。
@@ -580,8 +652,9 @@ func (ap *App) reconfigureResolver() {
 		ap.state.Injects = kept
 		ap.state.mu.Unlock()
 	}
-	ap.resolver = inject.NewResolver(filepath.Join(ap.state.Agent.Cfg.Data.Dir, "inject"), onFail)
-	ctxmgr.ConfigureInjectResolver(ap.resolver)
+	res := inject.NewResolver(filepath.Join(ap.state.Agent.Cfg().Data.Dir, "inject"), onFail)
+	ap.resolver.Store(res)
+	ctxmgr.ConfigureInjectResolver(res)
 }
 
 // ServeHTTP 路由（与 TS 端点全集一一对应）
@@ -643,11 +716,13 @@ func (ap *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (ap *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 	a := ap.state.Agent
+	cfg := a.Cfg()
+	sess := a.CM().Session()
 	writeJSON(w, 200, map[string]interface{}{
 		"ok":      true,
-		"session": a.SessionNo,
-		"context": ctxmgr.ContextStatsOf(a.CM.Session(), a.Cfg.Context.CharsPerToken),
-		"llm":     a.Cfg.LLM.BaseURL,
+		"session": int(a.SessionNo.Load()),
+		"context": ctxmgr.ContextStatsOf(sess, cfg.Context.CharsPerToken),
+		"llm":     cfg.LLM.BaseURL,
 	})
 }
 
@@ -656,7 +731,8 @@ func (ap *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 	ap.state.mu.Lock()
 	running := a.Lock.Running() || ap.state.ActiveDrain != nil
 	ap.state.mu.Unlock()
-	sess := a.CM.Session()
+	cfg := a.Cfg()
+	sess := a.CM().Session()
 	a.logMu.Lock()
 	compress := lastN(a.CompressLog, 20)
 	doom := lastN(a.DoomLog, 10)
@@ -705,7 +781,7 @@ func (ap *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	bgs := make([]map[string]interface{}, 0)
-	for _, t := range a.BG.Snapshot() {
+	for _, t := range a.BG().Snapshot() {
 		bgs = append(bgs, map[string]interface{}{
 			"call_id":     t.CallID,
 			"tool":        t.ToolName,
@@ -716,15 +792,21 @@ func (ap *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	a.promptMu.Lock()
+	fallback := a.PromptFallback
+	files := append([]PromptFileInfo(nil), a.PromptFiles...)
+	spChars := utf16Len(a.SystemPrompt)
+	a.promptMu.Unlock()
+
 	writeJSON(w, 200, map[string]interface{}{
-		"session": a.SessionNo,
+		"session": int(a.SessionNo.Load()),
 		"running": running,
 		"system_prompt": map[string]interface{}{
-			"fallback": a.PromptFallback,
-			"files":    a.PromptFiles,
-			"chars":    utf16Len(a.SystemPrompt),
+			"fallback": fallback,
+			"files":    files,
+			"chars":    spChars,
 		},
-		"context":     ctxmgr.ContextStatsOf(sess, a.Cfg.Context.CharsPerToken),
+		"context":     ctxmgr.ContextStatsOf(sess, cfg.Context.CharsPerToken),
 		"compress":    compress,
 		"doom":        doom,
 		"backgrounds": bgs,
@@ -739,9 +821,12 @@ func (ap *App) handleQueue(w http.ResponseWriter, r *http.Request) {
 	queued := append([]string(nil), ap.state.MessageQueue...)
 	running := a.Lock.Running() || ap.state.ActiveDrain != nil
 	ap.state.mu.Unlock()
+	// 快照取一次（2026-09-14 审计修：旧代码每次迭代都调 Session() 取活引用，
+	// 两次取值可能不一致——压缩删消息时索引越界 panic）
+	sess := a.CM().Session()
 	userSeq := 0
-	for i := range a.CM.Session().Messages {
-		if a.CM.Session().Messages[i].Role == "user" {
+	for i := range sess.Messages {
+		if sess.Messages[i].Role == "user" {
 			userSeq++
 		}
 	}
@@ -750,7 +835,7 @@ func (ap *App) handleQueue(w http.ResponseWriter, r *http.Request) {
 
 func (ap *App) handleHistory(w http.ResponseWriter, r *http.Request) {
 	a := ap.state.Agent
-	sess := a.CM.Session()
+	sess := a.CM().Session()
 	entries := make([]map[string]interface{}, 0, len(sess.Messages))
 	for i := range sess.Messages {
 		e := &sess.Messages[i]
@@ -770,13 +855,13 @@ func (ap *App) handleHistory(w http.ResponseWriter, r *http.Request) {
 	if s := sess.Summary; s != nil {
 		summary = s.Content
 	}
-	writeJSON(w, 200, map[string]interface{}{"session": a.SessionNo, "summary": summary, "entries": entries})
+	writeJSON(w, 200, map[string]interface{}{"session": int(a.SessionNo.Load()), "summary": summary, "entries": entries})
 }
 
 func (ap *App) handleBackgrounds(w http.ResponseWriter, r *http.Request) {
 	a := ap.state.Agent
 	tasks := make([]map[string]interface{}, 0)
-	for _, t := range a.BG.Snapshot() {
+	for _, t := range a.BG().Snapshot() {
 		tasks = append(tasks, map[string]interface{}{
 			"call_id":      t.CallID,
 			"tool":         t.ToolName,
@@ -789,7 +874,7 @@ func (ap *App) handleBackgrounds(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]interface{}{
 		"running": a.Lock.Running(),
-		"count":   a.BG.Count(),
+		"count":   a.BG().Count(),
 		"tasks":   tasks,
 	})
 }
@@ -934,16 +1019,17 @@ func (ap *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 	a := ap.state.Agent
 	conn := newSSE(w)
 	conn.heartbeat()
+	subID := subSeq.Add(1)
 	sub := func(payload string) { conn.write(payload) }
 	ap.state.mu.Lock()
 	// 订阅：每次广播回调里直接写本连接（broadcastEvent 逐个 recover 隔离）
-	ap.state.BroadcastSubs = append(ap.state.BroadcastSubs, sub)
+	ap.state.BroadcastSubs = append(ap.state.BroadcastSubs, subEntry{ID: subID, Fn: sub})
 	// 连接建立即报当前状态（前端据此对齐：running + 排队消息全文 + 后台任务数）。
 	// queued 带全文：刷新/重开/重连后前端据此补显"排队中"气泡（与历史去重）。
 	queued := append([]string(nil), ap.state.MessageQueue...)
 	running := a.Lock.Running() || ap.state.ActiveDrain != nil
-	session := a.SessionNo
-	bgPending := a.BG.Count()
+	session := int(a.SessionNo.Load())
+	bgPending := a.BG().Count()
 	var replay []string
 	// 重放：仅当正在跑时，补发当前轮已流出的帧。空闲时不重放——已完成的
 	// 轮次由前端 /history 加载，重放会重复出气泡。只重放 round=当前 session 的缓冲。
@@ -963,11 +1049,10 @@ func (ap *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// 连接挂着直到对端断开 → 清订阅、停心跳
 	<-r.Context().Done()
 	ap.state.mu.Lock()
-		subPtr := reflect.ValueOf(sub).Pointer()
 	kept := ap.state.BroadcastSubs[:0]
-	for _, f := range ap.state.BroadcastSubs {
-		if reflect.ValueOf(f).Pointer() != subPtr {
-			kept = append(kept, f)
+	for _, s := range ap.state.BroadcastSubs {
+		if s.ID != subID {
+			kept = append(kept, s)
 		}
 	}
 	ap.state.BroadcastSubs = kept
@@ -1021,9 +1106,11 @@ func validateContentParts(v interface{}) []types.ContentPart {
 // sessionHasInjectRef inject_ref 是否仍在会话里（2026-09-12）：在 = 侧车必须保留
 // （KV 前缀稳定）；不在 = 已被压缩吃掉，清掉安全（无匹配断）。
 func sessionHasInjectRef(cm *ctxmgr.Manager, id string) bool {
-	for i := range cm.Session().Messages {
-		e := &cm.Session().Messages[i]
-		for _, p := range types.AsParts(e.Content) {
+	// 快照取一次（2026-09-14 审计修：旧代码每行调两次 Session() 取活引用，
+	// 两次不一致时索引越界 panic）
+	msgs := cm.Session().Messages
+	for i := range msgs {
+		for _, p := range types.AsParts(msgs[i].Content) {
 			if p.Type == "inject_ref" && p.Ref == id {
 				return true
 			}
@@ -1043,25 +1130,29 @@ func (ap *App) handleInject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a := ap.state.Agent
-	dir := filepath.Join(a.Cfg.Data.Dir, "inject")
+	dir := filepath.Join(a.Cfg().Data.Dir, "inject")
+	// 先无锁扫描（2026-09-14 审计修：旧实现在 state.mu 内调 sessionHasInjectRef
+	// （取 cm.mu）→ 锁序 state.mu→cm.mu；而 compose 侧 resolve 失败回调是
+	// cm.mu→state.mu → 反向锁序，并发 /inject 与在飞 run 可死锁。现在扫描
+	// 全程不持 state.mu，两个方向都断）
+	ap.state.mu.Lock()
+	pending := append([]InjectInfo(nil), ap.state.Injects...)
+	ap.state.mu.Unlock()
+	kept := make([]InjectInfo, 0, len(pending))
+	for _, x := range pending {
+		if sessionHasInjectRef(a.CM(), x.ID) {
+			kept = append(kept, x)
+		} else {
+			// 预算修复（2026-09-12 破案）：只清"会话里已无引用"的侧车（被压缩吃掉的）
+			inject.DropInjectFile(dir, x.ID)
+		}
+	}
 	ap.state.mu.Lock()
 	ap.state.InjectSeq++
 	id := fmt.Sprintf("inj-%d", ap.state.InjectSeq)
-	// 预算修复（2026-09-12 破案）：只清"会话里已无引用"的侧车（被压缩吃掉的）。
-	for _, inj := range ap.state.Injects {
-		if !sessionHasInjectRef(a.CM, inj.ID) {
-			inject.DropInjectFile(dir, inj.ID)
-		}
-	}
-	kept := ap.state.Injects[:0]
-	for _, x := range ap.state.Injects {
-		if sessionHasInjectRef(a.CM, x.ID) {
-			kept = append(kept, x)
-		}
-	}
 	ap.state.Injects = kept
-	overLimit := len(ap.state.Injects) > INJECT_MAX
-	n := len(ap.state.Injects)
+	overLimit := len(kept) > INJECT_MAX
+	n := len(kept)
 	ap.state.mu.Unlock()
 	if overLimit {
 		fmt.Fprintf(os.Stderr, "[inject] 活跃附件 %d 超软上限 %d（引用仍在会话，保留不清）\n", n, INJECT_MAX)
@@ -1088,7 +1179,7 @@ func (ap *App) handleInject(w http.ResponseWriter, r *http.Request) {
 	if notePtr != nil && *notePtr != "" {
 		label = *notePtr
 	}
-	a.CM.AddMessage(&types.RawEntry{
+	a.CM().AddMessage(&types.RawEntry{
 		Role: "user",
 		Content: []types.ContentPart{
 			{Type: "text", Text: "[okattach] " + label},
@@ -1108,7 +1199,13 @@ func (ap *App) handleDrop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a := ap.state.Agent
-	ok := inject.DropInjectFile(filepath.Join(a.Cfg.Data.Dir, "inject"), id)
+	ok := inject.DropInjectFile(filepath.Join(a.Cfg().Data.Dir, "inject"), id)
+	// 清解析器缓存（2026-09-14 审计修：旧实现只删侧车文件不清缓存——已 resolve
+	// 过的附件 /drop 后下一轮 compose 仍从缓存取到真实 parts，"已删附件"持续
+	// 注入直到进程重启）
+	if res := ap.resolver.Load(); res != nil {
+		res.ClearCache(id)
+	}
 	ap.state.mu.Lock()
 	kept := ap.state.Injects[:0]
 	for _, x := range ap.state.Injects {
@@ -1132,29 +1229,47 @@ func (ap *App) handleAttachments(w http.ResponseWriter, r *http.Request) {
 
 func (ap *App) handleReset(w http.ResponseWriter, r *http.Request) {
 	a := ap.state.Agent
-	a.SessionNo++
-	ap.state.mu.Lock()
-	ap.state.MessageQueue = nil    // 未发消息随会话清除（2026-08-31）
-	ap.state.Injects = nil         // 上下文注入附件随会话清除（2026-09-11）
-	ap.state.InjectSeq = 0
-	ap.state.RoundBuf = nil        // 轮次事件缓冲随会话清除（重放不再带旧轮）
-	ap.state.RunSeq = 0            // 会话内轮次计数随会话清除（新会话从 1 重新计）
-	ap.state.mu.Unlock()
-	a.logMu.Lock()
-	a.CompressLog = nil
-	a.DoomLog = nil
-	a.logMu.Unlock()
-	a.BG.Clear() // 未完成后台任务随会话清除
-	ap.resolver.ClearCache("")
-	_ = os.RemoveAll(filepath.Join(a.Cfg.Data.Dir, "inject"))
-	ap.reconfigureResolver()
-	a.CM = makeCm(a)
-	a.Agent = agent.New(a.LLM, a.SystemPrompt, a.CM)
-	a.BG = background.NewOrchestrator()
-	if ap.hooks != nil && ap.hooks.OnSessionRebuilt != nil {
-		ap.hooks.OnSessionRebuilt(a)
-	}
-	writeJSON(w, 200, map[string]interface{}{"ok": true, "session": a.SessionNo})
+	// 审计 H1 修（2026-09-14）：旧代码不持运行锁直接换 CM/Agent/BG——run 在飞时
+	// 会留一个 zombie run 继续在旧 CM 上跑完，其落盘闭包读到已 +1 的 SessionNo →
+	// 旧会话内容以新会话号写进 session.json（污染）。现在：先 Stop() 中断在飞
+	// LLM 流（partial 保留、本轮立即收尾），重建整体包进 Lock.Run——与在飞 run
+	// 互斥，等当前轮完全结束后才原子换运行时（在飞的是长工具时最长等其结束）。
+	a.Agent().Stop()
+	a.Lock.Run(func() error {
+		a.SessionNo.Add(1)
+		ap.state.mu.Lock()
+		ap.state.MessageQueue = nil // 未发消息随会话清除（2026-08-31）
+		ap.state.Injects = nil      // 上下文注入附件随会话清除（2026-09-11）
+		ap.state.InjectSeq = 0
+		ap.state.RoundBuf = nil // 轮次事件缓冲随会话清除（重放不再带旧轮）
+		ap.state.RunSeq = 0     // 会话内轮次计数随会话清除（新会话从 1 重新计）
+		ap.state.mu.Unlock()
+		a.logMu.Lock()
+		a.CompressLog = nil
+		a.DoomLog = nil
+		a.logMu.Unlock()
+		a.BG().Clear() // 未完成后台任务随会话清除（旧编排器随后整体废弃）
+		if res := ap.resolver.Load(); res != nil {
+			res.ClearCache("")
+		}
+		_ = os.RemoveAll(filepath.Join(a.Cfg().Data.Dir, "inject"))
+		ap.reconfigureResolver()
+		// 重建三件套并整体原子换入（2026-09-14 审计修：/inject 等不持运行锁的
+		// 路径经 CM()/Agent()/BG() 访问器取当前运行时，换入后自动指向新会话）
+		a.llmMu.Lock()
+		client := a.LLM
+		a.llmMu.Unlock()
+		a.promptMu.Lock()
+		sp := a.SystemPrompt
+		a.promptMu.Unlock()
+		newCM := makeCm(a)
+		a.rt.Store(&agentRuntime{CM: newCM, Agent: agent.New(client, sp, newCM), BG: background.NewOrchestrator()})
+		if ap.hooks != nil && ap.hooks.OnSessionRebuilt != nil {
+			ap.hooks.OnSessionRebuilt(a)
+		}
+		return nil
+	})
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "session": int(a.SessionNo.Load())})
 }
 
 // ---------- /stop：中断当前 LLM 输出（2026-08-29） ----------
@@ -1162,7 +1277,7 @@ func (ap *App) handleReset(w http.ResponseWriter, r *http.Request) {
 // 若正处工具执行中，本轮跑完工具后在下次 LLM 调用前强停。已生成的增量内容
 // 保留进会话（partial 收尾），不会丢。
 func (ap *App) handleStop(w http.ResponseWriter, r *http.Request) {
-	ap.state.Agent.Agent.Stop()
+	ap.state.Agent.Agent().Stop()
 	writeJSON(w, 200, map[string]interface{}{"ok": true})
 }
 
@@ -1170,16 +1285,21 @@ func (ap *App) handleStop(w http.ResponseWriter, r *http.Request) {
 
 func (ap *App) handlePrompts(w http.ResponseWriter, r *http.Request) {
 	a := ap.state.Agent
+	a.promptMu.Lock()
 	var dir interface{}
 	if a.PromptDir != "" {
 		dir = a.PromptDir
 	}
+	fallback := a.PromptFallback
+	files := append([]PromptFileInfo(nil), a.PromptFiles...)
+	sp := a.SystemPrompt
+	a.promptMu.Unlock()
 	writeJSON(w, 200, map[string]interface{}{
 		"dir":      dir,
-		"fallback": a.PromptFallback,
-		"files":    a.PromptFiles,
-		"chars":    utf16Len(a.SystemPrompt),
-		"prompt":   a.SystemPrompt,
+		"fallback": fallback,
+		"files":    files,
+		"chars":    utf16Len(sp),
+		"prompt":   sp,
 	})
 }
 
@@ -1223,10 +1343,12 @@ func (ap *App) handlePromptsFilePost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		reloadAgentPrompt(a)
+		a.promptMu.Lock() // 2026-09-14 审计修：PromptFiles 读取与并发重载互斥
 		names := make([]string, 0, len(a.PromptFiles))
 		for _, f := range a.PromptFiles {
 			names = append(names, f.Name)
 		}
+		a.promptMu.Unlock()
 		writeJSON(w, 200, map[string]interface{}{"ok": true, "name": name, "reloaded": true, "files": names})
 		return
 	}
@@ -1250,7 +1372,8 @@ func (ap *App) handlePromptsReload(w http.ResponseWriter, r *http.Request) {
 // ---------- 配置（WebUI 配置页，2026-08-29，2026-09-09 单实例化） ----------
 
 func (ap *App) handleConfigGet(w http.ResponseWriter, r *http.Request) {
-	buf, _ := json.Marshal(ap.state.Cfg)
+	cfg := ap.state.Agent.Cfg() // COW 读：不可变对象，直接序列化
+	buf, _ := json.Marshal(cfg)
 	var global map[string]interface{}
 	_ = json.Unmarshal(buf, &global)
 	restart := make([]string, 0, len(restartSections))
@@ -1260,8 +1383,8 @@ func (ap *App) handleConfigGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{
 		"global":       mergeMaps(global, map[string]interface{}{"restart_required": restart}),
 		"hot_sections": hotSections,
-		"effective":    ap.state.Cfg,
-		"llm_client":   ap.state.Agent.LLMCfg,
+		"effective":    cfg,
+		"llm_client":   llmCfgOf(cfg.LLM),
 	})
 }
 
@@ -1340,7 +1463,7 @@ func (ap *App) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// 应用（单实例：全局 = 本实例）
-	rl := applyConfigPatch(ap.state.Cfg, patch, ap.state.Agent)
+	rl := applyConfigPatch(ap.state.Agent, patch)
 	if ap.hooks != nil && ap.hooks.OnConfigSaved != nil {
 		ap.hooks.OnConfigSaved(patch)
 	}
@@ -1443,10 +1566,15 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// maxBodyBytes 请求体上限（2026-09-14 审计修：旧实现无上限，恶意/失控客户端
+// 可灌 GB 级 JSON 撑爆内存；256MB 已远大于任何正常请求——/inject 的大图 base64
+// 也在其内）
+const maxBodyBytes = 256 << 20
+
 // tryReadJSON 读 JSON body（失败 → nil，与 TS c.req.json().catch(() => null) 等价）
 func tryReadJSON(r *http.Request) map[string]interface{} {
 	var m map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxBodyBytes)).Decode(&m); err != nil {
 		return nil
 	}
 	return m

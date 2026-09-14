@@ -19,6 +19,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"okhuman/internal/config"
 	"okhuman/internal/llm"
@@ -123,14 +125,14 @@ func main() {
 	// 恢复落盘会话（重启续接）
 	sessSnap, _ := persist.LoadSessionFile(dataDir)
 	if sessSnap != nil {
-		a.SessionNo = sessSnap.No
-		a.CM.Restore(sessSnap.State)
-		a.CM.SetSeq(sessSnap.Seq)
+		a.SessionNo.Store(int32(sessSnap.No))
+		a.CM().Restore(sessSnap.State)
+		a.CM().SetSeq(sessSnap.Seq)
 		// 注：对齐 TS——restore() 不更新 cm 的会话号（记录文件名沿用建 CM 时的会话号）
 	}
 	// 会话变更 → 实时同步落盘
-	a.CM.AddPersistListener(func(s *types.SessionState, seq int) {
-		_ = p.SaveSession(&persist.Snapshot{No: a.SessionNo, Seq: seq, State: s})
+	a.CM().AddPersistListener(func(s *types.SessionState, seq int) {
+		_ = p.SaveSession(&persist.Snapshot{No: int(a.SessionNo.Load()), Seq: seq, State: s})
 	})
 
 	fileNames := make([]string, 0, len(loaded.Files))
@@ -146,14 +148,12 @@ func main() {
 	default:
 		promptSrc = fmt.Sprintf("%s/（%s）", cfg.SystemPrompt.Dir, strings.Join(fileNames, ", "))
 	}
-	restored := ""
+	restored := "（新建）"
 	if sessSnap != nil {
 		restored = ""
-	} else {
-		restored = "（新建）"
 	}
 	log(fmt.Sprintf("[OkHuman] 就绪：prompt=%s（%d 字符） | llm=%s | session#%d%s | data=%s",
-		promptSrc, utf16Len(loaded.Prompt), cfg.LLM.BaseURL, a.SessionNo, restored, dataDir))
+		promptSrc, utf16Len(loaded.Prompt), cfg.LLM.BaseURL, int(a.SessionNo.Load()), restored, dataDir))
 
 	// ---------- 服务状态（单实例） ----------
 	appState := server.NewAppState(cfg, root, a)
@@ -163,11 +163,11 @@ func main() {
 			// /reset 重建 cm 后重挂落盘监听，并立即落盘空会话（2026-08-30 修）：
 			// 监听器只在 addMessage 时触发，若不立即写，重启会载入旧快照
 			// （会话号回退 + 旧消息"复活"）。
-			a.CM.AddPersistListener(func(s *types.SessionState, seq int) {
-				_ = p.SaveSession(&persist.Snapshot{No: a.SessionNo, Seq: seq, State: s})
+			a.CM().AddPersistListener(func(s *types.SessionState, seq int) {
+				_ = p.SaveSession(&persist.Snapshot{No: int(a.SessionNo.Load()), Seq: seq, State: s})
 			})
-			_ = p.SaveSession(&persist.Snapshot{No: a.SessionNo, Seq: a.CM.GetSeq(), State: a.CM.Session()})
-			log(fmt.Sprintf("[OkHuman] 会话已重置 #%d，落盘监听已重挂（空会话已落盘）", a.SessionNo))
+			_ = p.SaveSession(&persist.Snapshot{No: int(a.SessionNo.Load()), Seq: a.CM().GetSeq(), State: a.CM().Session()})
+			log(fmt.Sprintf("[OkHuman] 会话已重置 #%d，落盘监听已重挂（空会话已落盘）", int(a.SessionNo.Load())))
 		},
 		OnConfigSaved: func(patch map[string]interface{}) {
 			saveGlobalConfigPatch(root, patch)
@@ -191,9 +191,12 @@ func main() {
 	// IdleTimeout 不设（=0 禁用）：Bun.serve 默认 idleTimeout=10s，SSE 流式聊天在
 	// LLM 思考 / 工具执行期间可能连续 >10s 无数据帧，默认值会把连接直接掐断。
 	// 长连接场景必须禁用。
+	// ReadHeaderTimeout 30s（2026-09-14 审计修：旧实现全零超时，慢速客户端可
+	// 无限占用连接——slowloris；只限"读请求头"阶段，SSE 长连接不受影响）
 	srv := &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
-		Handler: app,
+		Addr:              fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
+		Handler:           app,
+		ReadHeaderTimeout: 30 * time.Second,
 	}
 	if err := srv.ListenAndServe(); err != nil {
 		fatalf("http 服务退出：%v", err)
@@ -239,7 +242,14 @@ func jsonEqual(a, b interface{}) bool {
 
 // saveGlobalConfigPatch 读 user.json → 深合并补丁 → 剔"等于出厂默认"的叶子键
 // （文件保持最小）→ 原子写回
+//
+// cfgSaveMu 串行化读改写（2026-09-14 审计修：并发 /config POST 的读-改-写
+// 互相覆盖 → 丢失更新）
+var cfgSaveMu sync.Mutex
+
 func saveGlobalConfigPatch(root string, patch map[string]interface{}) {
+	cfgSaveMu.Lock()
+	defer cfgSaveMu.Unlock()
 	file := filepath.Join(root, "config", "user.json")
 	var cur map[string]interface{}
 	if s, err := os.ReadFile(file); err == nil {

@@ -66,13 +66,16 @@ func (l *RunLock) Run(fn func() error) error {
 	return err
 }
 
-// WaitIdle 等队列完全空闲（当前 run + 排队 run 都结束）；已空闲则立即返回
+// WaitIdle 等队列完全空闲（当前 run + 排队 run 都结束）；已空闲则立即返回。
+// 空闲判定与登记 waiter 在同一把锁内完成（2026-09-14 审计修：旧实现在锁外先查
+// running，"查完即变空闲"的窗口里登记的 waiter 永远等不到唤醒）
 func (l *RunLock) WaitIdle() {
+	l.mu.Lock()
 	if !l.running.Load() {
+		l.mu.Unlock()
 		return
 	}
 	done := make(chan struct{})
-	l.mu.Lock()
 	l.idleWaiters = append(l.idleWaiters, func() { close(done) })
 	l.mu.Unlock()
 	<-done
@@ -96,7 +99,7 @@ func NewOrchestrator() *BackgroundOrchestrator {
 const maxStoredResultBytes = 256 * 1024
 
 // OnBackgroundStart 由 Agent 的工具循环调用：注册任务 + 挂 settle 检测
-//（Promise 通道收到结果 → 标记 settled/ok/durationMs → 调 a.OnSettled 把
+// （Promise 通道收到结果 → 标记 settled/ok/durationMs → 调 a.OnSettled 把
 // 通知入消息队列 → 标记 Notified）
 func (o *BackgroundOrchestrator) OnBackgroundStart(a types.BackgroundStartArgs) {
 	t := &types.PendingBackgroundTask{

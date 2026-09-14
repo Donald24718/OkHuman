@@ -57,10 +57,10 @@ func IsCompressRequest(messages []types.Message) bool {
 
 // LoopCompressResult 滚动压缩结果
 type LoopCompressResult struct {
-	Text       string
-	Rounds     int
-	Before     int
-	Thinking   *string
+	Text     string
+	Rounds   int
+	Before   int
+	Thinking *string
 }
 
 // LoopCompressOpts 流式回调与空闲超时

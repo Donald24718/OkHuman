@@ -27,10 +27,10 @@ type ServerCfg struct {
 }
 
 type LLMCfg struct {
-	BaseURL  string `json:"base_url"`
-	Model    string `json:"model"`
-	APIKey   string `json:"api_key"`
-	TimeoutMS int   `json:"timeout_ms"`
+	BaseURL   string `json:"base_url"`
+	Model     string `json:"model"`
+	APIKey    string `json:"api_key"`
+	TimeoutMS int    `json:"timeout_ms"`
 }
 
 type SystemPromptCfg struct {

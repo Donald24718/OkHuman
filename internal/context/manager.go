@@ -13,11 +13,11 @@ package context
 // 热更新（2026-09-03）：SetCfg/SetLLM/SetSystemPrompt 支持 POST /config 即时生效。
 
 import (
-	"reflect"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -40,16 +40,20 @@ type CompressEvent struct {
 
 // Cfg 压缩参数（POST /config 热更新，对应 config.context）
 type Cfg struct {
-	MaxTokens        int
-	KeepRecentChars  int
-	HardTruncChars   int
-	StreamIdleMS     int
-	CharsPerToken    float64
+	MaxTokens       int
+	KeepRecentChars int
+	HardTruncChars  int
+	StreamIdleMS    int
+	CharsPerToken   float64
 }
 
 // Manager 会话状态 + 压缩编排
 type Manager struct {
-	mu           sync.Mutex
+	mu       sync.Mutex
+	changeMu sync.Mutex // 审计 H2 修（2026-09-14）：串行化"变更全程"
+	//（AddMessage 的 append+压缩+落盘、ForceHardTruncate）。/inject 与在飞 run
+	// 并发 AddMessage 时，旧代码两个压缩并行、各自按压缩前下标切 batch → 陈旧
+	// 下标切错位置可能丢错消息；持锁后压缩串行、下标始终有效。
 	llm          llm.LlmClient
 	cfg          Cfg
 	systemPrompt string
@@ -102,11 +106,23 @@ func (m *Manager) SystemPrompt() string {
 	return m.systemPrompt
 }
 
-// Session 当前会话状态（只读引用；修改必须经 AddMessage/Restore）
+// snapshotLocked 当前会话的深快照（持锁调用）：Messages 为新切片（元素拷贝），
+// Summary 共享指针（TEntry 一经创建不再原地修改）。调用方可长期持有快照并发
+// 读取——与 AddMessage 的 append / 压缩的切片重切互不干扰（无共享可变结构）。
+func (m *Manager) snapshotLocked() *types.SessionState {
+	snap := &types.SessionState{ID: m.session.ID, Summary: m.session.Summary}
+	snap.Messages = make([]types.RawEntry, len(m.session.Messages))
+	copy(snap.Messages, m.session.Messages)
+	return snap
+}
+
+// Session 当前会话状态（深快照；2026-09-14 审计修：旧实现返回活引用，
+// /status /history 等只读端点无锁遍历 Messages 时与 AddMessage 的 append
+// 竞态——-race 必报，撕裂的 slice header 极端情况下越界 panic）
 func (m *Manager) Session() *types.SessionState {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.session
+	return m.snapshotLocked()
 }
 
 // CfgOf 当前压缩参数
@@ -218,6 +234,8 @@ func (m *Manager) EstimateTotalTokens() int {
 // AddMessage 追加一条消息（user/assistant/tool）；追加后检查总 token 超阈值
 // → 压最旧一批为 summary。压缩内部错误已自行兜底（硬截断/下轮再试），不返回 error。
 func (m *Manager) AddMessage(e *types.RawEntry) {
+	m.changeMu.Lock()
+	defer m.changeMu.Unlock()
 	m.mu.Lock()
 	m.session.Messages = append(m.session.Messages, *e)
 	m.seq++
@@ -382,6 +400,8 @@ func (m *Manager) llmLocked() llm.LlmClient {
 // ForceHardTruncate 兜底硬截断（LLM 4xx 三级阶梯第三级）：不经 LLM 压缩重试，
 // 直接保留最近 hard_trunc_chars 字符，完整原文落 session-records/
 func (m *Manager) ForceHardTruncate() {
+	m.changeMu.Lock()
+	defer m.changeMu.Unlock()
 	m.mu.Lock()
 	recordPath := m.writeSessionRecordLocked()
 	m.hardTruncateLocked(recordPath)
@@ -390,7 +410,7 @@ func (m *Manager) ForceHardTruncate() {
 
 // hardTruncateLocked 硬截断（持锁）：压缩 3 次重试均空闲超时（或 4xx 阶梯）→
 // 放弃 LLM 压缩，直接保留最近 hard_trunc_chars 字符预算内的原文，其余丢弃
-//（完整内容已在 session-records/ 落盘，数据不丢）。summary 置为记录文件路径引用。
+// （完整内容已在 session-records/ 落盘，数据不丢）。summary 置为记录文件路径引用。
 func (m *Manager) hardTruncateLocked(recordPath string) {
 	before := sessionChars(m.session)
 	n := len(m.session.Messages)
@@ -419,7 +439,7 @@ func (m *Manager) hardTruncateLocked(recordPath string) {
 }
 
 // writeSessionRecordLocked 压缩触发时生成会话完整记录
-//（recordDir/session-records/ctx-<会话号>-<时间戳>-seq<N>.txt，持锁调用）。
+// （recordDir/session-records/ctx-<会话号>-<时间戳>-seq<N>.txt，持锁调用）。
 // 内容 = 压缩前的完整会话（system 提示词 + summary + 全部消息原文）。
 // 人类可读的纯文本；结构固定：压缩后总结置顶 → system 提示词 → 消息按时间序。
 // 文件名毫秒精度 + seq 后缀（同毫秒不撞名）。
@@ -518,11 +538,12 @@ func (m *Manager) emitLocked(scope, detail, text string, rounds, beforeChars int
 	}
 }
 
-// emitPersist 广播会话变更（落盘）
+// emitPersist 广播会话变更（落盘）。传深快照（2026-09-14 审计修：旧实现传
+// 活指针，落盘监听器 json.Marshal 时与并发 AddMessage 的 append 竞态）
 func (m *Manager) emitPersist() {
 	m.mu.Lock()
 	l := m.persistL
-	state := m.session
+	state := m.snapshotLocked()
 	seq := m.seq
 	m.mu.Unlock()
 	for _, fn := range l {

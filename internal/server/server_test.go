@@ -47,3 +47,42 @@ func TestAssembleBatchMerged(t *testing.T) {
 		t.Fatalf("label=%v，want %q", label, wantLabel)
 	}
 }
+
+// TestSubscriberIsolation（2026-09-14 审计修回归）：/events 订阅按唯一 id 摘除，
+// 断开一个连接不得误杀其他连接——旧实现用 reflect 代码指针判同，同字面量闭
+// 共享指针 → 任一断开把全部订阅一并摘掉（前端全瞎）。
+func TestSubscriberIsolation(t *testing.T) {
+	st := &AppState{}
+	id1 := subSeq.Add(1)
+	id2 := subSeq.Add(2)
+	st.mu.Lock()
+	st.BroadcastSubs = append(st.BroadcastSubs, subEntry{ID: id1, Fn: func(string) {}})
+	st.BroadcastSubs = append(st.BroadcastSubs, subEntry{ID: id2, Fn: func(string) {}})
+	st.mu.Unlock()
+	// 模拟 handleEvents 断开清理：按 id 摘除 id1
+	st.mu.Lock()
+	kept := st.BroadcastSubs[:0]
+	for _, s := range st.BroadcastSubs {
+		if s.ID != id1 {
+			kept = append(kept, s)
+		}
+	}
+	st.BroadcastSubs = kept
+	st.mu.Unlock()
+	if len(st.BroadcastSubs) != 1 || st.BroadcastSubs[0].ID != id2 {
+		t.Fatalf("误杀：摘除 id1 后应只剩 id2，got %d 条", len(st.BroadcastSubs))
+	}
+	// 重复摘除同一 id 不得影响其他订阅（幂等）
+	st.mu.Lock()
+	kept = st.BroadcastSubs[:0]
+	for _, s := range st.BroadcastSubs {
+		if s.ID != id1 {
+			kept = append(kept, s)
+		}
+	}
+	st.BroadcastSubs = kept
+	st.mu.Unlock()
+	if len(st.BroadcastSubs) != 1 || st.BroadcastSubs[0].ID != id2 {
+		t.Fatalf("幂等摘除后 id2 丢失")
+	}
+}

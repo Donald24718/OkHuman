@@ -20,10 +20,10 @@ import (
 )
 
 type Resolver struct {
-	dir      string
-	onFail   func(id, reason string)
-	mu       sync.Mutex
-	cache    map[string][]types.ContentPart
+	dir       string
+	onFail    func(id, reason string)
+	mu        sync.Mutex
+	cache     map[string][]types.ContentPart
 	stubCache map[string][]types.ContentPart
 }
 
@@ -123,7 +123,6 @@ func (r *Resolver) ClearCache(id string) {
 
 // DropInjectFile 删侧车文件 + 清缓存；返回是否真删了文件
 func DropInjectFile(dir, id string) bool {
-	_ = id
 	if err := os.Remove(filepath.Join(dir, id+".json")); err == nil {
 		return true
 	}

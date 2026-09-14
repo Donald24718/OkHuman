@@ -27,18 +27,35 @@ const (
 
 // Snapshot 会话快照（落盘格式 { no, seq, state }）
 type Snapshot struct {
-	No    int                  `json:"no"`
-	Seq   int                  `json:"seq"`
-	State *types.SessionState  `json:"state"`
+	No    int                 `json:"no"`
+	Seq   int                 `json:"seq"`
+	State *types.SessionState `json:"state"`
 }
 
-// AtomicWriteFile 原子写（tmp + rename）：读端永远看到完整文件
+// AtomicWriteFile 原子写（唯一 tmp + rename）：读端永远看到完整文件。
+// tmp 名每次唯一（2026-09-14 审计修：旧固定 .tmp 名在并发 SaveSession 时
+// ——/inject 与在飞 run 各自触发落盘——互相覆盖，rename 失败会把 session.json
+// 留在陈旧内容上，进程恰在此窗口被杀则丢最近消息）
 func AtomicWriteFile(file string, data string) error {
-	tmp := file + ".tmp"
-	if err := os.WriteFile(tmp, []byte(data), 0o644); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(file), filepath.Base(file)+".tmp-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, file)
+	tmp := f.Name()
+	if _, err := f.WriteString(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, file); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // Persistence 单实例落盘器
@@ -99,8 +116,8 @@ func LoadSessionFile(dir string) (*Snapshot, error) {
 		return nil, nil
 	}
 	var d struct {
-		No  *int            `json:"no"`
-		Seq *int            `json:"seq"`
+		No  *int             `json:"no"`
+		Seq *int             `json:"seq"`
 		St  *json.RawMessage `json:"state"`
 	}
 	if err := json.Unmarshal(data, &d); err != nil || d.No == nil || d.Seq == nil || d.St == nil {
@@ -156,7 +173,10 @@ func LoadSessionFile(dir string) (*Snapshot, error) {
 		createdAt = t2.CreatedAt
 	}
 	for _, t := range t1s {
-		to := t.(map[string]interface{})
+		to, ok := t.(map[string]interface{})
+		if !ok {
+			return nil, nil // t1s 条目形状异常 → 整份拒载（与 validEntry 同口径，
+		}
 		if c, ok := to["content"].(string); ok {
 			parts = append(parts, c)
 			if ca, ok := to["created_at"].(float64); ok && createdAt == 0 {

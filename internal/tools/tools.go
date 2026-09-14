@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"os/exec"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -71,15 +72,21 @@ func toolBash(args map[string]interface{}) (string, error) {
 
 	cmd := exec.Command("bash", "-c", command)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // 独立进程组
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	// 审计 H3 修（2026-09-14）：输出按流封顶 32MB（防单条命令灌 GB 级输出
+	// OOM 整个进程；600s 只限时间不限大小）。超上限部分丢弃但持续读取
+	// （管道不堵，子进程不挂起），正文留前 32MB + 截断说明。
+	stdout := newCappedBuffer(maxToolOutputBytes)
+	stderr := newCappedBuffer(maxToolOutputBytes)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
 		return "", err
 	}
-	killed := false
+	// 超时标记用 atomic.Bool（2026-09-14 审计修：旧裸 bool 由 AfterFunc
+	// goroutine 写、主 goroutine 读，无同步 → 数据竞争）
+	var killed atomic.Bool
 	timer := time.AfterFunc(time.Duration(timeoutSec)*time.Second, func() {
-		killed = true
+		killed.Store(true)
 		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
 			_ = cmd.Process.Kill() // 组已不存在时兜底杀顶层
 		}
@@ -96,7 +103,7 @@ func toolBash(args map[string]interface{}) (string, error) {
 		}
 	}
 	head := fmt.Sprintf("退出码: %d", code)
-	if killed {
+	if killed.Load() {
 		head += "（已超时被终止）"
 	}
 	out := stdout.String()
@@ -112,6 +119,42 @@ func toolBash(args map[string]interface{}) (string, error) {
 		return head + "\n\n" + body, nil
 	}
 	return head, nil
+}
+
+// maxToolOutputBytes 单流（stdout/stderr 各自）输出封顶（2026-09-14 审计 H3 修）
+const maxToolOutputBytes = 32 << 20
+
+// cappedBuffer 保留前 n 字节；超出部分丢弃但持续读取（管道保持排空、子进程
+// 永不阻塞在写管道上），并记录被丢弃字节数供截断说明用。
+type cappedBuffer struct {
+	buf  bytes.Buffer
+	cap  int
+	over int64
+}
+
+func newCappedBuffer(n int) *cappedBuffer { return &cappedBuffer{cap: n} }
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	room := c.cap - c.buf.Len()
+	if room >= len(p) {
+		return c.buf.Write(p)
+	}
+	if room > 0 {
+		c.buf.Write(p[:room])
+		p = p[room:]
+	}
+	c.over += int64(len(p))
+	return len(p), nil
+}
+
+func (c *cappedBuffer) String() string {
+	if c.over == 0 {
+		return c.buf.String()
+	}
+	// 说明放开头：agent 的 ResultLimit 截断保留头部（模型据此知道丢弃量）；
+	// 尾部会被切掉。
+	return fmt.Sprintf("[输出截断：仅保留前 %d 字节，另有 %d 字节丢弃（共约 %d 字节）]\n",
+		c.cap, c.over, int64(c.cap)+c.over) + c.buf.String()
 }
 
 func requireStr(args map[string]interface{}, key string) (string, bool) {

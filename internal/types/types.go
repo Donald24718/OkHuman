@@ -23,10 +23,10 @@ type Function struct {
 // ContentPart 三型：text | image_url | inject_ref。
 // inject_ref 仅存于会话；组装请求时解析成真实 parts（侧车文件），永不上 wire。
 type ContentPart struct {
-	Type     string       `json:"type"`
-	Text     string       `json:"text,omitempty"`
-	ImageURL *ImageURL    `json:"image_url,omitempty"`
-	Ref      string       `json:"ref,omitempty"`
+	Type     string    `json:"type"`
+	Text     string    `json:"text,omitempty"`
+	ImageURL *ImageURL `json:"image_url,omitempty"`
+	Ref      string    `json:"ref,omitempty"`
 }
 
 type ImageURL struct {
@@ -84,11 +84,11 @@ type ToolParameters struct {
 
 // RawEntry 会话内一条逻辑消息
 type RawEntry struct {
-	Role             string      `json:"role"`
-	Content          Content     `json:"content"`
-	ToolCalls        []ToolCall  `json:"tool_calls,omitempty"`
-	ToolCallID       *string     `json:"tool_call_id,omitempty"`
-	ReasoningContent *string     `json:"reasoning_content,omitempty"`
+	Role             string     `json:"role"`
+	Content          Content    `json:"content"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       *string    `json:"tool_call_id,omitempty"`
+	ReasoningContent *string    `json:"reasoning_content,omitempty"`
 }
 
 // TEntry 滚动 summary

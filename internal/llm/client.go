@@ -24,9 +24,9 @@ import (
 
 // ClientConfig 客户端构造参数
 type ClientConfig struct {
-	BaseURL  string
-	Model    string
-	APIKey   string
+	BaseURL   string
+	Model     string
+	APIKey    string
 	TimeoutMS int // 整体请求超时（complete 非流式用；流式另有空闲超时）
 }
 
@@ -46,7 +46,7 @@ func (c *OpenAiClient) Config() ClientConfig { return c.cfg }
 // ---------- 错误类型（agent 4xx 阶梯按 HTTPError.Status 判定） ----------
 
 // HTTPError LLM 返回非 2xx。Error() 串格式 "LLM <status>: <body前500>"
-//（与 TS 版完全一致，日志/阶梯正则口径不变）
+// （与 TS 版完全一致，日志/阶梯正则口径不变）
 type HTTPError struct {
 	Status int
 	Body   string
@@ -123,13 +123,13 @@ func newCallID() string {
 // ---------- 非流式（压缩请求用） ----------
 
 type wireMessage struct {
-	Content          *string    `json:"content"`
-	ReasoningContent *string    `json:"reasoning_content"`
+	Content          *string        `json:"content"`
+	ReasoningContent *string        `json:"reasoning_content"`
 	ToolCalls        []wireToolCall `json:"tool_calls"`
 }
 
 type wireToolCall struct {
-	ID       *string      `json:"id"`
+	ID       *string       `json:"id"`
 	Function *wireFunction `json:"function"`
 }
 
@@ -164,12 +164,12 @@ func (c *OpenAiClient) Complete(ctx context.Context, messages []types.Message, t
 	}
 	var j struct {
 		Choices []struct {
-			FinishReason *string     `json:"finish_reason"`
+			FinishReason *string      `json:"finish_reason"`
 			Message      *wireMessage `json:"message"`
 		} `json:"choices"`
 		Usage *struct {
-			PromptTokens     int           `json:"prompt_tokens"`
-			CompletionTokens int           `json:"completion_tokens"`
+			PromptTokens        int           `json:"prompt_tokens"`
+			CompletionTokens    int           `json:"completion_tokens"`
 			PromptTokensDetails *usageDetails `json:"prompt_tokens_details"`
 		} `json:"usage"`
 		Timings *struct {
@@ -204,7 +204,7 @@ func (c *OpenAiClient) Complete(ctx context.Context, messages []types.Message, t
 			for _, tc := range m.ToolCalls {
 				if tc.Function == nil || tc.Function.Name == nil {
 					continue
-			}
+				}
 				id := newCallID()
 				if tc.ID != nil && *tc.ID != "" {
 					id = *tc.ID
@@ -229,8 +229,8 @@ func (c *OpenAiClient) Complete(ctx context.Context, messages []types.Message, t
 // sseFrame llama.cpp SSE 帧（choices 为空 + usage = 尾块）
 type sseFrame struct {
 	Usage *struct {
-		PromptTokens      int            `json:"prompt_tokens"`
-		CompletionTokens  int            `json:"completion_tokens"`
+		PromptTokens        int           `json:"prompt_tokens"`
+		CompletionTokens    int           `json:"completion_tokens"`
 		PromptTokensDetails *usageDetails `json:"prompt_tokens_details"`
 	} `json:"usage"`
 	Timings *struct {
@@ -239,16 +239,16 @@ type sseFrame struct {
 	Choices []struct {
 		FinishReason *string `json:"finish_reason"`
 		Delta        struct {
-			ReasoningContent *string `json:"reasoning_content"`
-			Content          *string `json:"content"`
+			ReasoningContent *string             `json:"reasoning_content"`
+			Content          *string             `json:"content"`
 			ToolCalls        []wireToolCallDelta `json:"tool_calls"`
 		} `json:"delta"`
 	} `json:"choices"`
 }
 
 type wireToolCallDelta struct {
-	Index    *int         `json:"index"`
-	ID       *string      `json:"id"`
+	Index    *int          `json:"index"`
+	ID       *string       `json:"id"`
 	Function *wireFunction `json:"function"`
 }
 

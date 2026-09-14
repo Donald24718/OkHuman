@@ -46,7 +46,7 @@ type RunOptions struct {
 	// 落盘根目录：截断工具结果写 <dataDir>/tool-results/<时间戳>.log
 	DataDir string
 	// 工具结果回填上限（字符，可配置，默认 50000）：超出截断 + 全文落文件
-	ResultLimit int
+	ResultLimit   int
 	DoomWarnAfter int
 	// 前台执行超时（毫秒）：超时不取消，转后台 + 双向通知（§7.3）
 	FgTimeoutMS int
@@ -190,12 +190,12 @@ func (a *Agent) runUserMessage(ctx context.Context, userText string, opt RunOpti
 	offCompress := a.cm.AddCompressListener(func(e ctxmgr.CompressEvent) {
 		ev := types.AgentEvent{
 			"type":         "compress",
-			"scope":       e.Scope,
-			"detail":      e.Detail,
+			"scope":        e.Scope,
+			"detail":       e.Detail,
 			"before_chars": e.BeforeChars,
-			"after_chars": e.AfterChars,
-			"rounds":      e.Rounds,
-			"text":        e.Text,
+			"after_chars":  e.AfterChars,
+			"rounds":       e.Rounds,
+			"text":         e.Text,
 		}
 		if e.Thinking != nil {
 			ev["thinking"] = *e.Thinking
@@ -311,12 +311,18 @@ func (a *Agent) FormatBackgroundNotice(task *types.PendingBackgroundTask, opt Ru
 	return head + result
 }
 
-// writeToolLog 被截断的工具结果全文落文件（<dataDir>/tool-results/tool-<时间戳>.log），
-// 返回绝对路径。文件名秒精度（tool- 前缀，与 session-records 的 ctx- 区分）。
+// toolLogSeq 工具结果文件名序号（2026-09-14 审计修：旧文件名仅秒精度，同一秒
+// 两次截断——后台通知（独立 goroutine）与轮内结果可并发——撞名互相覆盖，
+// 前一条消息里的 log 路径会指向后一条的内容）
+var toolLogSeq atomic.Uint64
+
+// writeToolLog 被截断的工具结果全文落文件
+// （<dataDir>/tool-results/tool-<时间戳>-<序号>.log），返回绝对路径。
+// 文件名秒精度 + 单调序号（tool- 前缀，与 session-records 的 ctx- 区分）。
 func (a *Agent) writeToolLog(opt RunOptions, full string) string {
 	dir := filepath.Join(opt.DataDir, "tool-results")
 	ts := time.Now().UTC().Format("2006-01-02_15-04-05")
-	path := filepath.Join(dir, "tool-"+ts+".log")
+	path := filepath.Join(dir, fmt.Sprintf("tool-%s-%d.log", ts, toolLogSeq.Add(1)))
 	if err := os.MkdirAll(dir, 0o755); err == nil {
 		if err := os.WriteFile(path, []byte(full), 0o644); err == nil {
 			return path
@@ -333,7 +339,7 @@ func (a *Agent) writeToolLog(opt RunOptions, full string) string {
 // ① 正常请求 → ② 4xx：最近一条带附件的消息降级文本提示重试 → ③ 仍 4xx：全部附件降级重试
 // → ④ 仍 4xx：触发兜底硬截断压缩后重试（再败则抛，轮次死，人工介入）。
 // 降级是请求级：不动会话/侧车/附件列表，下轮请求原样恢复；触发限 400/413/415
-//（请求体被拒），其余错误（5xx/401/404/网络错）终止阶梯原样抛（配置类错误不配吃硬截断）。
+// （请求体被拒），其余错误（5xx/401/404/网络错）终止阶梯原样抛（配置类错误不配吃硬截断）。
 func (a *Agent) llmCall(ctx context.Context, emit func(types.AgentEvent), totals *TokenTotals) (*types.Response, error) {
 	// 上一轮 /stop 挂起后若本轮已重置（stopRequested=false 说明新 run），这里正常走
 	if a.stopRequested.Load() {
