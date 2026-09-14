@@ -1,0 +1,1071 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OkHuman 控制台</title>
+<!-- marked：本地化 markdown 渲染库（2026-09-09，webui/marked.min.js 由 /marked.min.js 路由
+     静态服务，不依赖 CDN——本地工具断网也能渲染）。加载失败不阻塞：md() 自动回退纯文本。 -->
+<script src="/marked.min.js"></script>
+<style>
+  :root {
+    --bg: #0e1116;
+    --bg2: #151a22;
+    --bg3: #1c2330;
+    --border: #2a3444;
+    --text: #dbe4f0;
+    --dim: #8494ab;
+    --accent: #4f9cff;
+    --green: #3ecf8e;
+    --red: #ff6b6b;
+    --amber: #ffb454;
+    --purple: #b58cff;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    display: flex; overflow: hidden;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  button {
+    font: inherit; cursor: pointer; border: 1px solid var(--border);
+    background: var(--bg3); color: var(--text); border-radius: 8px; padding: 6px 14px;
+    transition: all .15s;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled) { filter: brightness(1.12); }
+  button.danger { background: transparent; border-color: #5a2a2a; color: var(--red); }
+  button.danger:hover:not(:disabled) { border-color: var(--red); background: rgba(255,107,107,.08); }
+  button.small { padding: 2px 9px; font-size: 12px; border-radius: 6px; }
+  input, select, textarea {
+    font: inherit; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; width: 100%;
+  }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  textarea { resize: vertical; font-family: var(--mono); font-size: 13px; }
+  label.f { display: block; margin-bottom: 10px; }
+  label.f span { display: block; color: var(--dim); font-size: 12px; margin-bottom: 4px; }
+
+  /* ---------- 侧栏 ---------- */
+  aside {
+    width: 210px; min-width: 210px; background: var(--bg2); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; padding: 14px 10px;
+  }
+  .logo { font-size: 18px; font-weight: 700; padding: 4px 8px 14px; letter-spacing: .5px; }
+  .logo em { color: var(--accent); font-style: normal; }
+  .agent-box { padding: 0 8px 12px; }
+  .agent-box span { display: block; color: var(--dim); font-size: 12px; margin-bottom: 4px; }
+  nav { display: flex; flex-direction: column; gap: 2px; }
+  nav a {
+    padding: 8px 12px; border-radius: 8px; color: var(--dim); cursor: pointer; user-select: none;
+    display: flex; align-items: center; gap: 9px;
+  }
+  nav a:hover { background: var(--bg3); color: var(--text); }
+  nav a.active { background: var(--bg3); color: #fff; box-shadow: inset 2px 0 0 var(--accent); }
+  .side-foot { margin-top: auto; padding: 10px 8px 0; font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 7px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
+  .dot.ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot.err { background: var(--red); box-shadow: 0 0 6px var(--red); }
+
+  /* ---------- 主区 ---------- */
+  main { flex: 1; overflow-y: auto; padding: 22px 26px; }
+  .page { display: none; max-width: 1080px; margin: 0 auto; }
+  .page.active { display: block; }
+  h1 { font-size: 19px; margin-bottom: 16px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  h1 .sub { font-size: 12px; color: var(--dim); font-weight: 400; }
+  .card {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px; margin-bottom: 14px;
+  }
+  .card h2 { font-size: 14px; margin-bottom: 12px; color: #fff; display: flex; align-items: center; gap: 8px; }
+  .card h2 .right { margin-left: auto; font-size: 12px; color: var(--dim); font-weight: 400; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--dim); font-weight: 400; font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 7px 8px; border-bottom: 1px solid rgba(42,52,68,.5); vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  .kv { display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid rgba(42,52,68,.5); font-size: 13px; }
+  .kv:last-child { border-bottom: none; }
+  .kv b { color: var(--dim); font-weight: 400; }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .dim { color: var(--dim); }
+  .tag {
+    display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 20px;
+    background: var(--bg3); border: 1px solid var(--border); color: var(--dim); margin-right: 4px;
+  }
+  .tag.run { color: var(--green); border-color: rgba(62,207,142,.4); }
+  .tag.pause { color: var(--amber); border-color: rgba(255,180,84,.4); }
+  .tag.once { color: var(--purple); border-color: rgba(181,140,255,.4); }
+  .tag.ok { color: var(--green); border-color: rgba(62,207,142,.4); }
+  .tag.fail { color: var(--red); border-color: rgba(255,107,107,.4); }
+
+  /* ---------- 聊天 ---------- */
+  #chatWrap { display: flex; flex-direction: column; height: calc(100vh - 96px); max-width: none; }
+  #chatBoxes { flex: 1; position: relative; overflow: hidden; }
+  .chatbox { position: absolute; inset: 0; overflow-y: auto; padding: 6px 4px 12px; }
+  .msg { display: flex; margin-bottom: 14px; }
+  .msg.user { justify-content: flex-end; }
+  .bubble {
+    max-width: 78%; padding: 9px 14px; border-radius: 12px; white-space: pre-wrap;
+    word-break: break-word; font-size: 14px;
+  }
+  .msg.user .bubble { background: #274768; border: 1px solid #33587f; border-bottom-right-radius: 4px; }
+  /* 排队中标记（2026-08-31）：运行中发送的消息，本轮结束后由 drain 合并一起发出 */
+  .queue-tag { margin-top: 5px; font-size: 11px; color: var(--amber); }
+  .piggy-tag { margin-top: 5px; font-size: 11px; color: var(--green); }
+  .msg.bot .bubble { background: var(--bg3); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+  .msg.bot .bubble.streaming { border-color: rgba(79,156,255,.45); }
+  button.danger { background: #3a2530; color: #ff6b6b; border: 1px solid rgba(255,107,107,.45); }
+  button.danger:hover { background: #4a2c38; }
+  .ev { margin: 8px 0; font-size: 12.5px; }
+  .ev.thinking {
+    background: rgba(181,140,255,.06); border: 1px solid rgba(181,140,255,.3);
+    border-radius: 9px; padding: 7px 11px;
+  }
+  .ev.toolcall {
+    background: rgba(79,156,255,.07); border: 1px solid rgba(79,156,255,.3);
+    border-radius: 9px; padding: 7px 11px;
+  }
+  .ev.toolres {
+    background: rgba(62,207,142,.06); border: 1px solid rgba(62,207,142,.28);
+    border-radius: 9px; padding: 7px 11px;
+  }
+  .ev.compress {
+    background: rgba(181,140,255,.07); border: 1px solid rgba(181,140,255,.32);
+    border-radius: 9px; padding: 7px 11px; color: var(--purple);
+  }
+  .ev.doom {
+    background: rgba(255,107,107,.08); border: 1px solid rgba(255,107,107,.4);
+    border-radius: 9px; padding: 7px 11px; color: var(--red);
+  }
+  .ev.bgstart {
+    background: rgba(255,180,84,.08); border: 1px solid rgba(255,180,84,.4);
+    border-radius: 9px; padding: 7px 11px; color: var(--amber);
+  }
+  .ev .evhead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .ev details { margin-top: 5px; }
+  .ev summary { cursor: pointer; color: var(--dim); font-size: 12px; user-select: none; }
+  .ev pre {
+    margin-top: 5px; background: var(--bg); border-radius: 7px; padding: 8px 10px;
+    font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-word;
+    max-height: 300px; overflow: auto;
+  }
+  .ev .usage { color: var(--dim); font-size: 12px; padding: 3px 2px; }
+  #chatInputRow { display: flex; gap: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
+  #chatInput { flex: 1; height: 64px; resize: none; font-family: inherit; font-size: 14px; }
+  #chatInputRow button { width: 88px; font-size: 14px; }
+  .cursor { display: inline-block; width: 7px; height: 14px; background: var(--accent); vertical-align: -2px; animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  #chatStatus { font-size: 12px; color: var(--dim); margin-left: auto; }
+  /* ---------- markdown 渲染（2026-09-09：bot 回复/历史总结走 marked 渲染） ---------- */
+  .md { white-space: normal; word-break: break-word; }
+  .md > :first-child { margin-top: 0; }
+  .md > :last-child { margin-bottom: 0; }
+  .md p { margin: 8px 0; }
+  .md h1, .md h2, .md h3, .md h4 { font-size: 1.06em; font-weight: 700; margin: 14px 0 6px; color: #fff; }
+  .md h1 { font-size: 1.18em; }
+  .md ul, .md ol { margin: 8px 0; padding-left: 22px; }
+  .md li { margin: 3px 0; }
+  .md code { font-family: var(--mono); font-size: 12.5px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  .md pre { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin: 8px 0; overflow-x: auto; max-height: 360px; overflow-y: auto; }
+  .md pre code { background: none; border: none; padding: 0; font-size: 12.5px; }
+  .md table { width: auto; border-collapse: collapse; margin: 8px 0; font-size: 13px; }
+  .md th, .md td { border: 1px solid var(--border); padding: 5px 10px; text-align: left; }
+  .md th { background: var(--bg3); color: #fff; font-weight: 600; }
+  .md a { word-break: break-all; }
+  .md blockquote { margin: 8px 0; padding: 4px 12px; border-left: 3px solid var(--accent); background: rgba(79,156,255,.05); border-radius: 0 8px 8px 0; color: var(--dim); }
+  .md hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+  .md img { max-width: 100%; }
+
+  /* ---------- 配置 ---------- */
+  .cfg-scope { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  .cfg-scope select { width: 220px; }
+  .note { font-size: 12px; color: var(--amber); margin-top: 3px; }
+  .note.gray { color: var(--dim); }
+  .restart-flag { color: var(--amber); font-size: 11px; margin-left: 6px; }
+  .applied-list { margin-top: 10px; font-size: 13px; }
+  .applied-list .ok-line { color: var(--green); }
+  .applied-list .rs-line { color: var(--amber); }
+
+  /* ---------- 提示词 ---------- */
+  #promptFileList { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .pf-chip {
+    padding: 5px 13px; border-radius: 20px; border: 1px solid var(--border); background: var(--bg3);
+    cursor: pointer; font-size: 13px; user-select: none;
+  }
+  .pf-chip.active { border-color: var(--accent); color: #fff; }
+  .pf-chip:hover { border-color: var(--accent); }
+
+  /* ---------- toast ---------- */
+  #toast {
+    position: fixed; right: 20px; bottom: 20px; z-index: 99; display: flex; flex-direction: column; gap: 8px;
+  }
+  .toast {
+    background: var(--bg3); border: 1px solid var(--border); border-left: 3px solid var(--green);
+    border-radius: 9px; padding: 10px 16px; font-size: 13px; max-width: 420px;
+    box-shadow: 0 6px 24px rgba(0,0,0,.4); animation: slidein .2s ease;
+    word-break: break-word;
+  }
+  .toast.err { border-left-color: var(--red); }
+  @keyframes slidein { from { transform: translateX(30px); opacity: 0; } }
+
+  .empty { color: var(--dim); text-align: center; padding: 22px 0; font-size: 13px; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .row > * { flex: none; }
+  .grow { flex: 1 !important; min-width: 120px; }
+  hr.sep { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+</style>
+</head>
+<body>
+<aside>
+  <div class="logo">Ok<em>Human</em></div>
+  <nav id="nav">
+    <a data-page="chat" class="active">💬 聊天</a>
+    <a data-page="status">📊 状态</a>
+    <a data-page="prompts">📝 提示词</a>
+    <a data-page="config">⚙️ 配置</a>
+  </nav>
+  <div class="side-foot"><span class="dot" id="healthDot"></span><span id="healthText">检测中…</span></div>
+</aside>
+<main>
+  <!-- ================= 聊天 ================= -->
+  <section class="page active" id="page-chat">
+    <div id="chatWrap">
+      <h1>💬 聊天
+        <span class="sub" id="chatMeta"></span>
+        <button class="small" onclick="resetSession()">🧹 重置会话</button>
+      </h1>
+      <div id="chatBoxes"></div>
+      <div id="chatInputRow">
+        <textarea id="chatInput" placeholder="输入消息，Enter 发送，Shift+Enter 换行" onkeydown="chatKey(event)"></textarea>
+        <button class="primary" id="sendBtn" onclick="sendChat()">发送 ➤</button>
+        <button class="danger" id="stopBtn" style="display:none" onclick="stopChat()">停止 ⏹</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 状态 ================= -->
+  <section class="page" id="page-status">
+    <h1>📊 状态 <span class="sub" id="stMeta"></span></h1>
+    <div class="grid2">
+      <div class="card">
+        <h2>会话与上下文</h2>
+        <div id="stContext"></div>
+      </div>
+      <div class="card">
+        <h2>系统提示词</h2>
+        <div id="stPrompt"></div>
+      </div>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <h2>后台任务</h2>
+        <div id="stBg"></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>上下文尾部预览 <span class="right">最近 5 条原文</span></h2>
+      <div id="stRaw"></div>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <h2>压缩日志 <span class="right">最近 20 次</span></h2>
+        <div id="stCompress"></div>
+      </div>
+      <div class="card">
+        <h2>死循环 / 后台告警 <span class="right">最近 10 条</span></h2>
+        <div id="stDoom"></div>
+      </div>
+    </div>
+    <div class="card" style="font-size:12.5px;color:var(--dim)">
+      ⏰ 定时任务已拆为独立插件仓（/media/xhy/docker/OkHuman_p/cron，默认 :8601），请到其管理页维护——本控制台只负责 LLM 执行。
+    </div>
+  </section>
+
+  <!-- ================= 提示词 ================= -->
+  <section class="page" id="page-prompts">
+    <h1>📝 系统提示词 <span class="sub">目录内 *.md 按文件名自然排序拼接；保存 .md 立即生效，其他文件需点"重载"</span></h1>
+    <div class="card">
+      <div id="promptHead" style="font-size:12px;color:var(--dim);margin-bottom:10px"></div>
+      <div id="promptFileList"></div>
+      <div class="row" style="margin-bottom:10px">
+        <input id="pfNewName" placeholder="新文件名，如 03-style.md" style="width:220px">
+        <button onclick="pfNew()">＋ 新建文件</button>
+        <span style="flex:1"></span>
+        <button onclick="pfReload()">🔄 重载目录</button>
+      </div>
+      <div id="pfEditorWrap" style="display:none">
+        <div class="row" style="margin-bottom:8px">
+          <b id="pfName" class="mono" style="font-size:13px"></b>
+          <span class="dim" id="pfChars" style="font-size:12px"></span>
+          <span style="flex:1"></span>
+          <button class="primary" onclick="pfSave()">💾 保存</button>
+        </div>
+        <textarea id="pfText" rows="16" placeholder="（提示词内容）"></textarea>
+      </div>
+      <div id="pfNoDir" style="display:none" class="note gray"></div>
+    </div>
+  </section>
+
+  <!-- ================= 配置 ================= -->
+  <section class="page" id="page-config">
+    <h1>⚙️ 配置 <span class="sub">保存即生效：llm/context/tools/doom 即时热更新；带 ⚠重启 标记的段需重启进程</span></h1>
+    <div class="cfg-scope">
+      <span class="dim" id="cfgPatchFile" style="font-size:12px">落盘 config/user.json（重启恢复）</span>
+    </div>
+    <div id="cfgBody"></div>
+    <div class="row" style="margin-top:6px">
+      <button class="primary" style="padding:9px 30px;font-size:15px" onclick="saveConfig()">💾 保存并生效</button>
+      <span id="cfgResult" style="font-size:13px"></span>
+    </div>
+    <div id="cfgResultList" class="applied-list"></div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+"use strict";
+/* ================= 全局状态 ================= */
+const $ = (id) => document.getElementById(id);
+// 单实例（2026-09-09 多 agent 移除）：一个聊天框 DOM + 流式状态 + 常驻 /events 流。
+const state = { box: null, busy: false, seenRuns: [], stream: null, compressLive: new Map(), events: null };
+
+function getBox() {
+  if (!state.box) {
+    const el = document.createElement("div");
+    el.className = "chatbox";
+    $("chatBoxes").appendChild(el);
+    state.box = { el, loaded: false };
+  }
+  return state.box;
+}
+
+async function showBox() {
+  const b = getBox();
+  $("sendBtn").disabled = false; // 运行中发送 = 入队（与本轮合并一起发），不挡
+  $("stopBtn").style.display = state.busy ? "" : "none";
+  $("chatMeta").textContent = `会话 #${b.session ?? "-"} · ${state.busy ? "运行中…" : "空闲"}`;
+  await restoreChatBox();
+  // 常驻 /events 流：历史加载完才连——若先连，重放帧会把"刷新瞬间在跑那轮"的
+  // delta 写进框，随后历史加载的 innerHTML="" 会把它清掉 → 丢流式回复。
+  eventsFor();
+}
+
+/* 历史恢复（2026-08-29）：框为空且未加载过 → GET /history 重建。 */
+async function restoreChatBox() {
+  const b = getBox();
+  if (b.loaded || b.el.children.length > 0) { b.el.scrollTop = b.el.scrollHeight; return; }
+  b.el.innerHTML = `<div class="empty">加载历史中…</div>`;
+  try {
+    const j = await api("/history");
+    if (state.box !== b) return; // 已重置/重建 → 丢弃
+    b.el.innerHTML = "";
+    // 滚动总结（压缩后的历史，2026-09-07）：置顶一张可折叠卡片
+    if (j.summary) {
+      b.el.insertAdjacentHTML("beforeend",
+        `<details class="ev compress" style="margin:6px 0"><summary>🗜️ 历史总结（压缩后的早前消息）</summary><div class="md" style="max-height:320px;overflow:auto;word-break:break-word">${md(j.summary)}</div></details>`);
+    }
+    for (const e of j.entries) renderHistoryEntry(e);
+    if (!j.entries.length && !j.summary) b.el.innerHTML = `<div class="empty">（会话 #${j.session} 暂无消息）</div>`;
+    b.loaded = true;
+    b.el.scrollTop = b.el.scrollHeight;
+  } catch (e2) {
+    if (state.box !== b) return;
+    b.el.innerHTML = `<div class="empty">历史加载失败：${esc(e2.message)}</div>`;
+  }
+}
+function renderHistoryEntry(e) {
+  if (e.role === "user") {
+    // /inject 附件消息的 content 是 parts 数组（2026-09-11）：渲染文本 + 附件徽标
+    if (Array.isArray(e.content)) {
+      const text = e.content.filter((x) => x.type === "text").map((x) => x.text).join("\n");
+      const nImg = e.content.filter((x) => x.type === "image_url").length;
+      const refs = e.content.filter((x) => x.type === "inject_ref").map((x) => x.ref).join(",");
+      chatUserHtml((text ? text + "\n" : "") + `📎 ${refs || "附件"}${nImg ? `（图片 ×${nImg}）` : ""}`);
+    } else chatUserHtml(e.content);
+    return;
+  }
+  if (e.role === "assistant") {
+    if (e.reasoning_content) chatAddHtml(evCard("thinking", "💭", "思考", e.reasoning_content));
+    if (e.tool_calls?.length) for (const tc of e.tool_calls) {
+      let args = "{}";
+      try { args = prettyJson(JSON.parse(tc.function.arguments)); } catch { args = tc.function.arguments; }
+      chatAddHtml(evCard("toolcall", "🔧", `调用 ${tc.function.name}`, args, `call ${String(tc.id).slice(0, 8)}`));
+    }
+    if (e.content) chatBotHtml(e.content);
+  } else if (e.role === "tool") {
+    chatAddHtml(evCard("toolres", "📄", "工具返回", e.content, `call ${String(e.tool_call_id ?? "").slice(0, 8)}`));
+  }
+}
+
+/* ================= 基础工具 ================= */
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+/** markdown 渲染（2026-09-09）：模型输出按 markdown 渲染成 HTML。marked 不可用时回退 esc() 纯文本。 */
+function md(text) {
+  const raw = String(text ?? "");
+  const m = typeof window !== "undefined" ? window.marked : undefined;
+  const parse = m && (typeof m.parse === "function" ? m.parse : typeof m.marked === "function" ? m.marked : null);
+  if (!parse) return esc(raw);
+  try {
+    return parse(raw, { gfm: true, breaks: true });
+  } catch (e) {
+    return esc(raw);
+  }
+}
+async function api(path, opt) {
+  const r = await fetch(path, opt);
+  let j = null;
+  try { j = await r.json(); } catch {}
+  if (!r.ok) throw new Error((j && (j.error || j.message)) || `HTTP ${r.status}`);
+  return j;
+}
+function apiPost(path, body) {
+  return api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+}
+function toast(msg, isErr) {
+  const d = document.createElement("div");
+  d.className = "toast" + (isErr ? " err" : "");
+  d.textContent = msg;
+  $("toast").appendChild(d);
+  setTimeout(() => d.remove(), isErr ? 6000 : 3500);
+}
+function fmtBytes(n) {
+  if (n == null) return "-";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1024 / 1024).toFixed(2) + " MB";
+}
+function fmtDur(ms) {
+  if (ms == null) return "-";
+  if (ms < 1000) return ms + " ms";
+  const s = ms / 1000;
+  if (s < 60) return s.toFixed(1) + " 秒";
+  const m = s / 60;
+  if (m < 60) return m.toFixed(1) + " 分钟";
+  const h = m / 60;
+  if (h < 48) return h.toFixed(1) + " 小时";
+  return (h / 24).toFixed(1) + " 天";
+}
+function timeAgo(ts) {
+  if (!ts) return "-";
+  const d = Date.now() - ts;
+  if (d < 5000) return "刚刚";
+  if (d < 60000) return Math.floor(d / 1000) + " 秒前";
+  if (d < 3600000) return Math.floor(d / 60000) + "分钟前";
+  if (d < 86400000) return Math.floor(d / 3600000) + " 小时前";
+  return new Date(ts).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+function fmtTs(ts) {
+  if (!ts) return "-";
+  return new Date(ts).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+function prettyJson(v) {
+  try { return JSON.stringify(v, null, 2); } catch { return String(v); }
+}
+
+/* ================= 页面路由 ================= */
+const PAGES = ["chat", "status", "prompts", "config"];
+const LOADERS = {
+  status: loadStatus, prompts: loadPrompts, config: loadConfig,
+};
+document.querySelectorAll("#nav a").forEach((a) => {
+  a.onclick = () => showPage(a.dataset.page);
+});
+function showPage(p) {
+  document.querySelectorAll("#nav a").forEach((x) => x.classList.toggle("active", x.dataset.page === p));
+  document.querySelectorAll(".page").forEach((x) => x.classList.toggle("active", x.id === "page-" + p));
+  const L = LOADERS[p];
+  if (L) L();
+  stopAuto();
+  if (p === "status") startAuto();
+}
+/* 页面可见时自动刷新（状态页每 3s） */
+let autoTimer = null;
+function startAuto() {
+  stopAuto();
+  autoTimer = setInterval(() => {
+    if (document.hidden) return;
+    const act = document.querySelector(".page.active");
+    if (act?.id === "page-status") loadStatus();
+  }, 3000);
+}
+function stopAuto() { if (autoTimer) { clearInterval(autoTimer); autoTimer = null; } }
+
+/* ================= 健康检测 ================= */
+async function health() {
+  const dot = $("healthDot"), txt = $("healthText");
+  try {
+    const j = await api("/health");
+    dot.className = "dot ok";
+    txt.textContent = `在线 · ${j.llm}`;
+    txt.title = j.llm;
+    return j;
+  } catch (e) {
+    dot.className = "dot err";
+    txt.textContent = "服务离线";
+  }
+}
+
+/* ================= 聊天（单实例，2026-09-09） ================= */
+function chatKey(e) {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); }
+}
+function chatAddHtml(html) {
+  const box = getBox().el;
+  box.insertAdjacentHTML("beforeend", html);
+  box.scrollTop = box.scrollHeight;
+}
+function chatUserHtml(text, queued) {
+  const tag = queued ? `<div class="queue-tag">⏳ 排队中</div>` : "";
+  chatAddHtml(`<div class="msg user"><div class="bubble">${esc(text)}${tag}</div></div>`);
+}
+function chatBotHtml(text) {
+  // bot 回复渲染 markdown（2026-09-09）；user 气泡保持纯文本
+  chatAddHtml(`<div class="msg bot"><div class="bubble md">${md(text)}</div></div>`);
+}
+function chatUser(text, queued) {
+  chatUserHtml(text, queued);
+  $("chatInput").value = "";
+}
+/* 本轮开始 → 清掉所有"排队中"标记（它们已被 drain 带走，随本轮一起发出） */
+function clearQueueTags() {
+  getBox().el.querySelectorAll(".queue-tag").forEach((t) => t.remove());
+}
+
+/* ---------- 流式显示（2026-08-29） ---------- */
+function streamEnsure() {
+  let c = state.stream;
+  if (c) return c;
+  const box = getBox().el;
+  const think = document.createElement("div");
+  think.className = "ev thinking";
+  think.style.display = "none";
+  think.innerHTML = `<div class="evhead">💭 <b>思考</b></div><pre></pre>`;
+  const msg = document.createElement("div");
+  msg.className = "msg bot";
+  msg.innerHTML = `<div class="bubble streaming"></div>`;
+  box.appendChild(think);
+  box.appendChild(msg);
+  c = {
+    think, thinkPre: think.querySelector("pre"),
+    msg, bubble: msg.querySelector(".bubble"),
+    thinking: "", text: "", stopped: false,
+  };
+  state.stream = c;
+  return c;
+}
+function streamDelta(d) {
+  const c = streamEnsure();
+  if (d.thinking) {
+    c.thinking += d.thinking;
+    c.think.style.display = "";
+    c.thinkPre.textContent = c.thinking;
+  }
+  if (d.text) {
+    c.text += d.text;
+    c.bubble.className = "bubble md streaming";
+    c.bubble.innerHTML = md(c.text) + '<span class="cursor"></span>';
+  }
+  const box = getBox().el;
+  box.scrollTop = box.scrollHeight;
+}
+function streamEnd() {
+  const c = state.stream;
+  if (!c) return;
+  state.stream = null;
+  const cur2 = c.bubble.querySelector(".cursor");
+  if (cur2) cur2.remove();
+  c.bubble.classList.remove("streaming");
+  if (!c.thinking && !c.text) { c.think.remove(); c.msg.remove(); return; }
+  if (!c.text) { c.msg.remove(); }
+  if (c.text && !c.bubble.textContent) c.bubble.textContent = "";
+}
+/* ---------- 压缩"进行中"活卡（2026-09-01，压缩改流式后） ---------- */
+function compressLiveEnsure(scope) {
+  let c = state.compressLive.get(scope);
+  if (c) return c;
+  const el = document.createElement("div");
+  el.className = "ev compress";
+  el.style.borderStyle = "dashed";
+  el.innerHTML = `<div class="evhead">🗜️ <b>上下文压缩 [${scope}] 进行中…</b><span class="dim" style="font-size:11px">流式生成</span></div><pre class="clpre" style="white-space:pre-wrap;word-break:break-word;max-height:240px;overflow:auto"></pre>`;
+  const pre = el.querySelector(".clpre");
+  getBox().el.appendChild(el);
+  c = { el, pre, thinking: "", text: "" };
+  state.compressLive.set(scope, c);
+  const box = getBox().el;
+  box.scrollTop = box.scrollHeight;
+  return c;
+}
+function compressLiveDelta(scope, d) {
+  const c = compressLiveEnsure(scope);
+  if (d.thinking) c.thinking += d.thinking;
+  if (d.text) c.text += d.text;
+  let body = "";
+  if (c.thinking) body += c.thinking + "\n";
+  if (c.text) body += c.text;
+  c.pre.textContent = body;
+  const box = getBox().el;
+  box.scrollTop = box.scrollHeight;
+}
+function compressLiveEnd(scope) {
+  const c = state.compressLive.get(scope);
+  if (c) { c.el.remove(); state.compressLive.delete(scope); }
+}
+/* 清掉全部"压缩中"活卡（/stop 中断压缩、run 结束等收尾场景用） */
+function compressLiveEndAll() {
+  for (const [scope, c] of state.compressLive) { c.el.remove(); state.compressLive.delete(scope); }
+}
+function evCard(cls, icon, title, detailBody, badge) {
+  return `<div class="ev ${cls}">
+    <div class="evhead">${icon} <b>${esc(title)}</b>${badge ? `<span class="dim" style="font-size:11px">${badge}</span>` : ""}</div>
+    ${detailBody ? `<details open><summary>详情（点击折叠/展开）</summary><pre>${esc(detailBody)}</pre></details>` : ""}
+  </div>`;
+}
+function handleChatEvent(type, data) {
+  switch (type) {
+    case "run_start": {
+      const b = getBox();
+      const key = `${data.session}:${data.index ?? 0}`;
+      if (!state.seenRuns.includes(key)) state.seenRuns.push(key);
+      b.session = data.session;
+      syncUi(true);
+      clearQueueTags();
+      break;
+    }
+    case "run_msg": {
+      // merged 轮跳过（文本是"【第 N 条】…"拼接）。去重：框内已有相同文本的 user 气泡则跳过。
+      if (data.kind === "merged") break;
+      const msg = String(data.message ?? "");
+      const pre = msg.slice(0, 40);
+      const bb = getBox();
+      const dup = Array.from(bb.el.querySelectorAll(".msg.user .bubble"))
+        .some((x) => x.textContent?.startsWith(pre));
+      if (!dup && msg) chatUserHtml(msg);
+      break;
+    }
+    case "run_end":
+      clearQueueTags();
+      compressLiveEndAll();
+      refreshQueue();
+      break;
+    case "delta":
+      streamDelta(data);
+      break;
+    case "stopped":
+      streamEnd();
+      compressLiveEndAll();
+      chatAddHtml(evCard("doom", "⏹", "已中断", "用户手动停止（/stop），已生成内容保留进会话"));
+      break;
+    case "tool_call": {
+      streamEnd();
+      const args = prettyJson(data.args);
+      chatAddHtml(evCard("toolcall", "🔧", `调用 ${data.name}`, args, `call ${data.call_id.slice(0, 8)}`));
+      break;
+    }
+    case "tool_result": {
+      const badge = [
+        data.backgrounded ? "⏳ 已转后台" : "",
+        data.truncated ? `截断 · 全文 ${fmtBytes(data.total_chars)} · 显示前 ${fmtBytes((data.content || "").length)}` : "",
+      ].filter(Boolean).join(" · ");
+      chatAddHtml(evCard("toolres", "📄", `${data.name} 返回`, data.content || "", badge || "完成"));
+      break;
+    }
+    case "bg_start":
+      chatAddHtml(evCard("bgstart", "⏳", `前台超时，${data.tool_name} 转后台继续`, `前台等待上限 ${fmtDur(data.timeout_ms)}；完成后结果搭车随下一条消息发出，或空闲超时后单独唤醒`));
+      break;
+    case "bg_piggyback":
+      chatAddHtml(evCard("bgstart", "🚗", `${data.tool_name} 后台结果已搭车（${data.ok ? "成功" : "失败"}）`, `结果 ${fmtBytes(data.result_chars)}，已注入到本条消息之前、与本次 LLM 调用一起发出（不单独唤醒）`));
+      break;
+    case "user_piggyback": {
+      // 轮内搭车注入（2026-09-09）：运行中用户消息被取走注入上下文。
+      // 找已有的 user 气泡标"🚗 已搭车"；找不到（刷新过）→ 补画气泡。
+      const msg = String(data.message ?? "");
+      if (!msg) break;
+      const pre = msg.slice(0, 40);
+      const box = getBox().el;
+      const bub = Array.from(box.querySelectorAll(".msg.user .bubble"))
+        .find((x) => x.textContent?.startsWith(pre));
+      if (bub) {
+        if (!bub.querySelector(".piggy-tag")) {
+          bub.insertAdjacentHTML("beforeend", '<div class="piggy-tag">🚗 已搭车注入</div>');
+        }
+      } else {
+        chatUserHtml(msg);
+      }
+      break;
+    }
+    case "compress_delta":
+      if (data.thinking || data.text) compressLiveDelta(data.scope, data);
+      break;
+    case "compress": {
+      compressLiveEnd(data.scope);
+      const badge = `${fmtBytes(data.before_chars)} → ${fmtBytes(data.after_chars)} · ${data.rounds} 轮${data.forced ? " · ⚠强制截断" : ""}`;
+      let body = "";
+      if (data.thinking) body += `【压缩轮思考】\n${data.thinking}\n\n`;
+      if (data.text) body += `【压缩后内容】\n${data.text}`;
+      if (!body) body = data.detail;
+      chatAddHtml(evCard("compress", "🗜️", `上下文压缩 [${data.scope}]`, body, badge));
+      break;
+    }
+    case "doom_warn":
+      chatAddHtml(evCard("doom", "⚠️", "死循环警告", data.detail));
+      break;
+    case "doom_stop":
+      chatAddHtml(evCard("doom", "⛔", "死循环强停", data.detail));
+      break;
+    case "error":
+      streamEnd();
+      chatAddHtml(evCard("doom", "❌", "运行出错", data.message));
+      break;
+    case "done":
+      streamEnd();
+      chatAddHtml(`<div class="ev usage">📊 本轮 token：prompt ${data.usage.prompt_tokens} / completion ${data.usage.completion_tokens} / 缓存命中 ${data.usage.cached_tokens}</div>`);
+      break;
+  }
+}
+function syncUi(running) {
+  state.busy = running;
+  $("sendBtn").disabled = false; // 运行中发送 = 入队（随本轮结束一起发），永不挡
+  $("stopBtn").style.display = running ? "" : "none";
+  const b = state.box;
+  if (b) $("chatMeta").textContent = `会话 #${b.session ?? "-"} · ${running ? "运行中…" : "空闲"}`;
+}
+function chatFinish() { syncUi(false); }
+
+/* ================= /events 常驻事件流（2026-08-31 方案A） ================= */
+function eventsFor() {
+  if (state.events) return state.events;
+  const es = new EventSource("/events");
+  state.events = es;
+  const on = (name, fn) => es.addEventListener(name, (ev) => {
+    let d; try { d = JSON.parse(ev.data); } catch { return; }
+    try { fn(d); } catch (e) { console.error("[events]", name, e); }
+  });
+  on("hello", (d) => {
+    syncUi(d.running);
+    for (const m of (d.queued || [])) chatUserHtml(m, true);
+  });
+  on("enqueued", (d) => {
+    if (d.running) {
+      const b = getBox();
+      const last = b.el.children[b.el.childElementCount - 1];
+      const bub = last?.className === "msg user" ? last.querySelector(".bubble") : null;
+      if (bub && !bub.querySelector(".queue-tag") && bub.textContent?.startsWith(String(d.message).slice(0, 40))) {
+        bub.insertAdjacentHTML("beforeend", `<div class="queue-tag">⏳ 排队中</div>`);
+      }
+    }
+  });
+  on("run_start", (d) => handleChatEvent("run_start", d));
+  on("run_msg", (d) => handleChatEvent("run_msg", d));
+  on("run_end", (d) => handleChatEvent("run_end", d));
+  on("delta", (d) => handleChatEvent("delta", d));
+  on("stopped", (d) => handleChatEvent("stopped", d));
+  on("tool_call", (d) => handleChatEvent("tool_call", d));
+  on("tool_result", (d) => handleChatEvent("tool_result", d));
+  on("bg_start", (d) => handleChatEvent("bg_start", d));
+  on("bg_piggyback", (d) => handleChatEvent("bg_piggyback", d));
+  on("user_piggyback", (d) => handleChatEvent("user_piggyback", d));
+  on("compress", (d) => handleChatEvent("compress", d));
+  on("compress_delta", (d) => handleChatEvent("compress_delta", d));
+  on("doom_warn", (d) => handleChatEvent("doom_warn", d));
+  on("doom_stop", (d) => handleChatEvent("doom_stop", d));
+  on("error", (d) => {
+    // EventSource 的 "error" 分两种——服务端广播的 run error 带 data，连接自身断开无 data（浏览器自动重连）。
+    if (d && d.message) handleChatEvent("error", d);
+  });
+  on("done", (d) => handleChatEvent("done", d));
+  return es;
+}
+/* 队列状态轮询（2s）：running 以服务端为准（含活动 drain，多轮间隙不闪），
+ * 排队消息补显"排队中"气泡（重连/hello 错过的兜底）。事件驱动为主，轮询只做对齐。 */
+let queueTimer = null;
+function refreshQueue() {
+  api("/queue")
+    .then((j) => {
+      syncUi(j.running);
+      const b = getBox();
+      for (const m of (j.queued || [])) {
+        const pre = String(m).slice(0, 40);
+        const els = Array.from(b.el.querySelectorAll(".msg.user .bubble"));
+        const hit = els.find((x) => x.textContent?.startsWith(pre));
+        if (!hit) chatUserHtml(m, true);
+        else if (!hit.querySelector(".queue-tag")) hit.insertAdjacentHTML("beforeend", `<div class="queue-tag">⏳ 排队中，将随本轮结束一起发出</div>`);
+      }
+    })
+    .catch(() => {}); // 服务重启中，忽略（下一轮再对齐）
+}
+function startQueuePolling() {
+  stopQueuePolling();
+  queueTimer = setInterval(refreshQueue, 2000);
+}
+function stopQueuePolling() { if (queueTimer) { clearInterval(queueTimer); queueTimer = null; } }
+/* 发送消息（2026-08-31 改走 /enqueue + /events）：
+ * - 空闲：入队立即处理（running=false），气泡无标记。
+ * - 运行中：入队不触发 run，气泡带"排队中"；本轮结束后 drain 把积攒消息合并成一条发出。
+ * 显示统一由常驻 /events 流驱动（handleChatEvent），本函数只管入队 + 乐观气泡。 */
+async function sendChat() {
+  const input = $("chatInput");
+  const message = input.value.trim();
+  if (!message) return;
+  const box = getBox();
+  const queued = state.busy;
+  const before = box.el.childElementCount;
+  chatUser(message, queued);
+  box.loaded = true;
+  try {
+    await apiPost("/enqueue", { message });
+  } catch (e) {
+    const el = box.el.children[before];
+    if (el?.className === "msg user") el.remove();
+    chatAddHtml(evCard("doom", "❌", "发送失败", e.message));
+  }
+  refreshQueue();
+}
+async function stopChat() {
+  $("stopBtn").style.display = "none";
+  $("chatMeta").textContent = "正在中断…";
+  try {
+    await fetch("/stop", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  } catch (e) { toast("中断请求失败：" + e.message, true); }
+}
+async function resetSession() {
+  if (!confirm("重置会话？\n当前上下文将清空，会话编号 +1。")) return;
+  try {
+    const j = await apiPost("/reset", {});
+    toast(`会话已重置 → #${j.session}`);
+    const b = state.box;
+    if (b) { b.el.innerHTML = ""; b.loaded = false; b.session = j.session; }
+    state.seenRuns = [];
+    state.stream = null;
+    compressLiveEndAll();
+    refreshQueue();
+  } catch (e) { toast(e.message, true); }
+}
+
+/* ================= 状态页 ================= */
+async function loadStatus() {
+  let s;
+  try { s = await api("/status"); }
+  catch (e) { $("stMeta").textContent = "加载失败：" + e.message; return; }
+  $("stMeta").textContent = `会话 #${s.session} · ${s.running ? "运行中" : "空闲"}`;
+  $("stContext").innerHTML = `
+    <div class="kv"><b>消息</b><span>${s.context.messages} 条（${fmtBytes(s.context.msg_chars)}）</span></div>
+    <div class="kv"><b>滚动总结</b><span>${s.context.summary ? `1 条（${fmtBytes(s.context.summary_chars)}）` : "无"}</span></div>
+    <div class="kv"><b>总 token（估算）</b><span class="mono">${s.context.total_tokens}（消息 ${s.context.msg_tokens} + 总结 ${s.context.summary_tokens}）</span></div>
+    <div class="kv"><b>上下文构成</b><span class="mono" style="font-size:12px">[summary ×${s.context.summary}] → [messages ×${s.context.messages}]</span></div>`;
+  $("stPrompt").innerHTML = `
+    <div class="kv"><b>来源</b><span>${s.system_prompt.fallback ? '<span class="tag pause">内置默认（目录缺失）</span>' : esc(s.system_prompt.files.map((f) => f.name).join(", "))}</span></div>
+    <div class="kv"><b>总长度</b><span>${fmtBytes(s.system_prompt.chars)}</span></div>`;
+  $("stBg").innerHTML = s.backgrounds.length
+    ? `<table><tr><th>工具</th><th>开始</th><th>状态</th><th>耗时</th></tr>${s.backgrounds.map((t) => `<tr>
+        <td class="mono">${esc(t.tool)}</td><td>${timeAgo(t.started_at)}</td>
+        <td>${t.settled ? (t.ok ? '<span class="tag ok">成功</span>' : '<span class="tag fail">失败</span>') : '<span class="tag run">执行中</span>'}</td>
+        <td>${t.duration_ms != null ? fmtDur(t.duration_ms) : "-"}</td></tr>`).join("")}</table>`
+    : '<div class="empty">无后台任务</div>';
+  $("stRaw").innerHTML = s.raw_tail.length
+    ? s.raw_tail.map((e) => `<div style="padding:5px 0;border-bottom:1px solid rgba(42,52,68,.5);font-size:12.5px">
+        <span class="tag">${esc(e.role)}</span> <span class="dim">${e.chars} 字符</span>
+        <div class="mono" style="font-size:12px;margin-top:2px">${esc(e.preview)}${e.chars > 120 ? "…" : ""}</div></div>`).join("")
+    : '<div class="empty">上下文为空</div>';
+  $("stCompress").innerHTML = s.compress.length
+    ? s.compress.slice().reverse().map((e) => `<div style="padding:5px 0;border-bottom:1px solid rgba(42,52,68,.5);font-size:12.5px">
+        <span class="tag" style="color:var(--purple)">${esc(e.scope)}</span> <span class="dim">${timeAgo(e.at)}</span>
+        <div style="font-size:12px">${esc(e.detail)} · <span class="mono">${fmtBytes(e.before)} → ${fmtBytes(e.after)} · ${e.rounds} 轮${e.forced ? " · ⚠强制截断" : ""}</span></div></div>`).join("")
+    : '<div class="empty">暂无压缩记录</div>';
+  $("stDoom").innerHTML = s.doom.length
+    ? s.doom.slice().reverse().map((e) => `<div style="padding:5px 0;border-bottom:1px solid rgba(42,52,68,.5);font-size:12.5px">
+        ${e.kind === "stop" ? '<span class="tag fail">强停</span>' : e.kind === "warn" ? '<span class="tag pause">告警</span>' : ""}
+        <span class="dim">${timeAgo(e.at)}</span> <span style="font-size:12px">${esc(e.detail)}</span></div>`).join("")
+    : '<div class="empty">暂无告警（好事）</div>';
+}
+
+/* ================= 提示词页 ================= */
+let pfCurrent = null;
+async function loadPrompts() {
+  let j;
+  try { j = await api("/prompts"); }
+  catch (e) { $("promptHead").textContent = "加载失败：" + e.message; return; }
+  $("promptHead").innerHTML =
+    `目录：<span class="mono">${j.dir ? esc(j.dir) : "无（使用内置默认提示词）"}</span> · ` +
+    (j.fallback ? '<span class="tag pause">回退内置默认</span>' : "") +
+    ` 总长度 ${fmtBytes(j.chars)}`;
+  if (!j.dir) {
+    $("promptFileList").innerHTML = "";
+    $("pfEditorWrap").style.display = "none";
+    $("pfNoDir").style.display = "";
+    $("pfNoDir").textContent = `无提示词目录，当前用内置默认提示词。请在"配置"页设置 system_prompt.dir 后重启。`;
+    return;
+  }
+  $("pfNoDir").style.display = "none";
+  $("promptFileList").innerHTML = j.files.length
+    ? j.files.map((f) => `<span class="pf-chip ${f.name === pfCurrent ? "active" : ""}" onclick="pfOpen('${esc(f.name)}')">${esc(f.name)} <span class="dim">${fmtBytes(f.chars)}</span></span>`).join("")
+    : '<span class="dim" style="font-size:12px">目录里没有 .md 文件（当前回退内置提示词）。在下方新建一个 .md 吧。</span>';
+  if (pfCurrent && !j.files.some((f) => f.name === pfCurrent)) pfCurrent = null;
+}
+async function pfOpen(name) {
+  pfCurrent = name;
+  try {
+    const j = await api(`/prompts/file?name=${encodeURIComponent(name)}`);
+    $("pfEditorWrap").style.display = "";
+    $("pfName").textContent = name;
+    $("pfChars").textContent = fmtBytes(j.content.length);
+    $("pfText").value = j.content;
+    loadPrompts();
+  } catch (e) { toast(e.message, true); }
+}
+function pfNew() {
+  const name = $("pfNewName").value.trim();
+  if (!name) return toast("请填写文件名", true);
+  if (!/^[A-Za-z0-9_\-][A-Za-z0-9_\- .]*$/.test(name) || name.includes("..")) return toast("文件名非法", true);
+  if (pfCurrent !== null && $("pfText").dataset.dirty === "1") {
+    if (!confirm(`当前 "${pfCurrent}" 有未保存修改，放弃并新建？`)) return;
+  }
+  pfCurrent = name;
+  $("pfNewName").value = "";
+  $("pfEditorWrap").style.display = "";
+  $("pfName").textContent = name + "（新文件）";
+  $("pfChars").textContent = "0 B";
+  $("pfText").value = "";
+  $("pfText").dataset.dirty = "0";
+  loadPrompts();
+  $("pfText").focus();
+}
+$("pfText")?.addEventListener?.("input", function () {
+  this.dataset.dirty = "1";
+  $("pfChars").textContent = fmtBytes(this.value.length) + " · 未保存";
+});
+async function pfSave() {
+  if (!pfCurrent) return;
+  try {
+    const j = await apiPost("/prompts/file", { name: pfCurrent, content: $("pfText").value });
+    $("pfText").dataset.dirty = "0";
+    $("pfChars").textContent = fmtBytes($("pfText").value.length);
+    toast(j.reloaded ? `已保存并重载，当前生效文件：${j.files.join(", ")}` : `已保存（非 .md，点"重载目录"生效）`);
+    loadPrompts();
+  } catch (e) { toast(e.message, true); }
+}
+async function pfReload() {
+  try {
+    const j = await apiPost("/prompts/reload", {});
+    toast(`已重载：${j.fallback ? "回退内置提示词" : j.files.join(", ")}（${fmtBytes(j.chars)}）`);
+    loadPrompts();
+  } catch (e) { toast(e.message, true); }
+}
+
+/* ================= 配置页（单实例全局，2026-09-09） ================= */
+const CFG_SCHEMA = [
+  { section: "server", title: "服务", fields: [
+    { key: "host", label: "监听地址（host）", type: "text", restart: true },
+    { key: "port", label: "端口（port）", type: "number", restart: true },
+  ]},
+  { section: "llm", title: "LLM 后端", fields: [
+    { key: "base_url", label: "base_url（OpenAI 兼容地址）", type: "text" },
+    { key: "model", label: "model", type: "text" },
+    { key: "api_key", label: "api_key（可空）", type: "text" },
+    { key: "timeout_ms", label: "请求超时 timeout_ms（毫秒）", type: "number" },
+  ]},
+  { section: "context", title: "上下文压缩（总 token 超阈 → 滚动 summary）", fields: [
+    { key: "max_tokens", label: "max_tokens：总 token 估算超此值触发压缩（token = 字符 ÷ chars_per_token）", type: "number" },
+    { key: "keep_recent_chars", label: "keep_recent_chars：压缩时保留的最新原文字符预算（从最新往前累积不超此值）", type: "number" },
+    { key: "hard_trunc_chars", label: "hard_trunc_chars：压缩 3 次重试均无响应 → 硬截断保留的最新字符数", type: "number" },
+    { key: "stream_idle_ms", label: "stream_idle_ms：压缩流空闲超时（毫秒，无 wire 字节含 ping 帧 → 重试）", type: "number" },
+    { key: "chars_per_token", label: "chars_per_token：字符→token 估算比例（字符/token，中文≈1.57，英文≈4）", type: "number", step: 0.1 },
+  ]},
+  { section: "tools", title: "工具", fields: [
+    { key: "fg_timeout_ms", label: "fg_timeout_ms：前台执行超时（毫秒，超时转后台）", type: "number" },
+    { key: "result_limit", label: "result_limit：工具结果回填上限（字符，超出截断+全文落带时间戳文件）", type: "number" },
+  ]},
+  { section: "doom", title: "死循环保护", fields: [
+    { key: "warn_after", label: "warn_after：连续 N 次相同调用后警告（≥2）", type: "number" },
+  ]},
+  { section: "data", title: "落盘", fields: [
+    { key: "dir", label: "data.dir：落盘根目录（运行时自动追加 -<port> 后缀，多实例互不干扰）", type: "text", restart: true },
+  ]},
+  { section: "system_prompt", title: "提示词目录", fields: [
+    { key: "dir", label: "system_prompt.dir（相对项目根）", type: "text", restart: true },
+  ]},
+];
+async function loadConfig(opts) {
+  let j;
+  try { j = await api("/config"); }
+  catch (e) { $("cfgBody").innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; return; }
+  const cfg = j.global;
+  $("cfgPatchFile").textContent = "落盘 config/user.json（重启恢复）";
+  if (!opts?.keepResult) {
+    $("cfgResult").textContent = "";
+    $("cfgResultList").innerHTML = "";
+  }
+  $("cfgBody").innerHTML = CFG_SCHEMA
+    .map((sec) => `<div class="card">
+      <h2>${esc(sec.title)}<span class="right">全局</span></h2>
+      <div class="grid3">
+      ${sec.fields.map((f) => {
+        let node = cfg;
+        for (const part of sec.section.split(".")) node = node && node[part];
+        const v = node?.[f.key] ?? "";
+        const control = f.type === "select"
+          ? `<select data-sec="${sec.section}" data-key="${f.key}" data-orig="${esc(v)}"${f.bool ? ' data-bool="1"' : ""}>${(f.options || []).map((o) => `<option value="${esc(o.v)}" ${String(v) === o.v ? "selected" : ""}>${esc(o.l)}</option>`).join("")}</select>`
+          : `<input data-sec="${sec.section}" data-key="${f.key}" data-orig="${esc(v)}" type="${f.type}" value="${esc(v)}" ${f.type === "number" ? `step="${f.step ?? 1}"` : ""}>`;
+        return `<div style="min-width:200px">
+          <label class="f">
+            <span>${esc(f.label)}${f.restart ? '<span class="restart-flag">⚠ 改后需重启进程</span>' : ""}${f.note && !f.restart ? `<span class="note gray">（${esc(f.note)}）</span>` : ""}</span>
+            ${control}
+          </label>
+        </div>`;
+      }).join("")}
+      </div>
+    </div>`).join("");
+}
+async function saveConfig() {
+  const patch = {};
+  document.querySelectorAll("#cfgBody [data-sec]").forEach((inp) => {
+    const isNum = inp.type === "number";
+    const isBool = inp.dataset.bool === "1";
+    const cur = isBool ? inp.value === "true" : isNum ? Number(inp.value) : inp.value;
+    const orig = isBool ? inp.dataset.orig === "true" : isNum ? Number(inp.dataset.orig) : inp.dataset.orig;
+    const changed = (isBool || isNum) ? cur !== orig : String(orig) !== cur;
+    if (!changed) return;
+    let node = patch;
+    for (const part of inp.dataset.sec.split(".")) {
+      node[part] = node[part] || {};
+      node = node[part];
+    }
+    node[inp.dataset.key] = cur;
+  });
+  if (Object.keys(patch).length === 0) {
+    toast("没有检测到改动（把输入框的值改回来再保存即可）");
+    return;
+  }
+  try {
+    const j = await apiPost("/config", { patch });
+    $("cfgResult").innerHTML = '<span style="color:var(--green)">✔ 已保存并生效</span>';
+    $("cfgResultList").innerHTML =
+      (j.applied || []).map((x) => `<div class="ok-line">✓ ${esc(x)}</div>`).join("") +
+      (j.restart || []).map((x) => `<div class="rs-line">⚠ ${esc(x)}</div>`).join("");
+    toast("配置已保存" + (j.restart?.length ? "（部分项需重启进程生效）" : "（全部即时生效）"));
+    await loadConfig({ keepResult: true });
+  } catch (e) {
+    toast(e.message, true);
+    $("cfgResult").innerHTML = `<span style="color:var(--red)">✘ ${esc(e.message)}</span>`;
+  }
+}
+
+/* ================= 启动 ================= */
+(async function init() {
+  health();
+  setInterval(health, 8000);
+  eventsFor(); // 常驻 /events 流（2026-08-31 方案A）：刷新/重开页面后续接
+  startQueuePolling(); // /queue 2s 对齐
+  await showBox(); // 页面加载 / 刷新后显示聊天框（含历史）
+})();
+</script>
+</body>
+</html>
