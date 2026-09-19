@@ -326,7 +326,7 @@ func broadcastEvent(state *AppState, e types.AgentEvent) {
 // logRunEvent run 事件里的 doom/bg 记录（所有入口统一）
 func logRunEvent(a *AgentState, e types.AgentEvent) {
 	switch e["type"] {
-	case "doom_warn":
+	case "doom_warn", "trunc_warn": // 异常截断（2026-09-15）与死循环警告同记 warn
 		a.logMu.Lock()
 		a.DoomLog = append(a.DoomLog, DoomLogEntry{At: time.Now().UnixMilli(), Kind: "warn", Detail: strOf(e["detail"])})
 		a.logMu.Unlock()

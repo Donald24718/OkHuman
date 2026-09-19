@@ -1,8 +1,11 @@
 package tools
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // cappedBuffer 行为（2026-09-14 审计 H3 修）：前 n 字节保留、超出丢弃但计数、
@@ -57,5 +60,56 @@ func TestCappedBufferPartialOver(t *testing.T) {
 	}
 	if c.over != 2 {
 		t.Fatalf("over=%d want 2", c.over)
+	}
+}
+
+// TestBashViaTempScript 方案 B（2026-09-15 移植自 TS 4a5182c）：命令文本进 /tmp 临时脚本、
+// 不进 argv——根治 pkill/pgrep -f 自匹配自杀；进程退出后脚本删除。
+// 验证：1) 运行期没有任何进程的 argv 含命令文本（在脚本文件里，不在 argv）；
+//       2) 输出正常；3) 退出后无新增临时脚本（跑前快照比对——同机其他 OkHuman
+//       实例的并发脚本不算残留）。
+func TestBashViaTempScript(t *testing.T) {
+	marker := "okhuman-planb-marker-7731"
+	before, _ := filepath.Glob(filepath.Join(os.TempDir(), "okhuman-bash-*.sh"))
+	done := make(chan string, 1)
+	go func() {
+		out, err := ExecuteTool("bash", map[string]interface{}{
+			"command":         "sleep 1; echo " + marker,
+			"timeout_seconds": 10,
+		})
+		if err != nil {
+			done <- "ERR:" + err.Error()
+			return
+		}
+		done <- out
+	}()
+	// 运行期扫 /proc：命令文本不应出现在任何进程 argv 里
+	time.Sleep(300 * time.Millisecond)
+	entries, _ := os.ReadDir("/proc")
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		cmdline, err := os.ReadFile("/proc/" + e.Name() + "/cmdline")
+		if err != nil || len(cmdline) == 0 {
+			continue
+		}
+		if strings.Contains(string(cmdline), marker) {
+			t.Fatalf("命令文本出现在进程 %s 的 argv（应在 /tmp 脚本里，不在 argv）", e.Name())
+		}
+	}
+	out := <-done
+	if !strings.Contains(out, marker) {
+		t.Fatalf("输出不含 marker: %q", out)
+	}
+	after, _ := filepath.Glob(filepath.Join(os.TempDir(), "okhuman-bash-*.sh"))
+	beforeSet := map[string]bool{}
+	for _, f := range before {
+		beforeSet[f] = true
+	}
+	for _, f := range after {
+		if !beforeSet[f] {
+			t.Errorf("临时脚本未删除（新增残留）: %s", f)
+		}
 	}
 }

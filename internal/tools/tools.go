@@ -6,8 +6,12 @@ package tools
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -70,7 +74,18 @@ func toolBash(args map[string]interface{}) (string, error) {
 		timeoutSec = 600
 	}
 
-	cmd := exec.Command("bash", "-c", command)
+	// 方案 B（2026-09-15）：命令文本进 /tmp 临时脚本，不进 argv。pkill/pgrep -f 按完整
+	// 命令行（argv）匹配——旧 `bash -c <全文>` 把命令文本挂在包装壳 argv 上，任何命中
+	// 命令文本的 -f 模式必然匹配到包装壳自己（自杀 exit 143 / 自匹配假 pid，2026-09-15
+	// 实测事故）。执行脚本文件是 bash 原生形态：命令文本既不在 argv 也不在 environ。
+	// 文件在进程退出后删除（绑退出，不绑 30s 前台超时——届时命令可能已转后台仍在跑；
+	// 提前 unlink 也不会中断执行，绑退出是保留取证价值）。
+	scriptPath := filepath.Join(os.TempDir(), fmt.Sprintf("okhuman-bash-%d-%s.sh", time.Now().UnixMilli(), randHex(4)))
+	if err := os.WriteFile(scriptPath, []byte(command), 0o700); err != nil {
+		return "", fmt.Errorf("写临时脚本失败: %w", err)
+	}
+	defer os.Remove(scriptPath)
+	cmd := exec.Command("bash", scriptPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // 独立进程组
 	// 审计 H3 修（2026-09-14）：输出按流封顶 32MB（防单条命令灌 GB 级输出
 	// OOM 整个进程；600s 只限时间不限大小）。超上限部分丢弃但持续读取
@@ -164,4 +179,13 @@ func requireStr(args map[string]interface{}, key string) (string, bool) {
 		return "", false
 	}
 	return s, true
+}
+
+// randHex n 字节的十六进制随机串（临时脚本文件名去重用）
+func randHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%x", time.Now().UnixNano()) // crypto/rand 失败兜底（理论上不会）
+	}
+	return hex.EncodeToString(b)
 }

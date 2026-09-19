@@ -240,6 +240,14 @@ func (a *Agent) runUserMessage(ctx context.Context, userText string, opt RunOpti
 	if err != nil {
 		return a.finishRunError(err, runCtx, emit, &totals)
 	}
+	// 异常截断（2026-09-15）：有 thinking 但无正文也无工具调用 → 不是"纯文本回复"：提示模型 + 重试一次
+	if isTruncated(resp) {
+		r2, err2 := a.retryTruncation(runCtx, emit, &totals)
+		if err2 != nil {
+			return a.finishRunError(err2, runCtx, emit, &totals)
+		}
+		resp = r2
+	}
 	// 纯文本回复 → 本轮结束
 	if len(resp.ToolCalls) == 0 {
 		return a.finishText(resp, emit, &totals)
@@ -247,6 +255,31 @@ func (a *Agent) runUserMessage(ctx context.Context, userText string, opt RunOpti
 	// 注意：必须等 runLoop 完成后再 return（Go 无 JS 的 return-promise 陷阱，
 	// defer 顺序天然正确）
 	return a.runLoop(runCtx, resp, emit, &totals, opt)
+}
+
+// isTruncated 异常截断判定（2026-09-15）：响应有 thinking 但无正文也无工具调用。
+//  服务端提前收笔（Q2 量化提前 stop token / MTP 投机解码异常）——OkHuman 请求不发
+//  max_tokens（纯协议层），客户端没有截断理由，流是干净结束的 HTTP 200。
+func isTruncated(resp *types.Response) bool {
+	return len(resp.ToolCalls) == 0 &&
+		strings.TrimSpace(resp.Content) == "" &&
+		resp.ReasoningContent != nil &&
+		strings.TrimSpace(*resp.ReasoningContent) != ""
+}
+
+// retryTruncation 异常截断处置：WebUI 事件 + 向模型注入提示 + 重试一次 llmCall。
+//  只重试一次（防死循环）；重试仍截断 → emit 放弃事件后原样返回。
+func (a *Agent) retryTruncation(ctx context.Context, emit func(types.AgentEvent), totals *TokenTotals) (*types.Response, error) {
+	emit(types.AgentEvent{"type": "trunc_warn", "detail": "有 thinking 但无正文也无工具调用 → 异常截断，提示模型重发"})
+	a.cm.AddMessage(&types.RawEntry{Role: "user", Content: "（系统提示：你上一条响应有思考内容，但未输出正文或工具调用，判定为异常截断。请基于当前上下文重新输出完整正文或工具调用。）"})
+	resp, err := a.llmCall(ctx, emit, totals)
+	if err != nil {
+		return nil, err
+	}
+	if isTruncated(resp) {
+		emit(types.AgentEvent{"type": "trunc_warn", "detail": "重试后仍无正文或工具调用 → 本轮放弃（请查 LLM 服务端日志的 stop 原因）"})
+	}
+	return resp, nil
 }
 
 // finishRunError runUserMessage 顶层错误收尾：AgentStoppedError → partial 收尾；

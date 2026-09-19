@@ -15,9 +15,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -74,6 +76,30 @@ func main() {
 		}
 		promptDirRel = abs
 		break
+	}
+
+	// ---------- 端口冲突回退（2026-09-15）：配置端口被占用 → 依次 +1 直到成功 ----------
+	// 用一次性 listener 探测（bind 成功 = 可用，随即关闭）；末尾真实服务器再绑同一端口。
+	// 探测→真实窗口毫秒级，本机仅并发启动另一个 OkHuman 才可能抢占，届时以 EADDRINUSE 明确报错。
+	// 端口若被顶走，落盘目录后缀 -<port>（下段）随实际绑定端口走，保持"一端口一目录"。
+	host := cfg.Server.Host
+	port := cfg.Server.Port
+	for {
+		ln, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+		if err == nil {
+			_ = ln.Close()
+			break
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "in use") {
+			port++
+			fmt.Fprintf(os.Stderr, "[server] 端口 %d 被占用，试 %d\n", port-1, port)
+			continue
+		}
+		fatalf("端口 %d 绑定失败: %v", port, err)
+	}
+	if port != cfg.Server.Port {
+		fmt.Fprintf(os.Stderr, "[server] 配置端口 %d → 实际使用 %d\n", cfg.Server.Port, port)
+		cfg.Server.Port = port
 	}
 
 	// ---------- 落盘根目录：自动追加端口后缀（多实例同机互不干扰） ----------
@@ -262,10 +288,20 @@ func saveGlobalConfigPatch(root string, patch map[string]interface{}) {
 	}
 	next := deepMergeMaps(cur, patch)
 
-	// 清理"等于出厂默认"的叶子键，文件保持最小
+	// 清理"冗余"的叶子键，文件保持最小。
+	// 基线 = 不含 user.json 的生效值（DEFAULTS+default.json），不是裸 DEFAULTS（2026-09-15 修）：
+	// default.json 覆盖过的键，user 里"等于出厂默认"的值正是把它掰回来的覆盖，删掉即静默
+	// 改变生效配置（8451 事故：user.json 的 server.port:8451 被删，实例身份被 default.json
+	// 偷成 8452，下次重启撞端口崩死）。
 	var base map[string]interface{}
 	if b, err := json.Marshal(config.Default()); err == nil {
 		_ = json.Unmarshal(b, &base)
+	}
+	if s, err := os.ReadFile(filepath.Join(root, "config", "default.json")); err == nil {
+		var ds map[string]interface{}
+		if json.Unmarshal(s, &ds) == nil {
+			base = deepMergeMaps(base, ds)
+		}
 	}
 	for s, sec := range next {
 		secM, ok := sec.(map[string]interface{})

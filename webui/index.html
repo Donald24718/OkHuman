@@ -56,8 +56,17 @@
     width: 210px; min-width: 210px; background: var(--bg2); border-right: 1px solid var(--border);
     display: flex; flex-direction: column; padding: 14px 10px;
   }
-  .logo { font-size: 18px; font-weight: 700; padding: 4px 8px 14px; letter-spacing: .5px; }
-  .logo em { color: var(--accent); font-style: normal; }
+  /* 品牌标（2026-09-14 v4）：👌 手势即 "ok"，Human 原样保留 —— 👌Human = OkHuman */
+  .logo { display: flex; align-items: center; padding: 4px 2px 16px 8px; }
+  .logo-emoji { font-size: 24px; line-height: 1; flex: none; }
+  /* Human 蓝→紫渐变文字：与 👌 暖黄互补（2026-09-14 v2：emoji 24 / 文字 20，渐变蓝占头 1/4） */
+  .logo-text {
+    font-size: 20px; font-weight: 600; letter-spacing: .2px; margin-left: -5px; /* margin 吃掉 emoji 字体尾部隐形空白 */
+    position: relative; top: 3.5px; /* 对齐 👌 手势的 O 环（拇指食指捏环）与 Human 字母带 */
+    background: linear-gradient(90deg, var(--accent) 25%, var(--purple));
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent; color: transparent;
+  }
   .agent-box { padding: 0 8px 12px; }
   .agent-box span { display: block; color: var(--dim); font-size: 12px; margin-bottom: 4px; }
   nav { display: flex; flex-direction: column; gap: 2px; }
@@ -116,9 +125,21 @@
     word-break: break-word; font-size: 14px;
   }
   .msg.user .bubble { background: #274768; border: 1px solid #33587f; border-bottom-right-radius: 4px; }
+  /* 系统气泡（2026-09-14）：后台结果自动发车轮的"（系统通知：…）"消息 + 排队中的后台通知。
+     琥珀色虚线框，区别于 user（蓝）/ bot（灰），模型侧它是独立 user 消息、非用户输入 */
+  .msg.sys { justify-content: flex-start; }
+  .msg.sys .bubble { background: rgba(255,180,84,.07); border: 1px dashed rgba(255,180,84,.45); font-size: 13px; color: var(--dim); max-width: 85%; }
   /* 排队中标记（2026-08-31）：运行中发送的消息，本轮结束后由 drain 合并一起发出 */
   .queue-tag { margin-top: 5px; font-size: 11px; color: var(--amber); }
   .piggy-tag { margin-top: 5px; font-size: 11px; color: var(--green); }
+  /* 回到底部按钮（2026-09-14）：向上滚动看历史时出现，点击回底部并恢复自动跟随 */
+  .to-bottom {
+    position: absolute; bottom: 14px; right: 18px; z-index: 20;
+    padding: 6px 13px; border-radius: 999px;
+    background: var(--bg3); border: 1px solid var(--border); color: var(--text);
+    font-size: 12.5px; cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,.4);
+  }
+  .to-bottom:hover { border-color: var(--accent); }
   .msg.bot .bubble { background: var(--bg3); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
   .msg.bot .bubble.streaming { border-color: rgba(79,156,255,.45); }
   button.danger { background: #3a2530; color: #ff6b6b; border: 1px solid rgba(255,107,107,.45); }
@@ -224,7 +245,10 @@
 </head>
 <body>
 <aside>
-  <div class="logo">Ok<em>Human</em></div>
+  <div class="logo">
+    <span class="logo-emoji">👌</span>
+    <span class="logo-text">Human</span>
+  </div>
   <nav id="nav">
     <a data-page="chat" class="active">💬 聊天</a>
     <a data-page="status">📊 状态</a>
@@ -241,7 +265,7 @@
         <span class="sub" id="chatMeta"></span>
         <button class="small" onclick="resetSession()">🧹 重置会话</button>
       </h1>
-      <div id="chatBoxes"></div>
+      <div id="chatBoxes"><button class="to-bottom" id="toBottomBtn" style="display:none">⬇ 回到底部</button></div>
       <div id="chatInputRow">
         <textarea id="chatInput" placeholder="输入消息，Enter 发送，Shift+Enter 换行" onkeydown="chatKey(event)"></textarea>
         <button class="primary" id="sendBtn" onclick="sendChat()">发送 ➤</button>
@@ -342,6 +366,7 @@ function getBox() {
     el.className = "chatbox";
     $("chatBoxes").appendChild(el);
     state.box = { el, loaded: false };
+    bindChatScroll(el);
   }
   return state.box;
 }
@@ -388,7 +413,7 @@ function renderHistoryEntry(e) {
       const nImg = e.content.filter((x) => x.type === "image_url").length;
       const refs = e.content.filter((x) => x.type === "inject_ref").map((x) => x.ref).join(",");
       chatUserHtml((text ? text + "\n" : "") + `📎 ${refs || "附件"}${nImg ? `（图片 ×${nImg}）` : ""}`);
-    } else chatUserHtml(e.content);
+    } else String(e.content).startsWith(BG_NOTICE_PREFIX) ? chatSysHtml(e.content) : chatUserHtml(e.content); // 历史里的后台通知也画系统气泡（2026-09-14）
     return;
   }
   if (e.role === "assistant") {
@@ -518,10 +543,26 @@ async function health() {
 function chatKey(e) {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); }
 }
+/* ---------- 自动跟随底部（2026-09-14）：看历史时不强制拉底 ----------
+ * 视口"在底部"（距底 < 80px）时新内容照常跟随；用户向上滚动即停止跟随
+ * （不再拽屏幕）；点"⬇ 回到底部"或发送消息 → 回底并恢复跟随。 */
+const STICK_NEAR_PX = 80;
+function isAtBottom(el) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < STICK_NEAR_PX;
+}
+function chatScroll(el, force) {
+  if (force || isAtBottom(el)) el.scrollTop = el.scrollHeight;
+}
+function bindChatScroll(el) {
+  el.addEventListener("scroll", () => {
+    $("toBottomBtn").style.display = isAtBottom(el) ? "none" : "";
+  });
+}
 function chatAddHtml(html) {
   const box = getBox().el;
+  const stick = isAtBottom(box); // 先采样再插入：大卡片（工具/思考）一插就超 80px 阈值，插入后判断会让跟随静默断裂
   box.insertAdjacentHTML("beforeend", html);
-  box.scrollTop = box.scrollHeight;
+  if (stick) box.scrollTop = box.scrollHeight;
 }
 function chatUserHtml(text, queued) {
   const tag = queued ? `<div class="queue-tag">⏳ 排队中</div>` : "";
@@ -534,6 +575,13 @@ function chatBotHtml(text) {
 function chatUser(text, queued) {
   chatUserHtml(text, queued);
   $("chatInput").value = "";
+}
+/* 后台结果通知（2026-09-14 空闲发车）：与 server formatBackgroundNotice 同前缀。
+ * 自动发车轮 / 队列里的这类消息画成系统气泡，不当作用户输入 */
+const BG_NOTICE_PREFIX = "（系统通知：";
+function chatSysHtml(text, queued) {
+  const tag = queued ? `<div class="queue-tag">⏳ 排队中</div>` : "";
+  chatAddHtml(`<div class="msg sys"><div class="bubble">${esc(text)}${tag}</div></div>`);
 }
 /* 本轮开始 → 清掉所有"排队中"标记（它们已被 drain 带走，随本轮一起发出） */
 function clearQueueTags() {
@@ -563,6 +611,7 @@ function streamEnsure() {
   return c;
 }
 function streamDelta(d) {
+  const stick = isAtBottom(getBox().el);
   const c = streamEnsure();
   if (d.thinking) {
     c.thinking += d.thinking;
@@ -575,7 +624,7 @@ function streamDelta(d) {
     c.bubble.innerHTML = md(c.text) + '<span class="cursor"></span>';
   }
   const box = getBox().el;
-  box.scrollTop = box.scrollHeight;
+  if (stick) box.scrollTop = box.scrollHeight;
 }
 function streamEnd() {
   const c = state.stream;
@@ -597,14 +646,15 @@ function compressLiveEnsure(scope) {
   el.style.borderStyle = "dashed";
   el.innerHTML = `<div class="evhead">🗜️ <b>上下文压缩 [${scope}] 进行中…</b><span class="dim" style="font-size:11px">流式生成</span></div><pre class="clpre" style="white-space:pre-wrap;word-break:break-word;max-height:240px;overflow:auto"></pre>`;
   const pre = el.querySelector(".clpre");
+  const stick = isAtBottom(getBox().el); // 先采样：活卡插入较高，插入后判断会断跟随
   getBox().el.appendChild(el);
   c = { el, pre, thinking: "", text: "" };
   state.compressLive.set(scope, c);
-  const box = getBox().el;
-  box.scrollTop = box.scrollHeight;
+  if (stick) getBox().el.scrollTop = getBox().el.scrollHeight;
   return c;
 }
 function compressLiveDelta(scope, d) {
+  const stick = isAtBottom(getBox().el);
   const c = compressLiveEnsure(scope);
   if (d.thinking) c.thinking += d.thinking;
   if (d.text) c.text += d.text;
@@ -612,8 +662,7 @@ function compressLiveDelta(scope, d) {
   if (c.thinking) body += c.thinking + "\n";
   if (c.text) body += c.text;
   c.pre.textContent = body;
-  const box = getBox().el;
-  box.scrollTop = box.scrollHeight;
+  if (stick) getBox().el.scrollTop = getBox().el.scrollHeight;
 }
 function compressLiveEnd(scope) {
   const c = state.compressLive.get(scope);
@@ -641,14 +690,16 @@ function handleChatEvent(type, data) {
       break;
     }
     case "run_msg": {
-      // merged 轮跳过（文本是"【第 N 条】…"拼接）。去重：框内已有相同文本的 user 气泡则跳过。
+      // merged 轮跳过（文本是"【第 N 条】…"拼接）。去重：框内已有相同文本的气泡则跳过。
       if (data.kind === "merged") break;
       const msg = String(data.message ?? "");
-      const pre = msg.slice(0, 40);
+      if (!msg) break;
+      const isBg = msg.startsWith(BG_NOTICE_PREFIX);
+      const pre = msg.slice(0, isBg ? 80 : 40); // 后台通知前 40 字符常相同（同工具），加长区分
       const bb = getBox();
-      const dup = Array.from(bb.el.querySelectorAll(".msg.user .bubble"))
+      const dup = Array.from(bb.el.querySelectorAll(isBg ? ".msg.sys .bubble" : ".msg.user .bubble"))
         .some((x) => x.textContent?.startsWith(pre));
-      if (!dup && msg) chatUserHtml(msg);
+      if (!dup) isBg ? chatSysHtml(msg) : chatUserHtml(msg);
       break;
     }
     case "run_end":
@@ -679,10 +730,10 @@ function handleChatEvent(type, data) {
       break;
     }
     case "bg_start":
-      chatAddHtml(evCard("bgstart", "⏳", `前台超时，${data.tool_name} 转后台继续`, `前台等待上限 ${fmtDur(data.timeout_ms)}；完成后结果搭车随下一条消息发出，或空闲超时后单独唤醒`));
+      chatAddHtml(evCard("bgstart", "⏳", `前台超时，${data.tool_name} 转后台继续`, `前台等待上限 ${fmtDur(data.timeout_ms)}；完成后结果搭车随下一条消息发出，agent 空闲时自动发车单独处理（2026-09-14）`));
       break;
     case "bg_piggyback":
-      chatAddHtml(evCard("bgstart", "🚗", `${data.tool_name} 后台结果已搭车（${data.ok ? "成功" : "失败"}）`, `结果 ${fmtBytes(data.result_chars)}，已注入到本条消息之前、与本次 LLM 调用一起发出（不单独唤醒）`));
+      chatAddHtml(evCard("bgstart", "🚗", `${data.tool_name} 后台结果已搭车（${data.ok ? "成功" : "失败"}）`, `结果 ${fmtBytes(data.result_chars)}，已注入到本条消息之前、与本次 LLM 调用一起发出（轮内注入，不额外加 LLM 调用）`));
       break;
     case "user_piggyback": {
       // 轮内搭车注入（2026-09-09）：运行中用户消息被取走注入上下文。
@@ -721,6 +772,9 @@ function handleChatEvent(type, data) {
     case "doom_stop":
       chatAddHtml(evCard("doom", "⛔", "死循环强停", data.detail));
       break;
+    case "trunc_warn":
+      chatAddHtml(evCard("doom", "✂️", "异常截断", data.detail));
+      break;
     case "error":
       streamEnd();
       chatAddHtml(evCard("doom", "❌", "运行出错", data.message));
@@ -751,7 +805,7 @@ function eventsFor() {
   });
   on("hello", (d) => {
     syncUi(d.running);
-    for (const m of (d.queued || [])) chatUserHtml(m, true);
+    for (const m of (d.queued || [])) String(m).startsWith(BG_NOTICE_PREFIX) ? chatSysHtml(m, true) : chatUserHtml(m, true);
   });
   on("enqueued", (d) => {
     if (d.running) {
@@ -777,6 +831,7 @@ function eventsFor() {
   on("compress_delta", (d) => handleChatEvent("compress_delta", d));
   on("doom_warn", (d) => handleChatEvent("doom_warn", d));
   on("doom_stop", (d) => handleChatEvent("doom_stop", d));
+  on("trunc_warn", (d) => handleChatEvent("trunc_warn", d));
   on("error", (d) => {
     // EventSource 的 "error" 分两种——服务端广播的 run error 带 data，连接自身断开无 data（浏览器自动重连）。
     if (d && d.message) handleChatEvent("error", d);
@@ -793,10 +848,11 @@ function refreshQueue() {
       syncUi(j.running);
       const b = getBox();
       for (const m of (j.queued || [])) {
-        const pre = String(m).slice(0, 40);
-        const els = Array.from(b.el.querySelectorAll(".msg.user .bubble"));
+        const isBg = String(m).startsWith(BG_NOTICE_PREFIX);
+        const pre = String(m).slice(0, isBg ? 80 : 40);
+        const els = Array.from(b.el.querySelectorAll(isBg ? ".msg.sys .bubble" : ".msg.user .bubble"));
         const hit = els.find((x) => x.textContent?.startsWith(pre));
-        if (!hit) chatUserHtml(m, true);
+        if (!hit) isBg ? chatSysHtml(m, true) : chatUserHtml(m, true);
         else if (!hit.querySelector(".queue-tag")) hit.insertAdjacentHTML("beforeend", `<div class="queue-tag">⏳ 排队中，将随本轮结束一起发出</div>`);
       }
     })
@@ -819,6 +875,7 @@ async function sendChat() {
   const queued = state.busy;
   const before = box.el.childElementCount;
   chatUser(message, queued);
+  chatScroll(box.el, true); // 发送消息 → 强制回底并恢复跟随（2026-09-14）
   box.loaded = true;
   try {
     await apiPost("/enqueue", { message });
@@ -1060,6 +1117,10 @@ async function saveConfig() {
 
 /* ================= 启动 ================= */
 (async function init() {
+  $("toBottomBtn").addEventListener("click", () => {
+    const el = getBox().el;
+    el.scrollTop = el.scrollHeight; // 直接回底（scroll 监听随后隐藏按钮、恢复跟随）
+  });
   health();
   setInterval(health, 8000);
   eventsFor(); // 常驻 /events 流（2026-08-31 方案A）：刷新/重开页面后续接
