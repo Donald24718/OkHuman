@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"time"
 	"testing"
 
 	"okhuman/internal/config"
@@ -157,4 +159,88 @@ func TestHTTPEndToEnd(t *testing.T) {
 	if bg["count"] != float64(0) {
 		t.Fatalf("backgrounds count=%v want 0", bg["count"])
 	}
+}
+
+// TestHistoryTruncatedDuringRunningRound（2026-09-19）：刷新去重修复的回归——
+// 本轮正在跑（已完成 ≥1 个 LLM 调用/工具步）时，/history 只返回 run_start 之前
+// 的条目（当前轮由 /events 重放整轮重建）；轮次结束后 /history 返回全量。
+func TestHistoryTruncatedDuringRunningRound(t *testing.T) {
+	// 第一轮（跑完）：text 步 → 2 条（user+assistant）
+	// 第二轮（抓窗口）：tool 步 + 慢流式 text 步
+	fake := llm.NewFakeLLM([]llm.FakeStep{
+		{Type: "text", Text: "第一轮"},
+		{Type: "tool", Name: "bash", Args: map[string]interface{}{"command": "echo mid-round"}},
+		{Type: "text", Text: "第二轮回复，这句故意拉长一些，把 mid-round 的轮询窗口撑宽一点方便测试断言"},
+	})
+	fake.ChunkDelayMS = 15
+	cfg := config.Default()
+	cfg.Data.Dir = t.TempDir()
+	a := CreateAgentState(cfg, fake, "sys", []PromptFileInfo{}, true, "")
+	st := NewAppState(cfg, t.TempDir(), a)
+	ap := New(st, nil)
+	srv := httptest.NewServer(ap)
+	defer srv.Close()
+
+	getHistory := func() int {
+		resp, err := srv.Client().Get(srv.URL + "/history")
+		if err != nil {
+			t.Fatalf("/history: %v", err)
+		}
+		defer resp.Body.Close()
+		var h struct {
+			Entries []map[string]interface{} `json:"entries"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&h); err != nil {
+			t.Fatalf("/history 解码: %v", err)
+		}
+		return len(h.Entries)
+	}
+
+	// 第一轮跑完（阻塞 /chat）
+	req, _ := http.NewRequest("POST", srv.URL+"/chat", strings.NewReader(`{"message":"m1"}`))
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("/chat#1: %v", err)
+	}
+	resp.Body.Close()
+	if n := getHistory(); n != 2 {
+		t.Fatalf("第一轮后 history=%d want 2", n)
+	}
+
+	// 第二轮入队（非阻塞）→ 抓窗口：session 已有 5 条（+user,+assistant+tool,+tool）
+	// 且本轮在跑 → /history 必须截断回 2
+	req, _ = http.NewRequest("POST", srv.URL+"/enqueue", strings.NewReader(`{"message":"m2"}`))
+	resp, _ = srv.Client().Do(req)
+	resp.Body.Close()
+
+	seen := 0
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		sess := a.CM().Session()
+		running := a.Lock.Running()
+		if running && len(sess.Messages) >= 5 {
+			if n := getHistory(); n != 2 {
+				t.Fatalf("mid-round（session %d 条、running）/history=%d want 2（截断到 StartLen）", len(sess.Messages), n)
+			}
+			seen = 1
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if seen == 0 {
+		t.Fatalf("没抓到 mid-round 窗口（10s 内 session 未达 5 条且 running）")
+	}
+
+	// 轮次结束后 /history 恢复全量（2+3=5）
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if !a.Lock.Running() && len(a.CM().Session().Messages) == 6 {
+			if n := getHistory(); n != 6 {
+				t.Fatalf("轮次结束后 /history=%d want 6（全量，无截断）", n)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("第二轮未在 10s 内跑完")
 }

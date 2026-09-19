@@ -114,6 +114,10 @@ func (a *AgentState) BG() *background.BackgroundOrchestrator { return a.rt.Load(
 type roundBuf struct {
 	Round  int
 	Frames []string
+	// StartLen run_start 时刻会话消息数——当前轮的条目从下标 StartLen 起
+	// （run_start 广播在 AddMessage(user) 之前，见 agent.run）。
+	// 刷新时 /history 截断到 StartLen、/events 重放整轮 → 不重复不丢失。
+	StartLen int
 }
 
 // drainHandle 活动 drain 句柄（enqueueAndWake 返回；等待 done 后读 res）
@@ -306,7 +310,15 @@ func broadcastEvent(state *AppState, e types.AgentEvent) {
 	if e["type"] == "run_start" {
 		// 注：run_msg 帧（本轮 user 消息文本）天然进缓冲——重放时随帧补发，
 		// 刷新后"在跑那轮"的 user 气泡不丢，无需额外重建。
-		state.RoundBuf = &roundBuf{Round: int(state.Agent.SessionNo.Load()), Frames: []string{payload}}
+		// StartLen：run_start 广播在 AddMessage(user) 之前（agent.run 顺序），
+		// 此刻的消息数即"当前轮之前的历史长度"——/history 据此截断（2026-09-19 修复：
+		// 旧实现刷新时 /history 已含本轮已完成 LLM 调用的条目，重放又整轮重流 → 重复渲染）。
+		state.RoundBuf = &roundBuf{Round: int(state.Agent.SessionNo.Load()), Frames: []string{payload}, StartLen: len(state.Agent.CM().Session().Messages)}
+	} else if e["type"] == "run_end" {
+		// 轮次结束清缓冲（2026-09-19）：重放条件是 running，run_end 后 running=false，
+		// 保留旧缓冲只会让"刚结束瞬间"的 /history 截断与无重放错配（条目丢失）。
+		// run_end 帧本身已进各订阅者，清空不影响已连客户端。
+		state.RoundBuf = nil
 	} else if state.RoundBuf != nil && len(state.RoundBuf.Frames) < maxRoundFrames {
 		state.RoundBuf.Frames = append(state.RoundBuf.Frames, payload)
 	}
@@ -850,6 +862,16 @@ func (ap *App) handleHistory(w http.ResponseWriter, r *http.Request) {
 			m["reasoning_content"] = *e.ReasoningContent
 		}
 		entries = append(entries, m)
+	}
+	// 2026-09-19：本轮正在跑时，当前轮的条目（run_start 之后持久化的）不进 /history——
+	// 它们由 /events 重放整轮重建（重放含 run_msg/delta/tool_* 全部帧）。两边给同一条目
+	// 会让前端重复渲染（history 画一份 + 重放流一份）。条件与 /events 重放完全一致。
+	ap.state.mu.Lock()
+	runningNow := a.Lock.Running() || ap.state.ActiveDrain != nil
+	buf := ap.state.RoundBuf
+	ap.state.mu.Unlock()
+	if runningNow && buf != nil && buf.Round == int(a.SessionNo.Load()) && buf.StartLen < len(entries) {
+		entries = entries[:buf.StartLen]
 	}
 	var summary interface{}
 	if s := sess.Summary; s != nil {

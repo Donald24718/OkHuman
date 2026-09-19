@@ -558,8 +558,14 @@ function bindChatScroll(el) {
     $("toBottomBtn").style.display = isAtBottom(el) ? "none" : "";
   });
 }
+function dropEmpty() {
+  // "暂无消息"占位符：首个实际内容（历史/重放/事件）到达即清（2026-09-19）——
+  // 新会话第一轮跑到一半刷新时，/history 截断为空 + 重放整轮，占位符不能残留。
+  getBox().el.querySelectorAll(".empty").forEach((x) => x.remove());
+}
 function chatAddHtml(html) {
   const box = getBox().el;
+  dropEmpty();
   const stick = isAtBottom(box); // 先采样再插入：大卡片（工具/思考）一插就超 80px 阈值，插入后判断会让跟随静默断裂
   box.insertAdjacentHTML("beforeend", html);
   if (stick) box.scrollTop = box.scrollHeight;
@@ -592,6 +598,7 @@ function clearQueueTags() {
 function streamEnsure() {
   let c = state.stream;
   if (c) return c;
+  dropEmpty();
   const box = getBox().el;
   const think = document.createElement("div");
   think.className = "ev thinking";
