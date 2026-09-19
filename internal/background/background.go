@@ -102,9 +102,21 @@ const maxStoredResultBytes = 256 * 1024
 // （Promise 通道收到结果 → 标记 settled/ok/durationMs → 调 a.OnSettled 把
 // 通知入消息队列 → 标记 Notified）
 func (o *BackgroundOrchestrator) OnBackgroundStart(a types.BackgroundStartArgs) {
+	// 命令提取（2026-09-19）：bash 工具的 command 参数 → 任务管理器"命令"列，
+	// 后台任务启动了哪个端口的 okhuman 实例一眼可见。存 120 字截断（仅展示用）。
+	command := ""
+	if m, ok := a.Args.(map[string]interface{}); ok {
+		if c, ok := m["command"].(string); ok {
+			command = c
+			if len(command) > 120 {
+				command = command[:120] + "…"
+			}
+		}
+	}
 	t := &types.PendingBackgroundTask{
 		CallID:     a.CallID,
 		ToolName:   a.ToolName,
+		Command:    command,
 		StartedAt:  a.StartedAt,
 		DurationMs: 0,
 		OK:         false,
