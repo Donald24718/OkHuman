@@ -187,7 +187,7 @@ func CreateAgentState(cfg *config.Config, client llm.LlmClient, systemPrompt str
 	a.CfgRef.Store(cfg)
 	a.SessionNo.Store(1)
 	cm := makeCm(a)
-	a.rt.Store(&agentRuntime{CM: cm, Agent: agent.New(client, systemPrompt, cm), BG: background.NewOrchestrator()})
+	a.rt.Store(&agentRuntime{CM: cm, Agent: agent.New(client, systemPrompt, cm, filepath.Join(a.Cfg().Data.Dir, "inject")), BG: background.NewOrchestrator()})
 	return a
 }
 
@@ -1285,7 +1285,7 @@ func (ap *App) handleReset(w http.ResponseWriter, r *http.Request) {
 		sp := a.SystemPrompt
 		a.promptMu.Unlock()
 		newCM := makeCm(a)
-		a.rt.Store(&agentRuntime{CM: newCM, Agent: agent.New(client, sp, newCM), BG: background.NewOrchestrator()})
+		a.rt.Store(&agentRuntime{CM: newCM, Agent: agent.New(client, sp, newCM, filepath.Join(a.Cfg().Data.Dir, "inject")), BG: background.NewOrchestrator()})
 		if ap.hooks != nil && ap.hooks.OnSessionRebuilt != nil {
 			ap.hooks.OnSessionRebuilt(a)
 		}

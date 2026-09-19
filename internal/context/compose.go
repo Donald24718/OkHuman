@@ -36,6 +36,14 @@ var resolveInject atomic.Pointer[inject.Resolver]
 // ConfigureInjectResolver 启动/重置时设置全局侧车解析器
 func ConfigureInjectResolver(r *inject.Resolver) { resolveInject.Store(r) }
 
+// ClearResolverCacheEntry 清全局解析器的指定 id 缓存（侧车被改写后调用，如 4xx
+// 降级回写；2026-09-19）——否则解析器内存缓存继续返回旧（坏）parts。
+func ClearResolverCacheEntry(id string) {
+	if r := resolveInject.Load(); r != nil {
+		r.ClearCache(id)
+	}
+}
+
 // ComposeOptions demote 模式（""=正常 / "newest"=只降最近注入 / "all"=全降）
 type ComposeOptions struct {
 	DemoteInjects string

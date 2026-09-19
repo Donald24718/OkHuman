@@ -121,6 +121,23 @@ func (r *Resolver) ClearCache(id string) {
 	}
 }
 
+// PersistDemotion 4xx 降级成功回写（2026-09-19）：侧车内容替换为文本提示。
+// 降级本是请求级（Compose 变体，不动侧车）——对“持久坏附件”（内容损坏的图片，
+// 每次 LLM 调用必 400），下轮请求原样恢复坏 part，每轮都先 4xx 再降级。
+// 回写后后续 Resolve 拿到提示，根治。返回侧车是否存在并被改写。
+func PersistDemotion(dir, id string) bool {
+	p := filepath.Join(dir, id+".json")
+	if _, err := os.Stat(p); err != nil {
+		return false
+	}
+	stub := []types.ContentPart{{Type: "text", Text: fmt.Sprintf("附件 %s 因 LLM 4xx 降级为文本提示，原附件未发送", id)}}
+	b, err := json.Marshal(stub)
+	if err != nil {
+		return false
+	}
+	return os.WriteFile(p, b, 0o644) == nil
+}
+
 // DropInjectFile 删侧车文件 + 清缓存；返回是否真删了文件
 func DropInjectFile(dir, id string) bool {
 	if err := os.Remove(filepath.Join(dir, id+".json")); err == nil {

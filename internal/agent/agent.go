@@ -36,6 +36,7 @@ import (
 	"time"
 
 	ctxmgr "okhuman/internal/context"
+	"okhuman/internal/inject"
 	"okhuman/internal/llm"
 	"okhuman/internal/tools"
 	"okhuman/internal/types"
@@ -93,6 +94,7 @@ type Agent struct {
 	llm           llm.LlmClient
 	systemPrompt  string
 	cm            *ctxmgr.Manager
+	injectDir     string // 注入侧车目录（4xx 降级成功回写用，2026-09-19；""=不回写）
 	lastCalls     []callRec
 	warned        bool
 	stopRequested atomic.Bool
@@ -106,8 +108,8 @@ type callRec struct {
 }
 
 // New 新建 agent
-func New(client llm.LlmClient, systemPrompt string, cm *ctxmgr.Manager) *Agent {
-	return &Agent{llm: client, systemPrompt: systemPrompt, cm: cm}
+func New(client llm.LlmClient, systemPrompt string, cm *ctxmgr.Manager, injectDir string) *Agent {
+	return &Agent{llm: client, systemPrompt: systemPrompt, cm: cm, injectDir: injectDir}
 }
 
 // SetLLM 运行时热更新 LLM 客户端（WebUI 配置页改 llm 段后）
@@ -446,6 +448,18 @@ func (a *Agent) llmCall(ctx context.Context, emit func(types.AgentEvent), totals
 				detail := truncateStr(firstErr.Error(), 300)
 				fmt.Printf("[llm] 4xx 回退阶梯：%s 重试成功（首次报错：%s）\n", mode, detail)
 				emit(types.AgentEvent{"type": "inject_fallback", "mode": mode, "detail": detail})
+				// 2026-09-19：降级成功 → 回写侧车（治本）。降级本是请求级（不动侧车），
+				// 对持久坏附件（内容损坏的图片，每次调用必 400）每轮都先 4xx 再降级；
+				// 回写后侧车变文本提示，后续 resolve 不再发坏 part。
+				if mode != "truncate" {
+					dir := a.injectDir
+					for _, id := range a.demotedInjectIDs(mode) {
+						if inject.PersistDemotion(dir, id) {
+							ctxmgr.ClearResolverCacheEntry(id)
+							fmt.Printf("[inject] %s 降级回写侧车（后续调用不再发原 part）\n", id)
+						}
+					}
+				}
 				break
 			}
 			if stopped() {
@@ -495,6 +509,40 @@ func isLlm4xxErr(e error) bool {
 }
 
 // sessionHasInject 会话里是否存在附件引用（inject_ref）——4xx 阶梯只对"有附件"的会话降级
+// demotedInjectIDs 返回本次降级覆盖的注入 id（2026-09-19）：
+// "newest"=会话里最近一条带附件的消息；"all"=会话内全部 inject_ref。
+func (a *Agent) demotedInjectIDs(mode string) []string {
+	sess := a.cm.Session()
+	refs := func(i int) (string, bool) {
+		for _, p := range types.AsParts(sess.Messages[i].Content) {
+			if p.Type == "inject_ref" && p.Ref != "" {
+				return p.Ref, true
+			}
+		}
+		return "", false
+	}
+	ids := map[string]bool{}
+	if mode == "newest" {
+		for i := len(sess.Messages) - 1; i >= 0; i-- {
+			if id, ok := refs(i); ok {
+				ids[id] = true
+				break
+			}
+		}
+	} else {
+		for i := range sess.Messages {
+			if id, ok := refs(i); ok {
+				ids[id] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(ids))
+	for id := range ids {
+		out = append(out, id)
+	}
+	return out
+}
+
 func (a *Agent) sessionHasInject() bool {
 	for _, m := range a.cm.Session().Messages {
 		if m.HasInjectRef() {
