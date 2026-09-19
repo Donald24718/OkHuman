@@ -1,7 +1,7 @@
 // Package server HTTP 服务（移植自 TS src/server.ts）：
 // 端点全集与 TS 逐字段同形（插件 qq-channel/cron 依赖的协议不变）：
 //
-//	GET  /health /status /queue /history /backgrounds /attachments /instances
+//	GET  /health /status /queue /history /backgrounds /attachments
 //	GET  /events (SSE 常驻广播) /prompts /prompts/file /config
 //	GET  / /favicon.ico /marked.min.js (WebUI 静态)
 //	POST /chat /chat/stream (SSE) /enqueue /inject /drop /reset /stop
@@ -683,8 +683,6 @@ func (ap *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ap.handleHistory(w, r)
 	case r.Method == http.MethodGet && path == "/backgrounds":
 		ap.handleBackgrounds(w, r)
-	case r.Method == http.MethodGet && path == "/instances":
-		ap.handleInstances(w, r)
 	case r.Method == http.MethodPost && path == "/chat":
 		ap.handleChat(w, r)
 	case r.Method == http.MethodPost && path == "/chat/stream":
@@ -799,7 +797,6 @@ func (ap *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 		bgs = append(bgs, map[string]interface{}{
 			"call_id":     t.CallID,
 			"tool":        t.ToolName,
-			"command":     t.Command,
 			"started_at":  t.StartedAt,
 			"settled":     t.Settled,
 			"ok":          t.OK,
@@ -883,54 +880,6 @@ func (ap *App) handleHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{"session": int(a.SessionNo.Load()), "summary": summary, "entries": entries})
 }
 
-// ---------- GET /instances：本机 OkHuman 实例列表（2026-09-19） ----------
-// 多实例同机时任务管理器/进程列表都只显示 "okhuman"：这里读机器级注册表
-// /tmp/okhuman/instance-<port>.json（各实例启动时写、SIGTERM 时删），按
-// /proc/<pid> 存活 + comm 前缀双重过滤僵尸条目，webui 状态页据此区分端口。
-type instanceInfo struct {
-	PID       int    `json:"pid"`
-	Port      int    `json:"port"`
-	LLM       string `json:"llm"`
-	DataDir   string `json:"data_dir"`
-	StartedAt int64  `json:"started_at"`
-}
-
-func (ap *App) handleInstances(w http.ResponseWriter, r *http.Request) {
-	regDir := filepath.Join(os.TempDir(), "okhuman")
-	entries, _ := os.ReadDir(regDir)
-	out := make([]map[string]interface{}, 0)
-	for _, e := range entries {
-		n := e.Name()
-		if !strings.HasPrefix(n, "instance-") || !strings.HasSuffix(n, ".json") {
-			continue
-		}
-		var info instanceInfo
-		b, err := os.ReadFile(filepath.Join(regDir, n))
-		if err != nil || json.Unmarshal(b, &info) != nil {
-			continue
-		}
-		// 存活双重过滤：/proc/<pid> 存在 + comm 以 okhuman- 开头（防 pid 复用误报）
-		if _, err := os.Stat(fmt.Sprintf("/proc/%d", info.PID)); err != nil {
-			continue
-		}
-		comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", info.PID))
-		if !strings.HasPrefix(string(comm), "okhuman-") {
-			continue
-		}
-		self := info.Port == ap.state.Agent.Cfg().Server.Port
-		out = append(out, map[string]interface{}{
-			"port":       info.Port,
-			"pid":        info.PID,
-			"llm":        info.LLM,
-			"data_dir":   info.DataDir,
-			"started_at": info.StartedAt,
-			"self":       self,
-		})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i]["port"].(int) < out[j]["port"].(int) })
-	writeJSON(w, 200, map[string]interface{}{"instances": out})
-}
-
 func (ap *App) handleBackgrounds(w http.ResponseWriter, r *http.Request) {
 	a := ap.state.Agent
 	tasks := make([]map[string]interface{}, 0)
@@ -938,7 +887,6 @@ func (ap *App) handleBackgrounds(w http.ResponseWriter, r *http.Request) {
 		tasks = append(tasks, map[string]interface{}{
 			"call_id":      t.CallID,
 			"tool":         t.ToolName,
-			"command":      t.Command,
 			"started_at":   t.StartedAt,
 			"settled":      t.Settled,
 			"ok":           t.OK,

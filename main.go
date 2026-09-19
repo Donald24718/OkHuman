@@ -18,12 +18,10 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"okhuman/internal/config"
@@ -40,41 +38,6 @@ func fatalf(format string, args ...interface{}) {
 }
 
 // utf16Len UTF-16 code units 长度（对齐 TS text.length）
-// ---------- 进程自识别（2026-09-19） ----------
-
-// setProcName 改进程名（comm，≤15 字符）：写 /proc/<pid>/comm 即可，
-// 该文件属于主线程（thread group leader），任意 goroutine 写入都生效
-// （2026-09-19 活体验证：非主线程 goroutine 写后 ps 显示新名）。
-func setProcName(name string) {
-	if len(name) > 15 {
-		name = name[:15]
-	}
-	_ = os.WriteFile(fmt.Sprintf("/proc/%d/comm", os.Getpid()), []byte(name), 0)
-}
-
-// writeInstanceRegistry 写实例注册表：数据目录一份 + 机器级 /tmp/okhuman/ 一份。
-// 失败不致命（仅影响 /instances 展示）。
-func writeInstanceRegistry(port int, dataDir, llm string) {
-	info := map[string]interface{}{
-		"pid":        os.Getpid(),
-		"port":       port,
-		"llm":        llm,
-		"data_dir":   dataDir,
-		"started_at": time.Now().UnixMilli(),
-	}
-	b, _ := json.Marshal(info)
-	_ = os.WriteFile(filepath.Join(dataDir, "instance.json"), b, 0o644)
-	regDir := filepath.Join(os.TempDir(), "okhuman")
-	_ = os.MkdirAll(regDir, 0o755)
-	_ = os.WriteFile(filepath.Join(regDir, fmt.Sprintf("instance-%d.json", port)), b, 0o644)
-}
-
-// removeInstanceRegistry 清理注册表（SIGTERM 退出前）
-func removeInstanceRegistry(port int, dataDir string) {
-	_ = os.Remove(filepath.Join(dataDir, "instance.json"))
-	_ = os.Remove(filepath.Join(os.TempDir(), "okhuman", fmt.Sprintf("instance-%d.json", port)))
-}
-
 func utf16Len(s string) int {
 	n := 0
 	for _, r := range s {
@@ -146,21 +109,6 @@ func main() {
 		dataDir += suffix
 	}
 	cfg.Data.Dir = dataDir
-
-	// ---------- 进程自识别（2026-09-19）：多实例同机，进程列表/任务管理器只见 "okhuman" ----------
-	// ① 进程名 → okhuman-<port>：写 /proc/<pid>/comm（主线程文件，任意 goroutine 可写，
-	//    无需 prctl 主线程绑定），ps/top/htop 直接显示端口
-	// ② 实例注册表：<dataDir>/instance.json + 机器级 /tmp/okhuman/instance-<port>.json
-	//    （/instances 端点读后者；SIGTERM 时清理，防僵尸条目）
-	setProcName(fmt.Sprintf("okhuman-%d", port))
-	writeInstanceRegistry(port, dataDir, cfg.LLM.BaseURL)
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		removeInstanceRegistry(port, dataDir)
-		os.Exit(0)
-	}()
 
 	p, err := persist.Init(dataDir)
 	if err != nil {

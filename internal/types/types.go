@@ -119,7 +119,6 @@ type AgentEvent map[string]interface{}
 type PendingBackgroundTask struct {
 	CallID     string
 	ToolName   string
-	Command    string // 任务命令（bash → command 正文，任务管理器显示用，2026-09-19）
 	StartedAt  int64
 	Settled    bool
 	SettledAt  int64

@@ -294,10 +294,6 @@
       </div>
     </div>
     <div class="card">
-      <h2>本机 OkHuman 实例 <span class="right">进程自识别：ps 显示 okhuman-&lt;端口&gt;，注册表 /tmp/okhuman/</span></h2>
-      <div id="stInstances"></div>
-    </div>
-    <div class="card">
       <h2>上下文尾部预览 <span class="right">最近 5 条原文</span></h2>
       <div id="stRaw"></div>
     </div>
@@ -919,21 +915,6 @@ async function resetSession() {
 }
 
 /* ================= 状态页 ================= */
-/* 本机 OkHuman 实例（2026-09-19）：/instances 读机器级注册表 + /proc 存活过滤 */
-async function loadInstances() {
-  let j;
-  try { j = await api("/instances"); }
-  catch (e) { $("stInstances").innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; return; }
-  const list = j.instances || [];
-  if (!list.length) { $("stInstances").innerHTML = '<div class="empty">无已注册实例（旧二进制无注册表）</div>'; return; }
-  $("stInstances").innerHTML = `<table><tr><th>端口</th><th>PID</th><th>LLM</th><th>数据目录</th><th>启动</th></tr>${list.map((i) => `<tr${i.self ? ' style="background:rgba(90,200,140,.08)"' : ""}>
-    <td><a class="mono" href="http://127.0.0.1:${i.port}/" target="_blank">:${i.port}</a>${i.self ? ' <span class="tag ok">本机</span>' : ""}</td>
-    <td class="mono">${i.pid}</td>
-    <td class="mono" style="font-size:12px">${esc(i.llm)}</td>
-    <td class="mono" style="font-size:12px">${esc(i.data_dir)}</td>
-    <td>${timeAgo(i.started_at)}</td></tr>`).join("")}</table>`;
-}
-
 async function loadStatus() {
   let s;
   try { s = await api("/status"); }
@@ -948,10 +929,8 @@ async function loadStatus() {
     <div class="kv"><b>来源</b><span>${s.system_prompt.fallback ? '<span class="tag pause">内置默认（目录缺失）</span>' : esc(s.system_prompt.files.map((f) => f.name).join(", "))}</span></div>
     <div class="kv"><b>总长度</b><span>${fmtBytes(s.system_prompt.chars)}</span></div>`;
   $("stBg").innerHTML = s.backgrounds.length
-    ? `<table><tr><th>工具</th><th>命令</th><th>开始</th><th>状态</th><th>耗时</th></tr>${s.backgrounds.map((t) => `<tr>
-        <td class="mono">${esc(t.tool)}</td>
-        <td class="mono" style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px" title="${esc(t.command || "")}">${esc(t.command || "-")}</td>
-        <td>${timeAgo(t.started_at)}</td>
+    ? `<table><tr><th>工具</th><th>开始</th><th>状态</th><th>耗时</th></tr>${s.backgrounds.map((t) => `<tr>
+        <td class="mono">${esc(t.tool)}</td><td>${timeAgo(t.started_at)}</td>
         <td>${t.settled ? (t.ok ? '<span class="tag ok">成功</span>' : '<span class="tag fail">失败</span>') : '<span class="tag run">执行中</span>'}</td>
         <td>${t.duration_ms != null ? fmtDur(t.duration_ms) : "-"}</td></tr>`).join("")}</table>`
     : '<div class="empty">无后台任务</div>';
@@ -965,7 +944,6 @@ async function loadStatus() {
         <span class="tag" style="color:var(--purple)">${esc(e.scope)}</span> <span class="dim">${timeAgo(e.at)}</span>
         <div style="font-size:12px">${esc(e.detail)} · <span class="mono">${fmtBytes(e.before)} → ${fmtBytes(e.after)} · ${e.rounds} 轮${e.forced ? " · ⚠强制截断" : ""}</span></div></div>`).join("")
     : '<div class="empty">暂无压缩记录</div>';
-  loadInstances();
   $("stDoom").innerHTML = s.doom.length
     ? s.doom.slice().reverse().map((e) => `<div style="padding:5px 0;border-bottom:1px solid rgba(42,52,68,.5);font-size:12.5px">
         ${e.kind === "stop" ? '<span class="tag fail">强停</span>' : e.kind === "warn" ? '<span class="tag pause">告警</span>' : ""}
