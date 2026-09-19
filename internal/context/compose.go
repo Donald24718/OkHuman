@@ -220,14 +220,15 @@ func ContextStatsOf(session *types.SessionState, cpl float64) ContextStats {
 		msgTokens += EstimateMessageTokens(e, cpl)
 		msgChars += messageChars(e)
 	}
-	var summaryTokens, summaryChars int
+	var summaryTokens, summaryChars, summaryCount int
 	if session.Summary != nil {
+		summaryCount = 1 // 2026-09-14 修：原硬编码 0，导致 WebUI 已压缩仍显示 [summary ×0]
 		summaryTokens = EstimateTokens(session.Summary.Content, cpl)
 		summaryChars = utf16Len(session.Summary.Content)
 	}
 	return ContextStats{
 		Messages:      len(session.Messages),
-		Summary:       0,
+		Summary:       summaryCount,
 		MsgTokens:     msgTokens,
 		SummaryTokens: summaryTokens,
 		TotalTokens:   msgTokens + summaryTokens,

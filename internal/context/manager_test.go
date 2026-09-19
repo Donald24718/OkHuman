@@ -51,3 +51,28 @@ func TestConcurrentAddMessageCompression(t *testing.T) {
 		}
 	}
 }
+
+// TestContextStatsSummaryCount 回归（2026-09-14）：Summary 计数曾硬编码 0，
+// 导致 WebUI 已压缩仍显示 [summary ×0] / 滚动总结"无"。
+func TestContextStatsSummaryCount(t *testing.T) {
+	// 有 summary → Summary=1，且 token/char 统计非零
+	with := &types.SessionState{
+		Summary: &types.TEntry{Content: "历史总结内容 12345", CreatedAt: 1},
+	}
+	st := ContextStatsOf(with, 2)
+	if st.Summary != 1 {
+		t.Fatalf("有 summary 时 Summary 应为 1，实得 %d", st.Summary)
+	}
+	if st.SummaryChars != utf16Len("历史总结内容 12345") {
+		t.Fatalf("SummaryChars = %d，期望 %d", st.SummaryChars, utf16Len("历史总结内容 12345"))
+	}
+	if st.SummaryTokens == 0 || st.TotalTokens != st.MsgTokens+st.SummaryTokens {
+		t.Fatalf("token 统计不一致：%+v", st)
+	}
+	// 无 summary → Summary=0
+	without := &types.SessionState{}
+	st2 := ContextStatsOf(without, 2)
+	if st2.Summary != 0 || st2.SummaryTokens != 0 || st2.SummaryChars != 0 {
+		t.Fatalf("无 summary 时应全 0：%+v", st2)
+	}
+}
