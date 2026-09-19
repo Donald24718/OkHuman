@@ -373,7 +373,7 @@ func (a *Agent) writeToolLog(opt RunOptions, full string) string {
 // LLM 4xx 三级回退阶梯（2026-09-13，用户拍板"粗暴版"）：
 // ① 正常请求 → ② 4xx：最近一条带附件的消息降级文本提示重试 → ③ 仍 4xx：全部附件降级重试
 // → ④ 仍 4xx：触发兜底硬截断压缩后重试（再败则抛，轮次死，人工介入）。
-// 降级是请求级：不动会话/侧车/附件列表，下轮请求原样恢复；触发限 400/413/415
+// 降级是永久的（用户设计意图）：降级成功即回写侧车为文本提示，被拒附件不恢复（2026-09-19 修，原实现是请求级、下轮原样恢复→持久坏附件每轮复发）；触发限 400/413/415
 // （请求体被拒），其余错误（5xx/401/404/网络错）终止阶梯原样抛（配置类错误不配吃硬截断）。
 func (a *Agent) llmCall(ctx context.Context, emit func(types.AgentEvent), totals *TokenTotals) (*types.Response, error) {
 	// 上一轮 /stop 挂起后若本轮已重置（stopRequested=false 说明新 run），这里正常走
