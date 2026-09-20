@@ -66,7 +66,6 @@ type Manager struct {
 	deltaL       []func(string, types.Delta)
 	persistL     []func(*types.SessionState, int)
 	selfInfo   SelfInfo // 自我生命感知输入（动态注入 2026-09-20）
-	runStamp   string   // 本 run 时间戳（BeginRun 定一次，compose 复用 → KV 前缀稳定）
 }
 
 // NewManager 新建（空会话）
@@ -226,19 +225,12 @@ func (m *Manager) Compose(opts *ComposeOptions) []types.Message {
 	return m.composeLocked(opts)
 }
 
-// composeLocked = 基础组装 + 动态注入（2026-09-20，持锁调用）：
-//   - 系统提示词首 prepend 自我生命感知块（本实例端口/pid + LLM 端口/pid，
-//     每次调用现算 → 端口/pid 变化实时更新）
-//   - 每条消息末尾追加本 run 时间戳（存储不变：session/侧车不落时间，
-//     compose 时重算；同 run 内时间戳固定 → 主循环与压缩请求前缀逐 token
-//     一致，KV 可复用）
+// composeLocked = 基础组装 + 动态注入（2026-09-20，持锁调用）：系统提示词首
+// prepend 自我生命感知块（本实例端口/pid + LLM 端口/pid，每次调用现算 →
+// 端口/pid 变化实时更新）。消息本体不再注入任何东西（时间戳功能同日砍掉），
+// 会话前缀跨 run 逐 token 稳定 → KV 前缀可复用。
 func (m *Manager) composeLocked(opts *ComposeOptions) []types.Message {
-	stamp := m.runStamp
-	if stamp == "" {
-		stamp = time.Now().Format(TimeStampFormat)
-	}
 	msgs := ComposeMessages(m.session, m.systemPrompt, opts)
-	stampMessages(msgs, " ["+stamp+"]")
 	if sb := m.selfBlockLocked(); sb != "" {
 		if sp, ok := msgs[0].Content.(string); ok {
 			msgs[0].Content = sb + "\n\n" + sp

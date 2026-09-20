@@ -1,44 +1,27 @@
 package context
 
-// 动态注入（2026-09-20）：自我生命感知 + 消息时间戳
+// 动态注入（2026-09-20）：自我生命感知
 //
-// 自我生命感知：系统提示词首 prepend 一块"你的生命"（本实例端口/pid +
-// 接入 LLM 的端口/pid），每次 LLM 调用现算 → 端口/pid 变化实时反映。
-// 语义明确告诉模型：这些端口与 PID 就是它自己与它思考的载体，谨慎操作。
-//
-// 时间戳：每条消息末尾追加当前时间。存储不变（session.json/侧车不落时间，
-// compose 时重算）；同一 run 内时间戳固定（BeginRun 定一次）→ 主循环与压缩
-// 请求前缀逐 token 一致 → KV 前缀可复用；新 run 重新计算。
+// 系统提示词首 prepend 一块"你的生命"（本实例端口/pid + 接入 LLM 的端口/
+// pid），每次 LLM 调用现算 → 端口/pid 变化实时反映。语义明确告诉模型：
+// 这些端口与 PID 就是它自己与它思考的载体，谨慎操作。
+// （消息时间戳功能 2026-09-20 同日砍掉：模型会模仿注入格式抄进自己的
+// 输出并落盘，累积成噪声；只保留生命感知。）
 
 import (
-	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
-	"time"
-
-	"okhuman/internal/types"
 )
-
-// TimeStampFormat 时间戳格式（本地时间，精确到秒）
-const TimeStampFormat = "2006-01-02 15:04:05"
 
 // SelfInfo 自我生命感知块的静态输入（server 启动时 / POST /config 热更新时设置）
 type SelfInfo struct {
 	Port       int    // 本 OkHuman 服务端口
 	DataDir    string // 本 OkHuman 数据目录
 	LLMBaseURL string // LLM base_url（解析出 host:port）
-}
-
-// BeginRun 每次 run 开始时调用：重算本 run 时间戳（同 run 内所有 compose 复用
-// 同一时间戳 → KV 前缀稳定；新 run 重算）
-func (m *Manager) BeginRun() {
-	m.mu.Lock()
-	m.runStamp = time.Now().Format(TimeStampFormat)
-	m.mu.Unlock()
 }
 
 // SetSelfInfo 设置/热更新自我生命感知输入
@@ -168,45 +151,3 @@ func hexPort(hexAddr string) int {
 	return int(p)
 }
 
-// stampMessages 每条消息的文本内容末尾追加时间后缀（只改 compose 副本，存储
-// 不动；parts 内容追加到最后一个非空 text part 并重建其 Raw——ContentPart
-// 序列化走 Raw 原字节，改 Text 字段不生效）
-func stampMessages(msgs []types.Message, suffix string) {
-	for i := range msgs {
-		switch c := msgs[i].Content.(type) {
-		case string:
-			if c != "" {
-				msgs[i].Content = c + suffix
-			}
-		default:
-			parts := types.AsParts(msgs[i].Content)
-			if parts == nil {
-				continue
-			}
-			last := -1
-			for j := len(parts) - 1; j >= 0; j-- {
-				if parts[j].Type == "text" && parts[j].Text != "" {
-					last = j
-					break
-				}
-			}
-			if last < 0 {
-				continue
-			}
-			cp := make([]types.ContentPart, len(parts))
-			copy(cp, parts)
-			var t struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			}
-			if json.Unmarshal(cp[last].Raw, &t) == nil && t.Type == "text" {
-				t.Text += suffix
-				if raw, err := json.Marshal(t); err == nil {
-					cp[last].Raw = raw
-					cp[last].Text = t.Text
-				}
-			}
-			msgs[i].Content = cp
-		}
-	}
-}

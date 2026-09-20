@@ -238,11 +238,6 @@ func (a *Agent) runUserMessage(ctx context.Context, userText string, opt RunOpti
 	// 刷新/重开页面后"刷新瞬间在跑那轮"的 user 气泡不丢（前端按文本去重不重画）。
 	emit(types.AgentEvent{"type": "run_msg", "message": userText, "kind": kind})
 
-	// 动态时间注入（2026-09-20）：本 run 时间戳在此重算（run 开始时定一次，
-	// 同 run 内所有 compose 复用 → KV 前缀稳定；新 run 重算）。放在 AddMessage
-	// 之后：user 消息触发的压缩仍复用上一 run 的时间戳 → 压缩请求前缀与上一
-	// run 最后一次 LLM 请求逐 token 一致，KV 命中。
-	a.cm.BeginRun()
 
 	resp, err := a.llmCall(runCtx, emit, &totals)
 	if err != nil {
