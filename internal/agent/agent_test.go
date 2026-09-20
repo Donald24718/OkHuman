@@ -32,7 +32,7 @@ func TestTruncationRetry(t *testing.T) {
 	thinking := "思考了很久但忘了写正文……"
 	a, _ := newTestAgent([]llm.FakeStep{
 		{Type: "text", Text: "", Reasoning: &thinking}, // 第一次：异常截断
-		{Type: "text", Text: "重试成功"},              // 重试：正常回复
+		{Type: "text", Text: "重试成功"},                   // 重试：正常回复
 	})
 	var warns []string
 	opt := testRunOpt(&warns)
@@ -140,8 +140,8 @@ func TestInjectDemotePersist(t *testing.T) {
 	}, "系统提示", t.TempDir())
 	// 会话里放一条带注入引用的消息（/inject 的标记消息）
 	cm.AddMessage(&types.RawEntry{Role: "user", Content: []types.ContentPart{
-		{Type: "text", Text: "[okattach] 附件 inj-1"},
-		{Type: "inject_ref", Ref: "inj-1"},
+		types.TextPart("[okattach] 附件 inj-1"),
+		types.RefPart("inj-1"),
 	}})
 	a := New(&failOnceClient{inner: inner, fails: 1}, "系统提示", cm, injectDir)
 

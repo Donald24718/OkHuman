@@ -1088,56 +1088,24 @@ func (ap *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 // KV 前缀匹配）；侧车只在"会话引用已消失（被压缩吃掉）"时清；超此数只警告。
 const INJECT_MAX = 8
 
-// validateContentParts OpenAI parts 校验（非空数组；每 part 仅 text / image_url 两种）
+// validateContentParts OpenAI parts 校验（非空数组；每 part 须为带非空 type 的 JSON 对象——
+// 透传管道，part 类型语义属于 LLM 端点，主程序不逐类型识别）
 func validateContentParts(v interface{}) []types.ContentPart {
 	arr, ok := v.([]interface{})
 	if !ok || len(arr) == 0 {
 		return nil
 	}
-	out := []types.ContentPart{}
+	out := make([]types.ContentPart, 0, len(arr))
 	for _, p := range arr {
 		o, ok := p.(map[string]interface{})
 		if !ok {
 			return nil
 		}
-		switch o["type"] {
-		case "text":
-			s, ok := o["text"].(string)
-			if ok && s != "" {
-				out = append(out, types.ContentPart{Type: "text", Text: s})
-				continue
-			}
-			return nil
-		case "image_url":
-			iu, ok := o["image_url"].(map[string]interface{})
-			if ok {
-				url, ok2 := iu["url"].(string)
-				if ok2 && url != "" {
-					out = append(out, types.ContentPart{Type: "image_url", ImageURL: &types.ImageURL{URL: url}})
-					continue
-				}
-			}
-			return nil
-	case "input_video":
-		iv, ok := o["input_video"].(map[string]interface{})
-		if ok {
-			data, okd := iv["data"].(string)
-			url, oku := iv["url"].(string)
-			if (okd && data != "") || (oku && url != "") {
-				part := types.ContentPart{Type: "input_video"}
-				if okd && data != "" {
-					part.InputVideo = &types.InputVideo{Data: data}
-				} else {
-					part.InputVideo = &types.InputVideo{URL: url}
-				}
-				out = append(out, part)
-				continue
-			}
-		}
-		return nil
-		default:
+		part, err := types.FromPartMap(o)
+		if err != nil {
 			return nil
 		}
+		out = append(out, part)
 	}
 	return out
 }
@@ -1165,7 +1133,7 @@ func (ap *App) handleInject(w http.ResponseWriter, r *http.Request) {
 		parts = validateContentParts(b["content"])
 	}
 	if parts == nil {
-		writeJSON(w, 400, map[string]interface{}{"error": "content 须为非空 content parts 数组（OpenAI 格式：{type:text,text} / {type:image_url,image_url:{url}} / {type:input_video,input_video:{data}}）"})
+		writeJSON(w, 400, map[string]interface{}{"error": "content 须为非空 content parts 数组（OpenAI 格式：每个 part 为带非空 type 字段的 JSON 对象，如 {type:text,text} / {type:image_url,image_url:{url}} / {type:input_video,input_video:{data}}）"})
 		return
 	}
 	a := ap.state.Agent
@@ -1221,8 +1189,8 @@ func (ap *App) handleInject(w http.ResponseWriter, r *http.Request) {
 	a.CM().AddMessage(&types.RawEntry{
 		Role: "user",
 		Content: []types.ContentPart{
-			{Type: "text", Text: "[okattach] " + label},
-			{Type: "inject_ref", Ref: id},
+			types.TextPart("[okattach] " + label),
+			types.RefPart(id),
 		},
 	})
 	writeJSON(w, 200, map[string]interface{}{"ok": true, "id": id})

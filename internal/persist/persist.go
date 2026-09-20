@@ -304,52 +304,15 @@ func entryFromJSON(e interface{}) types.RawEntry {
 func partsFromJSON(arr []interface{}) ([]types.ContentPart, bool) {
 	parts := make([]types.ContentPart, 0, len(arr))
 	for _, p := range arr {
-		po, ok := p.(map[string]interface{})
+		m, ok := p.(map[string]interface{})
 		if !ok {
 			return nil, false
 		}
-		t, _ := po["type"].(string)
-		switch t {
-		case "text":
-			s, ok := po["text"].(string)
-			if !ok {
-				return nil, false
-			}
-			parts = append(parts, types.ContentPart{Type: "text", Text: s})
-		case "image_url":
-			iu, ok := po["image_url"].(map[string]interface{})
-			url, ok2 := iu["url"].(string)
-			if !ok || !ok2 {
-				return nil, false
-			}
-			parts = append(parts, types.ContentPart{Type: "image_url", ImageURL: &types.ImageURL{URL: url}})
-			case "input_video":
-			iv, ok := po["input_video"].(map[string]interface{})
-			if !ok {
-				return nil, false
-			}
-			data, okd := iv["data"].(string)
-			url, oku := iv["url"].(string)
-			if (okd && data != "") || (oku && url != "") {
-				part := types.ContentPart{Type: "input_video"}
-				if okd && data != "" {
-					part.InputVideo = &types.InputVideo{Data: data}
-				} else {
-					part.InputVideo = &types.InputVideo{URL: url}
-				}
-				parts = append(parts, part)
-			} else {
-				return nil, false
-			}
-	case "inject_ref":
-			ref, ok := po["ref"].(string)
-			if !ok {
-				return nil, false
-			}
-			parts = append(parts, types.ContentPart{Type: "inject_ref", Ref: ref})
-		default:
+		part, err := types.FromPartMap(m)
+		if err != nil {
 			return nil, false
 		}
+		parts = append(parts, part)
 	}
 	return parts, true
 }

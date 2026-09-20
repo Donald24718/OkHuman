@@ -71,7 +71,7 @@ func (r *Resolver) Resolve(id string) []types.ContentPart {
 		if r.onFail != nil {
 			r.onFail(id, reason)
 		}
-		stub := []types.ContentPart{{Type: "text", Text: fmt.Sprintf("（附件 %s 载入失败，已移除：%s）", id, reason)}}
+		stub := []types.ContentPart{types.TextPart(fmt.Sprintf("（附件 %s 载入失败，已移除：%s）", id, reason))}
 		r.stubCache[id] = stub
 		fmt.Printf("[inject] %s 载入失败（%s）→ 已移除，报错已回传 LLM\n", id, reason)
 		return stub
@@ -82,46 +82,15 @@ func (r *Resolver) Resolve(id string) []types.ContentPart {
 func parseParts(v []interface{}) ([]types.ContentPart, bool) {
 	parts := make([]types.ContentPart, 0, len(v))
 	for _, p := range v {
-		po, ok := p.(map[string]interface{})
+		m, ok := p.(map[string]interface{})
 		if !ok {
 			return nil, false
 		}
-		t, _ := po["type"].(string)
-		switch t {
-		case "text":
-			s, ok := po["text"].(string)
-			if !ok {
-				return nil, false
-			}
-			parts = append(parts, types.ContentPart{Type: "text", Text: s})
-		case "image_url":
-			iu, ok := po["image_url"].(map[string]interface{})
-			url, ok2 := iu["url"].(string)
-			if !ok || !ok2 {
-				return nil, false
-			}
-			parts = append(parts, types.ContentPart{Type: "image_url", ImageURL: &types.ImageURL{URL: url}})
-			case "input_video":
-			iv, ok := po["input_video"].(map[string]interface{})
-			if !ok {
-				return nil, false
-			}
-			data, okd := iv["data"].(string)
-			url, oku := iv["url"].(string)
-			if (okd && data != "") || (oku && url != "") {
-				part := types.ContentPart{Type: "input_video"}
-				if okd && data != "" {
-					part.InputVideo = &types.InputVideo{Data: data}
-				} else {
-					part.InputVideo = &types.InputVideo{URL: url}
-				}
-				parts = append(parts, part)
-			} else {
-				return nil, false
-			}
-	default:
-		return nil, false
+		part, err := types.FromPartMap(m)
+		if err != nil {
+			return nil, false
 		}
+		parts = append(parts, part)
 	}
 	return parts, true
 }
@@ -148,7 +117,7 @@ func PersistDemotion(dir, id string) bool {
 	if _, err := os.Stat(p); err != nil {
 		return false
 	}
-	stub := []types.ContentPart{{Type: "text", Text: fmt.Sprintf("附件 %s 因 LLM 4xx 降级为文本提示，原附件未发送", id)}}
+	stub := []types.ContentPart{types.TextPart(fmt.Sprintf("附件 %s 因 LLM 4xx 降级为文本提示，原附件未发送", id))}
 	b, err := json.Marshal(stub)
 	if err != nil {
 		return false

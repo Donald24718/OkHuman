@@ -117,11 +117,11 @@ func resolveContentParts(parts []types.ContentPart, demote bool) []types.Content
 				resolved = r.Resolve(p.Ref)
 			}
 			if demote && resolved != nil {
-				out = append(out, types.ContentPart{Type: "text", Text: fmt.Sprintf("（附件 %s 本轮未发送，仅以文本提示保留）", p.Ref)})
+				out = append(out, types.TextPart(fmt.Sprintf("（附件 %s 本轮未发送，仅以文本提示保留）", p.Ref)))
 			} else if resolved != nil {
 				out = append(out, resolved...)
 			} else {
-				out = append(out, types.ContentPart{Type: "text", Text: fmt.Sprintf("（附件 %s 已清理或丢失）", p.Ref)})
+				out = append(out, types.TextPart(fmt.Sprintf("（附件 %s 已清理或丢失）", p.Ref)))
 			}
 		} else {
 			out = append(out, p)

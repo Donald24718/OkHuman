@@ -4,7 +4,10 @@ package types
 // 单一共享类型层：llm / context / persist / agent / server 全依赖本包，
 // 与 TS 版"types.ts 是唯一类型源"同构。
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // ---------- LLM wire 格式（OpenAI 兼容 / llama.cpp /v1/chat/completions） ----------
 
@@ -22,23 +25,79 @@ type Function struct {
 
 // ContentPart 三型：text | image_url | inject_ref。
 // inject_ref 仅存于会话；组装请求时解析成真实 parts（侧车文件），永不上 wire。
+// ContentPart 内容 part：主进程=透传管道（2026-09-20 解耦重构）。
+// 只认"带非空 type 字段的 JSON 对象"，负载原样转发给 LLM 端点（part 语义属于
+// LLM，如 llama-server 的 input_video / image_url / 未来新类型，主程序零感知）；
+// 4xx 降级类型无关，整条注入统一换文本存根。
+// Type/Text/Ref 是解析时提取的便捷字段（inject_ref 识别、降级、字符统计、
+// /history 展示用），不参与序列化。
 type ContentPart struct {
-	Type       string       `json:"type"`
-	Text       string       `json:"text,omitempty"`
-	ImageURL   *ImageURL    `json:"image_url,omitempty"`
-	InputVideo *InputVideo  `json:"input_video,omitempty"` // 2026-09-20：视频直通（llama-server input_video part）
-	Ref        string       `json:"ref,omitempty"`
+	Type string          `json:"-"`
+	Raw  json.RawMessage `json:"-"`
+	Text string          `json:"-"` // text part 的正文
+	Ref  string          `json:"-"` // inject_ref part 的引用 id
 }
 
-// InputVideo 视频 part（llama-server 口径：data=base64，url=文件/远端地址；
-// data 支持裸 base64 或 data:video/<mime>;base64, 前缀）
-type InputVideo struct {
-	Data string `json:"data,omitempty"`
-	URL  string `json:"url,omitempty"`
+// MarshalJSON 原对象原样输出（KV 前缀逐字节稳定）
+func (p ContentPart) MarshalJSON() ([]byte, error) {
+	if len(p.Raw) == 0 {
+		return nil, fmt.Errorf("ContentPart.Raw 为空（须经 TextPart/RefPart/FromPartMap 或 JSON 反序列化构造）")
+	}
+	return p.Raw, nil
 }
 
-type ImageURL struct {
-	URL string `json:"url"`
+// UnmarshalJSON 原字节原样保留，提取 type/text/ref
+func (p *ContentPart) UnmarshalJSON(b []byte) error {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		return fmt.Errorf("part 须为 JSON 对象: %w", err)
+	}
+	var t string
+	if err := json.Unmarshal(m["type"], &t); err != nil || t == "" {
+		return fmt.Errorf("part 须带非空 type 字段")
+	}
+	p.Type = t
+	if v, ok := m["text"]; ok {
+		_ = json.Unmarshal(v, &p.Text)
+	}
+	if v, ok := m["ref"]; ok {
+		_ = json.Unmarshal(v, &p.Ref)
+	}
+	p.Raw = append(json.RawMessage(nil), b...)
+	return nil
+}
+
+// TextPart 构造 text part
+func TextPart(text string) ContentPart {
+	raw, _ := json.Marshal(map[string]string{"type": "text", "text": text})
+	return ContentPart{Type: "text", Text: text, Raw: raw}
+}
+
+// RefPart 构造 inject_ref part
+func RefPart(id string) ContentPart {
+	raw, _ := json.Marshal(map[string]string{"type": "inject_ref", "ref": id})
+	return ContentPart{Type: "inject_ref", Ref: id, Raw: raw}
+}
+
+// FromPartMap 从通用 map 构造（server/persist 解析路径；map marshal 键序归一，
+// 内容逐字节确定 → 前缀稳定）
+func FromPartMap(m map[string]interface{}) (ContentPart, error) {
+	t, ok := m["type"].(string)
+	if !ok || t == "" {
+		return ContentPart{}, fmt.Errorf("part 须为带非空 type 的对象")
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return ContentPart{}, err
+	}
+	p := ContentPart{Type: t, Raw: raw}
+	if v, ok := m["text"].(string); ok {
+		p.Text = v
+	}
+	if v, ok := m["ref"].(string); ok {
+		p.Ref = v
+	}
+	return p, nil
 }
 
 // Content 消息内容：纯文本(string) 或 content parts([]ContentPart)
