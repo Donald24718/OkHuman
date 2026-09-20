@@ -743,20 +743,25 @@ function handleChatEvent(type, data) {
       chatAddHtml(evCard("bgstart", "🚗", `${data.tool_name} 后台结果已搭车（${data.ok ? "成功" : "失败"}）`, `结果 ${fmtBytes(data.result_chars)}，已注入到本条消息之前、与本次 LLM 调用一起发出（轮内注入，不额外加 LLM 调用）`));
       break;
     case "user_piggyback": {
-      // 轮内搭车注入（2026-09-09）：运行中用户消息被取走注入上下文。
-      // 找已有的 user 气泡标"🚗 已搭车"；找不到（刷新过）→ 补画气泡。
+      // 轮内搭车注入（2026-09-09）：运行中消息被取走注入上下文。
+      // 找已有气泡标"🚗 已搭车"；找不到（刷新过）→ 补画气泡。
+      // 后台通知（2026-09-20 修）同 run_msg 口径：画 sys 气泡不画 user 气泡——
+      // 旧实现一律查/画 .msg.user，排队时已画的 sys 气泡找不到，补画的 user 气泡
+      // 让后台通知"排队成功后从用户侧发出"，且同一文本双气泡重复渲染。
       const msg = String(data.message ?? "");
       if (!msg) break;
-      const pre = msg.slice(0, 40);
+      const isBg = msg.startsWith(BG_NOTICE_PREFIX);
+      const pre = msg.slice(0, isBg ? 80 : 40);
       const box = getBox().el;
-      const bub = Array.from(box.querySelectorAll(".msg.user .bubble"))
+      const bub = Array.from(box.querySelectorAll(isBg ? ".msg.sys .bubble" : ".msg.user .bubble"))
         .find((x) => x.textContent?.startsWith(pre));
       if (bub) {
+        bub.querySelector(".queue-tag")?.remove(); // 已被取走：摘"排队中"标记
         if (!bub.querySelector(".piggy-tag")) {
           bub.insertAdjacentHTML("beforeend", '<div class="piggy-tag">🚗 已搭车注入</div>');
         }
       } else {
-        chatUserHtml(msg);
+        isBg ? chatSysHtml(msg) : chatUserHtml(msg);
       }
       break;
     }
