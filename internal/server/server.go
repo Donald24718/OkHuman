@@ -210,6 +210,9 @@ func makeCm(a *AgentState) *ctxmgr.Manager {
 	}, sp, cfg.Data.Dir)
 	m.SetSessionNo(int(a.SessionNo.Load()))
 	m.AddCompressListener(func(e ctxmgr.CompressEvent) { pushCompressLog(a, e) })
+	// 自我生命感知（2026-09-20）：本实例端口/pid + LLM 端口/pid，compose 时
+	// 实时注入系统提示词首
+	m.SetSelfInfo(ctxmgr.SelfInfo{Port: cfg.Server.Port, DataDir: cfg.Data.Dir, LLMBaseURL: cfg.LLM.BaseURL})
 	return m
 }
 
@@ -548,6 +551,8 @@ func applyConfigPatch(a *AgentState, patch map[string]interface{}) PatchResult {
 			CharsPerToken:   nc.Context.CharsPerToken,
 		})
 	}
+	// 自我生命感知输入随配置热更新（llm base_url / server 段变化）
+	a.CM().SetSelfInfo(ctxmgr.SelfInfo{Port: nc.Server.Port, DataDir: nc.Data.Dir, LLMBaseURL: nc.LLM.BaseURL})
 	a.CfgRef.Store(nc)
 	// tools / doom 段：由 runOpt 每轮现取，无需动作
 	return PatchResult{Applied: dedupe(applied), Restart: dedupe(restart)}
