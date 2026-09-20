@@ -101,8 +101,26 @@ func parseParts(v []interface{}) ([]types.ContentPart, bool) {
 				return nil, false
 			}
 			parts = append(parts, types.ContentPart{Type: "image_url", ImageURL: &types.ImageURL{URL: url}})
-		default:
-			return nil, false
+			case "input_video":
+			iv, ok := po["input_video"].(map[string]interface{})
+			if !ok {
+				return nil, false
+			}
+			data, okd := iv["data"].(string)
+			url, oku := iv["url"].(string)
+			if (okd && data != "") || (oku && url != "") {
+				part := types.ContentPart{Type: "input_video"}
+				if okd && data != "" {
+					part.InputVideo = &types.InputVideo{Data: data}
+				} else {
+					part.InputVideo = &types.InputVideo{URL: url}
+				}
+				parts = append(parts, part)
+			} else {
+				return nil, false
+			}
+	default:
+		return nil, false
 		}
 	}
 	return parts, true

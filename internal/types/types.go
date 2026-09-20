@@ -23,10 +23,18 @@ type Function struct {
 // ContentPart 三型：text | image_url | inject_ref。
 // inject_ref 仅存于会话；组装请求时解析成真实 parts（侧车文件），永不上 wire。
 type ContentPart struct {
-	Type     string    `json:"type"`
-	Text     string    `json:"text,omitempty"`
-	ImageURL *ImageURL `json:"image_url,omitempty"`
-	Ref      string    `json:"ref,omitempty"`
+	Type       string       `json:"type"`
+	Text       string       `json:"text,omitempty"`
+	ImageURL   *ImageURL    `json:"image_url,omitempty"`
+	InputVideo *InputVideo  `json:"input_video,omitempty"` // 2026-09-20：视频直通（llama-server input_video part）
+	Ref        string       `json:"ref,omitempty"`
+}
+
+// InputVideo 视频 part（llama-server 口径：data=base64，url=文件/远端地址；
+// data 支持裸 base64 或 data:video/<mime>;base64, 前缀）
+type InputVideo struct {
+	Data string `json:"data,omitempty"`
+	URL  string `json:"url,omitempty"`
 }
 
 type ImageURL struct {

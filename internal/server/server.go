@@ -1118,6 +1118,23 @@ func validateContentParts(v interface{}) []types.ContentPart {
 				}
 			}
 			return nil
+	case "input_video":
+		iv, ok := o["input_video"].(map[string]interface{})
+		if ok {
+			data, okd := iv["data"].(string)
+			url, oku := iv["url"].(string)
+			if (okd && data != "") || (oku && url != "") {
+				part := types.ContentPart{Type: "input_video"}
+				if okd && data != "" {
+					part.InputVideo = &types.InputVideo{Data: data}
+				} else {
+					part.InputVideo = &types.InputVideo{URL: url}
+				}
+				out = append(out, part)
+				continue
+			}
+		}
+		return nil
 		default:
 			return nil
 		}
@@ -1148,7 +1165,7 @@ func (ap *App) handleInject(w http.ResponseWriter, r *http.Request) {
 		parts = validateContentParts(b["content"])
 	}
 	if parts == nil {
-		writeJSON(w, 400, map[string]interface{}{"error": "content 须为非空 content parts 数组（OpenAI 格式：{type:text,text} / {type:image_url,image_url:{url}}）"})
+		writeJSON(w, 400, map[string]interface{}{"error": "content 须为非空 content parts 数组（OpenAI 格式：{type:text,text} / {type:image_url,image_url:{url}} / {type:input_video,input_video:{data}}）"})
 		return
 	}
 	a := ap.state.Agent
