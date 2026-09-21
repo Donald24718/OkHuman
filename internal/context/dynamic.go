@@ -2,8 +2,8 @@ package context
 
 // 动态注入（2026-09-20）：自我生命感知
 //
-// 系统提示词首 prepend 一块"你的生命"（本实例端口/pid + 接入 LLM 的端口/
-// pid），每次 LLM 调用现算 → 端口/pid 变化实时反映。语义明确告诉模型：
+// 系统提示词首 prepend 一块"你的生命"（本实例端口/pid/源码位置 + 接入
+// LLM 的端口/pid），每次 LLM 调用现算 → 端口/pid/源码位置变化实时反映。语义明确告诉模型：
 // 这些端口与 PID 就是它自己与它思考的载体，谨慎操作。
 // （消息时间戳功能 2026-09-20 同日砍掉：模型会模仿注入格式抄进自己的
 // 输出并落盘，累积成噪声；只保留生命感知。）
@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -39,11 +40,16 @@ func (m *Manager) selfBlockLocked() string {
 	}
 	var b strings.Builder
 	b.WriteString("[你的生命]\n")
-	b.WriteString("本 OkHuman 实例（承载这个会话的进程，端口与 PID 实时计算）：\n")
+	b.WriteString("本 OkHuman 实例（承载这个会话的进程，端口/PID/源码位置实时计算）：\n")
 	if si.Port > 0 {
 		fmt.Fprintf(&b, "- 服务端口：%d\n", si.Port)
 	}
 	fmt.Fprintf(&b, "- 进程 PID：%d\n", os.Getpid())
+	if exe, err := os.Executable(); err == nil {
+		if dir := filepath.Dir(strings.TrimSuffix(exe, " (deleted)")); dir != "" {
+			fmt.Fprintf(&b, "- 源码位置：%s（运行树，二进制所在目录）\n", dir)
+		}
+	}
 	if si.DataDir != "" {
 		fmt.Fprintf(&b, "- 数据目录：%s\n", si.DataDir)
 	}
@@ -150,4 +156,3 @@ func hexPort(hexAddr string) int {
 	}
 	return int(p)
 }
-

@@ -3,6 +3,7 @@ package context
 import (
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -49,13 +50,21 @@ func TestComposeLocked(t *testing.T) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	m := NewManager(nil, Cfg{CharsPerToken: 1.5}, "原始系统提示词", t.TempDir())
 	m.SetSelfInfo(SelfInfo{Port: 8461, DataDir: "/tmp/x", LLMBaseURL: "http://127.0.0.1:" + strconv.Itoa(port) + "/v1"})
+	exeDir := ""
+	if exe, err := os.Executable(); err == nil {
+		exeDir = filepath.Dir(strings.TrimSuffix(exe, " (deleted)"))
+	}
 	m.AddMessage(&types.RawEntry{Role: "user", Content: "你好"})
 	msgs := m.Compose(nil)
 	sys, _ := msgs[0].Content.(string)
 	if !strings.HasPrefix(sys, "[你的生命]") {
 		t.Fatalf("system 未以自我块开头: %s", sys[:min(40, len(sys))])
 	}
-	for _, want := range []string{"服务端口：8461", "进程 PID：", "数据目录：/tmp/x", "127.0.0.1:" + strconv.Itoa(port), "原始系统提示词"} {
+	wants := []string{"服务端口：8461", "进程 PID：", "源码位置：", "数据目录：/tmp/x", "127.0.0.1:" + strconv.Itoa(port), "原始系统提示词"}
+	if exeDir != "" {
+		wants = append(wants, exeDir)
+	}
+	for _, want := range wants {
 		if !strings.Contains(sys, want) {
 			t.Fatalf("自我块缺 %q:\n%s", want, sys)
 		}

@@ -210,7 +210,7 @@ func makeCm(a *AgentState) *ctxmgr.Manager {
 	}, sp, cfg.Data.Dir)
 	m.SetSessionNo(int(a.SessionNo.Load()))
 	m.AddCompressListener(func(e ctxmgr.CompressEvent) { pushCompressLog(a, e) })
-	// 自我生命感知（2026-09-20）：本实例端口/pid + LLM 端口/pid，compose 时
+	// 自我生命感知（2026-09-20）：本实例端口/pid/源码位置 + LLM 端口/pid，compose 时
 	// 实时注入系统提示词首
 	m.SetSelfInfo(ctxmgr.SelfInfo{Port: cfg.Server.Port, DataDir: cfg.Data.Dir, LLMBaseURL: cfg.LLM.BaseURL})
 	return m
