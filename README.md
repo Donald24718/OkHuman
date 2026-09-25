@@ -36,4 +36,5 @@ Go 单仓：`main.go` + `internal/`（config / agent / server / context / prompt
 
 agent 身份的提交必须带 provenance trailer：`Provenance: agent(小K @8451)`——
 仓库 git 身份是机主（xhy）的，不带 trailer 则记录无法区分人/agent 手。
+（2026-09-21 互证事件：可归因的 agent 劳动全在插件层、内核 6754 行零可归因证据，根因是署名不可读。）
 （署名先于记忆：账本要先承载"谁写的"，才谈得上承载过去。）

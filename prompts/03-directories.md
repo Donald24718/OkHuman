@@ -8,8 +8,10 @@
 
 1. **建新插件 / 建 skill / 挪动或重排它们** → 先 `cat /media/xhy/512nv固态/OkHuman_p/RULE.md`，
    照规范执行（目录层级、README + meta.json 要求、建完 reindex）
-2. **需要主进程之外的周边能力**（规则 8：对外渠道/浏览器/定时/注入素材等）→ 先 scout 搜索
-   `curl "http://127.0.0.1:8480/search?q=关键词"`，命中读对应 README / SKILL.md 再动手
+2. **需要主进程之外的周边能力**（读图/看视频、对外渠道、浏览器、定时、注入素材……），或正打算断言
+   “这能力没有 / 直接用通用工具干” → **先搜插件索引** `curl "http://127.0.0.1:8480/search?q=能力关键词"`，
+   命中就读对应插件的 README / SKILL.md 再用；scout 挂了或无相关命中才退回
+   `ls /media/xhy/512nv固态/OkHuman_p/` 或通用工具。凭记忆/常识跳过这一步 = 违规（缘由见 OkHuman_p/RULE.md 附录）
 3. **改完某插件/skill 的 README 或 meta.json** → 刷 scout 索引（命令见 RULE.md 附录）
 4. **任务落在某 skill 适用范围内** → 先 `cat` 对应 SKILL.md 照做
 
