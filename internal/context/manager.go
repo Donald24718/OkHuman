@@ -5,7 +5,9 @@ package context
 //   → 保留集 = 最近 keep_recent_chars 字符预算内的原文（至少最新 1 条），
 //   保留集外（含旧 summary）交给 LLM 滚动压缩成 1 条 summary
 // - 压缩批次原文先写存档文件（data.dir/session-records/）再压缩 → 细节零丢失，
-//   新 summary 附"完整原文已存档"指引（LLM 可 cat 抓回）
+//   压缩后总结文本另存 data.dir/session-summaries/（与存档同名基座、不同文件夹配对，
+//   2026-09-25）；新 summary 附两行指针：总结文本文件 + 存档文件
+//   （回忆轨迹先看总结，被压掉的细节按需 cat/grep 存档抓回）
 // - 失败兜底：空闲超时重试 3 次仍失败 → 硬截断到 hard_trunc_chars；
 //   其他错误（含 /stop 中断）→ 不重试、session 不变（下轮消息再试）
 // - 4xx 回退阶梯（agent 包调用）：forceHardTruncate 直接硬截断不经 LLM
@@ -65,7 +67,7 @@ type Manager struct {
 	compressL    []func(CompressEvent)
 	deltaL       []func(string, types.Delta)
 	persistL     []func(*types.SessionState, int)
-	selfInfo   SelfInfo // 自我生命感知输入（动态注入 2026-09-20）
+	selfInfo     SelfInfo // 自我生命感知输入（动态注入 2026-09-20）
 }
 
 // NewManager 新建（空会话）
@@ -323,7 +325,8 @@ func (m *Manager) estimateTotalLocked() int {
 // session 不变（下一轮消息再试，原文已落盘不丢）。
 func (m *Manager) doCompress(batch []types.RawEntry) {
 	m.mu.Lock()
-	recordPath := m.writeSessionRecordLocked()
+	ts := m.recordTsLocked()
+	recordPath := m.writeSessionRecordLocked(ts)
 	oldSummary := ""
 	if m.session.Summary != nil {
 		oldSummary = m.session.Summary.Content
@@ -361,18 +364,31 @@ func (m *Manager) doCompress(batch []types.RawEntry) {
 			m.emit(scope, "压缩失败：模型空输出", oldSummary, 0, beforeChars, nil)
 			return
 		}
-		// 压缩成功：batch 出列，新 summary 替换旧 summary（尾部附记录文件路径）
+		// 压缩成功：batch 出列，新 summary 替换旧 summary（尾部附总结文本文件 + 存档文件两行指针）
 		m.mu.Lock()
 		if len(batch) > 0 && len(batch) <= len(m.session.Messages) {
 			m.session.Messages = m.session.Messages[len(batch):]
 		}
 		ref := res.Text
+		// 2026-09-25：总结文本落盘 session-summaries/（与 records 存档同名基座配对）；
+		// 写失败不阻断压缩，指针降级为只有存档行
+		var summaryPath string
 		if recordPath != "[记录写入失败]" {
-			ref += "\n\n[完整原文已存档：" + recordPath + " —— 需要被压掉的细节时用 bash cat/grep 抓回]"
+			summaryPath = m.writeSummaryFileLocked(ts, res.Text, res.Rounds, beforeChars, recordPath)
+		}
+		if summaryPath != "" && summaryPath != "[记录写入失败]" {
+			ref += "\n\n[压缩后总结文本：" + summaryPath + " —— 回忆任务轨迹先看这里（时间线/关键实体/完成状态）]"
+		}
+		if recordPath != "[记录写入失败]" {
+			ref += "\n[完整原文已存档：" + recordPath + " —— 需要被压掉的细节时用 bash cat/grep 按需抓回]"
 		}
 		m.session.Summary = &types.TEntry{Content: ref, CreatedAt: time.Now().UnixMilli()}
 		m.mu.Unlock()
-		m.emit(scope, fmt.Sprintf("%d 条最早消息%s → 1 条 summary（完整记录 %s）", len(batch), oldSummaryMark(oldSummary), recordPath), ref, res.Rounds, beforeChars, res.Thinking)
+		detail := fmt.Sprintf("%d 条最早消息%s → 1 条 summary（完整记录 %s）", len(batch), oldSummaryMark(oldSummary), recordPath)
+		if summaryPath != "" && summaryPath != "[记录写入失败]" {
+			detail += "，总结文本已落盘"
+		}
+		m.emit(scope, detail, ref, res.Rounds, beforeChars, res.Thinking)
 		return
 	}
 }
@@ -418,7 +434,8 @@ func (m *Manager) ForceHardTruncate() {
 	m.changeMu.Lock()
 	defer m.changeMu.Unlock()
 	m.mu.Lock()
-	recordPath := m.writeSessionRecordLocked()
+	ts := m.recordTsLocked()
+	recordPath := m.writeSessionRecordLocked(ts)
 	m.hardTruncateLocked(recordPath)
 	m.mu.Unlock()
 }
@@ -453,15 +470,42 @@ func (m *Manager) hardTruncateLocked(recordPath string) {
 	m.emitLocked("history", fmt.Sprintf("压缩 3 次均无响应 → 硬截断保留最近 %d 字符（丢弃 %d 条，完整记录 %s）", acc, n-keep, recordPath), ref, 0, before, nil)
 }
 
+// recordTsLocked 当前 UTC 毫秒精度时间戳（总结/存档文件名同名基座配对用，持锁调用）
+func (m *Manager) recordTsLocked() string {
+	return time.Now().UTC().Format("2006-01-02_15-04-05-000") + "Z"
+}
+
+// writeSummaryFileLocked 压缩后总结文本落盘（2026-09-25）：
+// recordDir/session-summaries/<同名基座>.summary.txt（持锁调用）。与 session-records/
+// 存档不同文件夹、同名基座成对：总结供快速回忆任务轨迹（时间线/关键实体/完成状态），
+// 存档供按需抓回被压掉的细节。文件头带元信息（会话号/生成时间/轮数/前后字数/配对存档）。
+func (m *Manager) writeSummaryFileLocked(ts, text string, rounds, beforeChars int, recordPath string) string {
+	iso := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
+	lines := []string{
+		fmt.Sprintf("# 压缩后总结 会话号=%d 生成=%s 压缩轮数=%d", m.sessionNo, iso, rounds),
+		fmt.Sprintf("压缩前会话字符数=%d 总结字符数=%d（单实例：agent 由落盘目录 okhuman-<port>/ 标识）", beforeChars, utf16Len(text)),
+		"配对完整存档：" + recordPath,
+		"",
+		text,
+	}
+	dir := filepath.Join(m.recordDir, "session-summaries")
+	path := filepath.Join(dir, fmt.Sprintf("ctx-%d-%s-seq%d.summary.txt", m.sessionNo, ts, m.seq))
+	if err := os.MkdirAll(dir, 0o755); err == nil {
+		if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644); err == nil {
+			return path
+		}
+	}
+	return "[记录写入失败]"
+}
+
 // writeSessionRecordLocked 压缩触发时生成会话完整记录
 // （recordDir/session-records/ctx-<会话号>-<时间戳>-seq<N>.txt，持锁调用）。
 // 内容 = 压缩前的完整会话（system 提示词 + summary + 全部消息原文）。
 // 人类可读的纯文本；结构固定：压缩后总结置顶 → system 提示词 → 消息按时间序。
-// 文件名毫秒精度 + seq 后缀（同毫秒不撞名）。
-func (m *Manager) writeSessionRecordLocked() string {
-	now := time.Now().UTC()
-	ts := now.Format("2006-01-02_15-04-05-000") + "Z"
-	iso := now.UTC().Format("2006-01-02T15:04:05.000Z")
+// 文件名毫秒精度 + seq 后缀（同毫秒不撞名）。ts 由调用方生成（doCompress 把同一 ts
+// 传给本函数与 writeSummaryFileLocked → 存档/总结同名基座配对）。
+func (m *Manager) writeSessionRecordLocked(ts string) string {
+	iso := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
 	var lines []string
 	lines = append(lines, fmt.Sprintf("# 会话完整记录 会话号=%d 生成=%s（单实例：agent 由落盘目录 okhuman-<port>/ 标识）", m.sessionNo, iso))
 	if m.session.Summary != nil {

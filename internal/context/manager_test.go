@@ -1,6 +1,9 @@
 package context
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -74,5 +77,70 @@ func TestContextStatsSummaryCount(t *testing.T) {
 	st2 := ContextStatsOf(without, 2)
 	if st2.Summary != 0 || st2.SummaryTokens != 0 || st2.SummaryChars != 0 {
 		t.Fatalf("无 summary 时应全 0：%+v", st2)
+	}
+}
+
+// extractBetween 取 s 中 pre 与 post 之间的子串（测试指针路径提取用）
+func extractBetween(s, pre, post string) string {
+	i := strings.Index(s, pre)
+	if i < 0 {
+		return ""
+	}
+	rest := s[i+len(pre):]
+	j := strings.Index(rest, post)
+	if j < 0 {
+		return ""
+	}
+	return rest[:j]
+}
+
+// TestSummaryFilePairing（2026-09-25）：压缩后总结文本落盘 session-summaries/，
+// 与 session-records/ 存档同名基座成对（不同文件夹）；summary 指针含两个路径。
+func TestSummaryFilePairing(t *testing.T) {
+	dir := t.TempDir()
+	fake := llm.NewFakeLLM([]llm.FakeStep{
+		{Type: "compress", Scope: "history", Text: "（假压缩总结）"},
+	})
+	m := NewManager(fake, Cfg{
+		MaxTokens:       10,
+		KeepRecentChars: 5,
+		HardTruncChars:  100,
+		StreamIdleMS:    200,
+		CharsPerToken:   1,
+	}, "sys", dir)
+	for i := 0; i < 3; i++ {
+		m.AddMessage(&types.RawEntry{Role: "user", Content: "这是一条比较长的消息内容 " + strings.Repeat("x", 30)})
+	}
+	sess := m.Session()
+	if sess.Summary == nil {
+		t.Fatal("无 summary（压缩未触发）")
+	}
+	ref := sess.Summary.Content
+	recPath := extractBetween(ref, "[完整原文已存档：", " ——")
+	sumPath := extractBetween(ref, "[压缩后总结文本：", " ——")
+	if recPath == "" || sumPath == "" {
+		t.Fatalf("指针缺路径（rec=%q sum=%q）：\n%s", recPath, sumPath, ref)
+	}
+	if !strings.HasPrefix(recPath, filepath.Join(dir, "session-records")) {
+		t.Fatalf("存档路径不在 session-records/：%s", recPath)
+	}
+	if !strings.HasPrefix(sumPath, filepath.Join(dir, "session-summaries")) {
+		t.Fatalf("总结路径不在 session-summaries/：%s", sumPath)
+	}
+	recBase := strings.TrimSuffix(filepath.Base(recPath), ".txt")
+	sumBase := strings.TrimSuffix(filepath.Base(sumPath), ".summary.txt")
+	if recBase != sumBase {
+		t.Fatalf("基座名不成对：rec=%s sum=%s", recPath, sumPath)
+	}
+	data, err := os.ReadFile(sumPath)
+	if err != nil {
+		t.Fatalf("总结文件未落盘：%v", err)
+	}
+	body := string(data)
+	if !strings.Contains(body, "（假压缩总结）") {
+		t.Fatalf("总结文件内容不符：%s", body)
+	}
+	if !strings.Contains(body, "配对完整存档："+recPath) {
+		t.Fatalf("总结文件头缺配对存档指引：%s", body)
 	}
 }
