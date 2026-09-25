@@ -108,6 +108,7 @@ func TestSummaryFilePairing(t *testing.T) {
 		StreamIdleMS:    200,
 		CharsPerToken:   1,
 	}, "sys", dir)
+	m.SetSessionNo(4) // 会话号显式设置（建 CM 默认 1 不得泄漏进文件名，2026-09-25）
 	for i := 0; i < 3; i++ {
 		m.AddMessage(&types.RawEntry{Role: "user", Content: "这是一条比较长的消息内容 " + strings.Repeat("x", 30)})
 	}
@@ -131,6 +132,9 @@ func TestSummaryFilePairing(t *testing.T) {
 	sumBase := strings.TrimSuffix(filepath.Base(sumPath), ".summary.txt")
 	if recBase != sumBase {
 		t.Fatalf("基座名不成对：rec=%s sum=%s", recPath, sumPath)
+	}
+	if !strings.HasPrefix(recBase, "ctx-4-") {
+		t.Fatalf("文件名会话号未用 SetSessionNo 的值（应 ctx-4-…）：%s", recPath)
 	}
 	data, err := os.ReadFile(sumPath)
 	if err != nil {

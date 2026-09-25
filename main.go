@@ -154,7 +154,9 @@ func main() {
 		a.SessionNo.Store(int32(sessSnap.No))
 		a.CM().Restore(sessSnap.State)
 		a.CM().SetSeq(sessSnap.Seq)
-		// 注：对齐 TS——restore() 不更新 cm 的会话号（记录文件名沿用建 CM 时的会话号）
+		// 2026-09-25 修：cm 会话号也同步为落盘值。此前重启续接后压缩存档误标
+		// ctx-1（建 CM 时的默认号，与磁盘上的真实会话号脱节，如 #4 会话出 ctx-1）
+		a.CM().SetSessionNo(int(sessSnap.No))
 	}
 	// 会话变更 → 实时同步落盘
 	a.CM().AddPersistListener(func(s *types.SessionState, seq int) {
