@@ -1,0 +1,4 @@
+{
+  "name": "voice-chat",
+  "summary": "语音对话插件：对着麦克风说话→VAD→声纹验证（只认你的声音）→ASR→唤醒词路由到 OkHuman 实例→Kokoro 本地 TTS 朗读回复。回复按条排队+消息内句子级流式播报，输入输出解耦。全自包含（Python 环境与模型经 setup.sh 安装）。"
+}

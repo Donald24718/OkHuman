@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>OkHuman 监控 (okmon)</title>
+<style>
+body{background:#111418;color:#d8dee6;font:14px/1.5 "Noto Sans CJK SC",sans-serif;margin:20px}
+h1{font-size:18px;margin:0 0 4px}h2{font-size:15px;color:#8ab4f8;margin:22px 0 8px;border-bottom:1px solid #2a2f36;padding-bottom:4px}
+#ts{color:#667;font-size:12px}
+table{border-collapse:collapse;width:100%}
+td,th{border-bottom:1px solid #232830;padding:5px 8px;text-align:left;font-size:13px}
+th{color:#778;font-weight:normal;font-size:12px}
+.bar{background:#1c2128;border-radius:3px;height:12px;width:140px;position:relative;display:inline-block;vertical-align:middle}
+.bar i{display:block;height:100%;border-radius:3px;background:#4c8dd6}
+.bar.warn i{background:#e8a33d}.bar.hot i{background:#e05d5d}
+.on{color:#7ee787}.off{color:#667}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
+.dot.on{background:#7ee787}.dot.off{background:#444}
+button{background:#2a3140;color:#d8dee6;border:1px solid #3a4150;border-radius:4px;padding:3px 12px;cursor:pointer;font-size:12px;margin-right:6px}
+button:hover{background:#37415a}button:disabled{opacity:.35;cursor:default}
+#msg{margin-top:14px;padding:8px 12px;border-radius:6px;font-size:13px;display:none}
+#msg.ok{display:block;background:#17321f;color:#7ee787}
+#msg.err{display:block;background:#3a1d1d;color:#e08585}
+.small{color:#778;font-size:12px}
+</style>
+</head>
+<body>
+<h1>OkHuman 监控（okmon）<span id="ts" class="small"></span></h1>
+
+<h2>显卡</h2>
+<table id="gpus"><tr><th>#</th><th>名称</th><th>利用率</th><th>显存</th><th>温度</th><th>功耗</th></tr></table>
+
+<h2>显存占用进程</h2>
+<table id="apps"><tr><th>pid</th><th>进程</th><th>显存 MiB</th><th>对应服务</th></tr></table>
+
+<h2>OkHuman 系 Go 进程</h2>
+<table id="svcs"><tr><th>服务</th><th>状态</th><th>pid</th><th>端口</th><th>运行时长</th><th>内存</th><th>CPU</th><th>操作</th></tr></table>
+
+<div id="msg"></div>
+<script>
+function bar(v, max, warnPct){
+  const p = max>0 ? Math.round(v/max*100) : 0;
+  const cls = p>=90?'hot':(p>=70?'warn':'');
+  return `<span class="bar ${cls}"><i style="width:${p}%"></i></span> <span class="small">${p}%</span>`;
+}
+function up(s){
+  if(!s) return '—';
+  const h=Math.floor(s/3600), m=Math.floor(s%3600/60), d=Math.floor(s/86400);
+  return d?`${d}天${h}时`:h?`${h}时${m}分`:`${m}分${s%60}秒`;
+}
+async function tick(){
+  try{
+    const r=await fetch('/api/state'); const st=await r.json();
+    document.getElementById('ts').textContent='更新 '+st.ts;
+    let h='<tr><th>#</th><th>名称</th><th>利用率</th><th>显存</th><th>温度</th><th>功耗</th></tr>';
+    for(const g of st.gpus){
+      h+=`<tr><td>${g.idx}</td><td>${g.name}</td><td>${bar(g.util,100)}</td><td>${bar(g.mem_used,g.mem_total)} <span class="small">${g.mem_used}/${g.mem_total} MiB</span></td><td>${g.temp}°C</td><td>${g.power?g.power.toFixed(1)+' W':'—'}</td></tr>`;
+    }
+    document.getElementById('gpus').innerHTML=h;
+    let a='<tr><th>pid</th><th>进程</th><th>显存 MiB</th><th>对应服务</th></tr>';
+    if(!st.gpu_apps.length) a+='<tr><td colspan="4" class="small">无</td></tr>';
+    for(const x of st.gpu_apps) a+=`<tr><td>${x.pid}</td><td>${x.name}</td><td>${x.mem}</td><td>${x.tag||'<span class="small">—</span>'}</td></tr>`;
+    document.getElementById('apps').innerHTML=a;
+    let s='<tr><th>服务</th><th>状态</th><th>pid</th><th>端口</th><th>运行时长</th><th>内存</th><th>CPU</th><th>操作</th></tr>';
+    for(const x of st.services){
+      const on=x.running&&!x.cli;
+      const dot=x.cli?'<span class="small">CLI</span>':`<span class="dot ${on?'on':'off'}"></span>${on?'<span class="on">运行中</span>':'<span class="off">停止</span>'}`;
+      const btns=x.cli?'<span class="small">—</span>':
+        x.auto?`<button onclick="act('stop','${x.name}')" ${on?'':'disabled'}>停止</button>`:
+        `<button onclick="act('start','${x.name}')" ${on?'disabled':''}>启动</button><button onclick="act('stop','${x.name}')" ${on?'':'disabled'}>停止</button>`;
+      s+=`<tr><td><b>${x.label||x.name}</b>${x.auto?'<span class="small" style="color:#8ab4f8"> 自动追踪</span>':''}<div class="small">${x.name}</div></td><td>${dot}</td><td>${x.pid||'—'}</td><td>${x.port||'—'}</td><td>${up(x.uptime_s)}</td><td>${x.mem_mb?Math.round(x.mem_mb)+' MB':'—'}</td><td>${x.cpu_pct>0.05?x.cpu_pct.toFixed(1)+'%':'—'}</td><td>${btns}</td></tr>`;
+    }
+    document.getElementById('svcs').innerHTML=s;
+  }catch(e){document.getElementById('ts').textContent='拉取失败: '+e}
+}
+async function act(action,name){
+  const r=await fetch('/api/services/'+action,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+  const j=await r.json();
+  const m=document.getElementById('msg');
+  m.className=j.ok?'ok':'err';
+  m.textContent=`${action==='start'?'启动':'停止'} ${name}: ${j.msg}`;
+  setTimeout(tick,800);
+}
+tick();setInterval(tick,2000);
+</script>
+</body>
+</html>

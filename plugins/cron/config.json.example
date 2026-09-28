@@ -1,0 +1,9 @@
+{
+  "server": { "host": "127.0.0.1", "port": 8601 },
+  "tick_ms": 1000,
+  "catchup_max": 3,
+  "data_dir": "./data",
+  "instances": [
+    { "id": "default", "url": "http://127.0.0.1:8451" }
+  ]
+}

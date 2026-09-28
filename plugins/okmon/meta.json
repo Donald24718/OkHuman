@@ -1,0 +1,4 @@
+{
+ "name": "okmon",
+ "summary": "OkHuman 系进程监控：显卡使用（nvidia-smi）+ OkHuman Go 常驻进程状态/启停 + 自动追踪一切 Go 版 okhuman 进程（含一次性实例，只读可停），webui :8496"
+}

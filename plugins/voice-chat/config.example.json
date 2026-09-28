@@ -1,0 +1,12 @@
+{
+ "okhuman_url": "http://127.0.0.1:8451",
+ "gate_threshold": 0.6,
+ "mic": "default",
+ "speaker": "pipewire",
+ "max_reply_chars": 2000,
+ "kokoro_voice": "zf_xiaoyi",
+ "instances": [
+  { "wake_word": "小K", "url": "http://127.0.0.1:8451" },
+  { "wake_word": "小B", "url": "http://127.0.0.1:8452" }
+ ]
+}

@@ -1,0 +1,19 @@
+{
+  "data_dir": "./data",
+  "instances": [
+    {
+      "id": "default",
+      "url": "http://127.0.0.1:8451"
+    }
+  ],
+  "bots": [
+    {
+      "app_id": "<QQ开放平台 app_id>",
+      "client_secret": "<QQ开放平台 client_secret，勿提交真实值>",
+      "channel_id": "c2c:<用户openid>",
+      "instance": "default",
+      "max_msgs_per_min": 20
+    }
+  ],
+  "markdown_enabled": true
+}

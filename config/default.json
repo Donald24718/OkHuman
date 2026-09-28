@@ -1,0 +1,8 @@
+{
+  "server": { "host": "127.0.0.1", "port": 8451 },
+  "llm": { "base_url": "http://127.0.0.1:8080/v1", "model": "local", "api_key": "", "timeout_ms": 300000 },
+  "system_prompt": { "dir": "prompts" },
+  "context": { "max_tokens": 150000, "keep_recent_chars": 60000 },
+  "tools": { "fg_timeout_ms": 30000, "result_limit": 50000 },
+  "doom": { "warn_after": 3 }
+}

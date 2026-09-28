@@ -1,0 +1,6 @@
+{
+  "port": 8496,
+  "services": [
+    { "name": "okhuman", "label": "OkHuman 主程序", "port": 8451, "start": "./okhuman", "workdir": "../.." }
+  ]
+}

@@ -1,0 +1,5 @@
+{
+ "name": "attach",
+ "summary": "素材注入 OkHuman 上下文：图片原图/压缩注入；视频按策略直通 input_video（宽<360 原样、≥360 压 360p、每段≤1万 tokens/360p≤60s 自动分段 --seg）；frame 抽单帧高清。端口随 okhuman 进程父链自识别。",
+ "cli": true
+}
