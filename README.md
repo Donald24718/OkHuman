@@ -8,8 +8,9 @@
 ## 快速开始
 
 ```bash
-# 0) 依赖：Go 1.22+；一个 OpenAI 兼容的 LLM 端点（llama.cpp / Ollama / vLLM 均可）
-# 1) 编译主程序
+# 0) 依赖：一个 OpenAI 兼容的 LLM 端点（llama.cpp / Ollama / vLLM 均可）
+#    不想编译的话：Releases 里有 linux/amd64 预编译二进制，下载即用
+# 1) 编译主程序（Go 1.22+）
 go build -o okhuman .
 
 # 2) 配置（默认值已可跑；按需改 config/user.json）
