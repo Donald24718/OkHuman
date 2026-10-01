@@ -9,3 +9,5 @@ speaker/enrollments/
 **/*.log
 data/
 *.bak-*
+# 个人部署值（唤醒词/音色/端口），只入库 example
+config.json
