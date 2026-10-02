@@ -34,6 +34,7 @@ import (
 	"okhuman/internal/inject"
 	"okhuman/internal/llm"
 	"okhuman/internal/prompt"
+	"okhuman/internal/tools"
 	"okhuman/internal/types"
 )
 
@@ -522,7 +523,7 @@ func applyConfigPatch(a *AgentState, patch map[string]interface{}) PatchResult {
 		applied = append(applied, "context（压缩参数，即时生效）")
 	}
 	if has("tools") {
-		applied = append(applied, "tools（前台超时/结果上限，下轮运行生效）")
+		applied = append(applied, "tools（前台超时/命令总时长上限/结果上限，下条命令起生效）")
 	}
 	if has("doom") {
 		applied = append(applied, "doom（死循环告警阈值，下轮运行生效）")
@@ -550,6 +551,9 @@ func applyConfigPatch(a *AgentState, patch map[string]interface{}) PatchResult {
 			StreamIdleMS:    nc.Context.StreamIdleMS,
 			CharsPerToken:   nc.Context.CharsPerToken,
 		})
+	}
+	if has("tools") { // 工具超时热更新（2026-10-02）：重建工具表 + 新上限，下条命令生效
+		tools.Configure(nc.Tools.FgTimeoutMS, nc.Tools.TimeoutMS)
 	}
 	// 自我生命感知输入随配置热更新（llm base_url / server 段变化）
 	a.CM().SetSelfInfo(ctxmgr.SelfInfo{Port: nc.Server.Port, DataDir: nc.Data.Dir, LLMBaseURL: nc.LLM.BaseURL})

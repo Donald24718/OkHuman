@@ -29,6 +29,7 @@ import (
 	"okhuman/internal/persist"
 	"okhuman/internal/prompt"
 	"okhuman/internal/server"
+	"okhuman/internal/tools"
 	"okhuman/internal/types"
 )
 
@@ -62,6 +63,11 @@ func main() {
 	if err != nil {
 		fatalf("配置加载失败：%v", err)
 	}
+
+	// 工具超时接线（2026-10-02）：tools.timeout_ms / fg_timeout_ms 灌进 tools 包。
+	// 执行上限与注入给模型的描述文本同源生成——改配置即改模型看到的数字，
+	// 不再出现"配置可改、描述写死"的不一致。
+	tools.Configure(cfg.Tools.FgTimeoutMS, cfg.Tools.TimeoutMS)
 
 	// ---------- 可选提示词目录（命令行第一个非 flag 参数） ----------
 	// 指定则覆盖 cfg.system_prompt.dir（解析为绝对路径）；缺省用 config 里的相对目录。

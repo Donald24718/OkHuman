@@ -52,6 +52,9 @@ type ContextCfg struct {
 type ToolsCfg struct {
 	FgTimeoutMS int `json:"fg_timeout_ms"`
 	ResultLimit int `json:"result_limit"`
+	// TimeoutMS 命令总时长上限（毫秒）：超时 SIGKILL 整个命令进程组。
+	// 转后台不重置此计时器——后台任务同样受约束（长驻服务须 setsid 脱离）。
+	TimeoutMS int `json:"timeout_ms"`
 }
 
 type DoomCfg struct {
@@ -71,7 +74,7 @@ func Default() *Config {
 		SystemPrompt: SystemPromptCfg{Dir: "prompts"},
 		Data:         DataCfg{Dir: filepath.Join(home, ".okhuman")},
 		Context:      ContextCfg{MaxTokens: 150000, KeepRecentChars: 60000, HardTruncChars: 150000, StreamIdleMS: 90000, CharsPerToken: 1.5},
-		Tools:        ToolsCfg{FgTimeoutMS: 30000, ResultLimit: 10000},
+		Tools:        ToolsCfg{FgTimeoutMS: 30000, ResultLimit: 10000, TimeoutMS: 600000},
 		Doom:         DoomCfg{WarnAfter: 3},
 	}
 }
