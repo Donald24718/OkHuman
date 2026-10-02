@@ -1,4 +1,32 @@
+// OkHuman 配置文件示例
+// 复制此文件为 user.json 并修改对应字段
+// api_key 必填：替换为你的 API 密钥
+// 来源优先级：默认值 < default.json < user.json < 环境变量
+
 {
-  "server": { "port": 8451 },
-  "llm": { "base_url": "http://127.0.0.1:8080/v1", "model": "local" }
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8451
+  },
+  "llm": {
+    "base_url": "https://api.openai.com/v1",
+    "model": "gpt-4o",
+    "api_key": "sk-your-api-key-here",
+    "timeout_ms": 300000
+  },
+  "context": {
+    "max_tokens": 150000,
+    "keep_recent_chars": 60000,
+    "hard_trunc_chars": 150000,
+    "stream_idle_ms": 90000,
+    "chars_per_token": 1.5
+  },
+  "tools": {
+    "fg_timeout_ms": 30000,
+    "result_limit": 10000,
+    "timeout_ms": 600000
+  },
+  "doom": {
+    "warn_after": 3
+  }
 }
