@@ -21,7 +21,8 @@
   },
   "tools": {
     "fg_timeout_ms": 30000,
-    "result_limit": 50000
+    "result_limit": 50000,
+    "timeout_ms": 600000
   },
   "doom": {
     "warn_after": 3

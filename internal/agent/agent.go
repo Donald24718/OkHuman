@@ -493,7 +493,7 @@ func (a *Agent) llmCall(ctx context.Context, emit func(types.AgentEvent), totals
 
 // streamOnce 一次流式调用（idleMs=0 → 客户端默认 max(timeout_ms,10min)）
 func (a *Agent) streamOnce(ctx context.Context, client llm.LlmClient, messages []types.Message, onDelta func(types.Delta), respOut **types.Response) error {
-	r, err := client.CompleteStream(ctx, messages, tools.TOOLS, onDelta, 0)
+	r, err := client.CompleteStream(ctx, messages, tools.Specs(), onDelta, 0)
 	if err == nil {
 		*respOut = r
 	}

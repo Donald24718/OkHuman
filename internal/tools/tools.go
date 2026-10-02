@@ -1,8 +1,13 @@
 package tools
 
-// 工具系统（2026-09-07）：唯一元工具 bash，静态注入，TOOLS 数组永远不变
-// → KV 前缀全程稳定。一切外部操作（文件读写改、搜索、抓被截断的 log 全文）
-// 都靠 bash 完成。
+// 工具系统（2026-09-07）：唯一元工具 bash。一切外部操作（文件读写改、搜索、
+// 抓被截断的 log 全文）都靠 bash 完成。
+//
+// 工具表由配置现生成（2026-10-02：命令总时长上限从硬编码 600s 改为
+// tools.timeout_ms 可配）：同配置 → 逐字同文本 → KV 前缀稳定。改 tools 段
+// 会让描述变化，代价是前缀作废一次——这是必要的：描述里的超时数字必须与
+// 实际执行一致，否则模型基于假数字做决策（旧实现正是配置可改、描述写死
+// 30s/600s，两处不一致）。
 
 import (
 	"bytes"
@@ -19,23 +24,82 @@ import (
 	"okhuman/internal/types"
 )
 
-// TOOLS 静态工具表（与 TS 版逐字一致）
-var TOOLS = []types.ToolSpec{
-	{
-		Name: "bash",
-		Description: "执行 bash 命令（异步并行；输出超长被截断时，全文已写入 log 文件、截断处会给出路径，用 bash 的 cat / grep / tail 抓回）。" +
-			"前台等待 30 秒未完成自动转后台（你收到通知后继续干活，结果在轮内下一个工具调用间隙或下一次 run 带回来）；命令总时长超 600 秒被强制终止（整个命令进程组）。" +
-			"起长驻服务（python 服务器等）必须完全脱离，否则服务占住本工具的进程组、会被 600 秒超时连带杀掉：用 " +
-			"(setsid <启动命令> < /dev/null > /tmp/<名>.log 2>&1 &)，之后用 curl 探活、cat 读日志。脱离后服务独立存活，不受前台超时/转后台影响。",
-		Parameters: types.ToolParameters{
-			Type: "object",
-			Properties: map[string]interface{}{
-				"command":         map[string]interface{}{"type": "string", "description": "要执行的 bash 命令"},
-				"timeout_seconds": map[string]interface{}{"type": "number", "description": "超时秒数（默认 600，上限 600）；命令超过此时长被强制终止"},
+// 超时默认与可配上限（2026-10-02）
+const (
+	DefaultToolTimeoutMS = 600000   // 命令总时长上限默认 600s（与旧硬编码一致）
+	MaxToolTimeoutMS     = 86400000 // 可配上限 24h：再大等于没有兜底
+	DefaultFgTimeoutMS   = 30000
+)
+
+var (
+	toolTimeoutMS atomic.Int64            // 命令总时长上限（毫秒）
+	toolFgMS      atomic.Int64            // 前台等待（毫秒）——仅用于生成描述文本
+	toolsSpec     atomic.Pointer[[]types.ToolSpec]
+)
+
+// Configure 设置工具超时并重建工具表：启动时一次，tools 段热更新时再调。
+// 新上限对"下一条命令"生效；已在跑的命令沿用其启动时的上限。
+// atomic.Pointer 与 context.ConfigureInjectResolver 同构（与在飞 LLM 调用的读并发）。
+func Configure(fgMS, timeoutMS int) {
+	if timeoutMS <= 0 || timeoutMS > MaxToolTimeoutMS {
+		timeoutMS = DefaultToolTimeoutMS
+	}
+	if fgMS <= 0 {
+		fgMS = DefaultFgTimeoutMS
+	}
+	toolTimeoutMS.Store(int64(timeoutMS))
+	toolFgMS.Store(int64(fgMS))
+	s := buildTools(fgMS, timeoutMS)
+	toolsSpec.Store(&s)
+}
+
+// Specs 当前工具表（注入 LLM 请求用；与 ExecuteTool 的超时同源）
+func Specs() []types.ToolSpec {
+	if p := toolsSpec.Load(); p != nil {
+		return *p
+	}
+	Configure(DefaultFgTimeoutMS, DefaultToolTimeoutMS) // 未接线兜底（测试/误用）
+	return *toolsSpec.Load()
+}
+
+// buildTools 由超时参数生成工具表：同参数 → 逐字同文本 → KV 前缀稳定
+func buildTools(fgMS, timeoutMS int) []types.ToolSpec {
+	fgSec, toSec := fgMS/1000, timeoutMS/1000
+	return []types.ToolSpec{
+		{
+			Name: "bash",
+			Description: "执行 bash 命令（异步并行；输出超长被截断时，全文已写入 log 文件、截断处会给出路径，用 bash 的 cat / grep / tail 抓回）。" +
+				fmt.Sprintf("前台等待 %d 秒未完成自动转后台（你收到通知后继续干活，结果在轮内下一个工具调用间隙或下一次 run 带回来）；命令总时长超 %d 秒被强制终止（整个命令进程组）。", fgSec, toSec) +
+				fmt.Sprintf("起长驻服务（python 服务器等）必须完全脱离，否则服务占住本工具的进程组、会被 %d 秒超时连带杀掉：用 ", toSec) +
+				"(setsid <启动命令> < /dev/null > /tmp/<名>.log 2>&1 &)，之后用 curl 探活、cat 读日志。脱离后服务独立存活，不受前台超时/转后台影响。" +
+				"脱离必须三件套：setsid + 重定向 stdout/stderr + < /dev/null——只 setsid 不重定向，脱离子进程仍持有输出管道写端，Wait 收不到 EOF 会永久挂住，且超时杀组打不到它（上限彻底失效）。",
+			Parameters: types.ToolParameters{
+				Type: "object",
+				Properties: map[string]interface{}{
+					"command": map[string]interface{}{"type": "string", "description": "要执行的 bash 命令"},
+					"timeout_seconds": map[string]interface{}{"type": "number",
+						"description": fmt.Sprintf("超时秒数（默认 %d，上限 %d）；命令超过此时长被强制终止", toSec, toSec)},
+				},
+				Required: []string{"command"},
 			},
-			Required: []string{"command"},
 		},
-	},
+	}
+}
+
+// numArg 数值参数取数：JSON 解码恒为 float64，但 Go 侧调用方可能传 int/int64——
+// 只认 float64 会把这类值静默忽略（退回默认上限），行为与调用方意图相反。
+func numArg(v interface{}) (float64, bool) {
+	switch x := v.(type) {
+	case float64:
+		return x, true
+	case float32:
+		return float64(x), true
+	case int:
+		return float64(x), true
+	case int64:
+		return float64(x), true
+	}
+	return 0, false
 }
 
 // ToolFailPrefix 工具执行失败结果的统一前缀（agent 与后台判定成功/失败用）
@@ -61,17 +125,22 @@ func toolBash(args map[string]interface{}) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("参数 command 缺失或不是字符串")
 	}
-	timeoutSec := 600
+	// 上限来自配置 tools.timeout_ms（2026-10-02；旧为硬编码 600）
+	limitSec := int(toolTimeoutMS.Load()) / 1000
+	if limitSec < 1 {
+		limitSec = DefaultToolTimeoutMS / 1000
+	}
+	timeoutSec := limitSec
 	if v, ok := args["timeout_seconds"]; ok {
-		if f, ok := v.(float64); ok && f > 0 {
+		if f, ok := numArg(v); ok && f > 0 {
 			timeoutSec = int(f)
 		}
 	}
 	if timeoutSec < 1 {
 		timeoutSec = 1
 	}
-	if timeoutSec > 600 {
-		timeoutSec = 600
+	if timeoutSec > limitSec { // 模型可下调，不可越过配置上限
+		timeoutSec = limitSec
 	}
 
 	// 方案 B（2026-09-15）：命令文本进 /tmp 临时脚本，不进 argv。pkill/pgrep -f 按完整
@@ -119,7 +188,9 @@ func toolBash(args map[string]interface{}) (string, error) {
 	}
 	head := fmt.Sprintf("退出码: %d", code)
 	if killed.Load() {
-		head += "（已超时被终止）"
+		// 光说"已超时"不够：模型分不清"命令自己失败"与"被上限杀掉"，会误判重试。
+		// 给出上限值与出路（脱离进程组 / 调大配置）。
+		head += fmt.Sprintf("（超过 %d 秒上限被强制终止；要跑更久：用 setsid + 重定向完全脱离进程组，或调大配置 tools.timeout_ms）", timeoutSec)
 	}
 	out := stdout.String()
 	errOut := stderr.String()

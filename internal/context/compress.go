@@ -104,7 +104,7 @@ func LoopCompress(ctx context.Context, client llm.LlmClient, prefix []types.Mess
 		copy(req, prefix)
 		req = append(req, types.Message{Role: "user", Content: instruction})
 
-		resp, err := client.CompleteStream(ctx, req, tools.TOOLS, opts.OnDelta, opts.IdleMS)
+		resp, err := client.CompleteStream(ctx, req, tools.Specs(), opts.OnDelta, opts.IdleMS)
 		if err != nil {
 			return nil, err
 		}
