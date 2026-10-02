@@ -96,7 +96,8 @@ func main() {
 			_ = ln.Close()
 			break
 		}
-		if strings.Contains(strings.ToLower(err.Error()), "in use") {
+		if strings.Contains(strings.ToLower(err.Error()), "in use") ||
+			strings.Contains(err.Error(), "Only one usage of each socket address") {
 			port++
 			fmt.Fprintf(os.Stderr, "[server] 端口 %d 被占用，试 %d\n", port-1, port)
 			continue
