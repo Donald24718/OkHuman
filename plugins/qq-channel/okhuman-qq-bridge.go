@@ -1090,7 +1090,7 @@ func (c *QQChannel) handleC2CMessage(m *qqMsg) {
 			if !ok {
 				continue
 			}
-			line := fmt.Sprintf("用户发来QQ附件：%s（%s %.1fKB，原文件名 %s）", landed.path, landed.fileType, float64(landed.size)/1024, landed.name)
+			line := fmt.Sprintf("用户发来的附件已保存到：%s（%s %.1fKB，原文件名 %s）", landed.path, landed.fileType, float64(landed.size)/1024, landed.name)
 			if a.ASRReferText != nil && strings.TrimSpace(*a.ASRReferText) != "" {
 				line += "\n语音识别文本：" + strings.TrimSpace(*a.ASRReferText)
 			}
