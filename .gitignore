@@ -39,3 +39,6 @@ plugins/voice-chat/speaker/__pycache__/
 *.ggml
 *.onnx
 *.so
+
+# WorkBuddy agent workspace (local memory, skills, scratch): never committed
+.workbuddy/
