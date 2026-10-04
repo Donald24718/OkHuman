@@ -20,12 +20,24 @@ import (
 // ToolFailPrefix 工具执行失败结果的统一前缀（agent 与后台判定成功/失败用）
 const ToolFailPrefix = "工具执行失败: "
 
-// ExecuteTool 执行工具（唯一 bash；错误以返回 error 抛出，由 agent 并入字符串）
+// ExecuteTool 执行工具（唯一 bash；错误以返回 error 抛出，由 agent 并入字符串）。
+//
+// 返回契约：成功 → (输出, nil)；失败 → ("", error)。实现约定**不会**返回
+// (非空输出, 非 nil error)：toolBash 的错误路径一律返回空串，命令自身的非零
+// 退出码（含被超时杀掉）算成功返回（"退出码: N" 落在输出里，err 为 nil）。
+//
+// ToolFailPrefix 的判定前提：agent 在 err != nil 时拼 ToolFailPrefix+err.Error()，
+// background 侧用 HasPrefix 判定失败。该判定成立依赖"成功输出恒以 '退出码: '
+// 开头、绝不以 ToolFailPrefix 开头"——此不变量由 toolBash 的 head 前缀保证，
+// 改动 toolBash 的输出格式时必须一并守住（否则背景任务成败会误判）。
 func ExecuteTool(name string, args map[string]interface{}) (string, error) {
 	switch name {
 	case "bash":
 		return toolBash(args) // 参数错误 → error，由 agent 并入 ToolFailPrefix 字符串（与 TS throw→catch 等价）
 	default:
-		return "", fmt.Errorf("未知工具: %s（唯一元工具是 bash）", name)
+		// %q 转义：name 来自 LLM 的 tool_calls[].function.name（模型可控），
+		// 可能含换行/ANSI 等，直接 %s 会污染日志与 LLM 上下文。
+		// 不写"唯一"二字：本 switch 是可扩展点，硬编码工具数量会随新增工具过时。
+		return "", fmt.Errorf("未知工具: %q", name)
 	}
 }
