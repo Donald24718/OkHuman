@@ -245,6 +245,7 @@ func runOpt(a *AgentState, state *AppState) agent.RunOptions {
 		ResultLimit:   cfg.Tools.ResultLimit,
 		DoomWarnAfter: cfg.Doom.WarnAfter,
 		FgTimeoutMS:   cfg.Tools.FgTimeoutMS,
+		MaxToolRounds: cfg.Tools.MaxToolRounds,
 		// 轮内搭车（2026-09-14 统一）：与 drain（runDrain）共享同一队列、splice 原子取走，
 		// 携带用户追加消息 + 已 settle 后台任务的通知（同一队列、同一逻辑）。
 		// 安全：本回调只在 lock.Run 内被调用（runLoop 持锁），drain 的下一轮
@@ -349,6 +350,16 @@ func logRunEvent(a *AgentState, e types.AgentEvent) {
 	case "doom_stop":
 		a.logMu.Lock()
 		a.DoomLog = append(a.DoomLog, DoomLogEntry{At: time.Now().UnixMilli(), Kind: "stop", Detail: strOf(e["detail"])})
+		a.logMu.Unlock()
+	case "round_limit", "doom_tail_pending":
+		// 工具轮次上限（2026-10-05）：完整性与 doom_stop 同级，记 stop；
+		// 收尾调用仍要工具 → warn（本轮不再执行工具，留痕即可）
+		kind := "stop"
+		if e["type"] == "doom_tail_pending" {
+			kind = "warn"
+		}
+		a.logMu.Lock()
+		a.DoomLog = append(a.DoomLog, DoomLogEntry{At: time.Now().UnixMilli(), Kind: kind, Detail: strOf(e["detail"])})
 		a.logMu.Unlock()
 	case "bg_start":
 		a.logMu.Lock()

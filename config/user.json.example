@@ -1,19 +1,13 @@
-// OkHuman 配置文件示例
-// 复制此文件为 user.json 并修改对应字段
-// api_key 必填：替换为你的 API 密钥
-// 来源优先级：默认值 < default.json < user.json < 环境变量
-
 {
-  "server": {
-    "host": "127.0.0.1",
-    "port": 8451
-  },
+  "_comment": "OkHuman 用户配置模板：复制为 config/user.json 后按需修改。三条约定 —— (1) user.json 是最小补丁，只保留你要覆盖的键，未写的走 config/default.json 的出厂默认；(2) 本文件必须是严格合法的 JSON，不支持 // 注释（loader 用 encoding/json），说明一律写进这种字符串字段；(3) 优先级：内置默认值 < default.json < user.json < 环境变量(OKHUMAN_PORT / OKHUMAN_LLM_BASE_URL / OKHUMAN_LLM_MODEL / OKHUMAN_DATA_DIR)。不要把 data.dir 写成空串，数据目录建议用 OKHUMAN_DATA_DIR 或保留默认 $HOME/.okhuman-<port>。",
+  "server": { "host": "127.0.0.1", "port": 8451 },
   "llm": {
     "base_url": "https://api.openai.com/v1",
     "model": "gpt-4o",
     "api_key": "sk-your-api-key-here",
     "timeout_ms": 300000
   },
+  "system_prompt": { "dir": "prompts" },
   "context": {
     "max_tokens": 150000,
     "keep_recent_chars": 60000,
@@ -23,10 +17,9 @@
   },
   "tools": {
     "fg_timeout_ms": 30000,
-    "result_limit": 10000,
-    "timeout_ms": 600000
+    "result_limit": 50000,
+    "timeout_ms": 600000,
+    "max_tool_rounds": 200
   },
-  "doom": {
-    "warn_after": 3
-  }
+  "doom": { "warn_after": 3 }
 }

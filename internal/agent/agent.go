@@ -27,7 +27,9 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,6 +53,11 @@ type RunOptions struct {
 	DoomWarnAfter int
 	// 前台执行超时（毫秒）：超时不取消，转后台 + 双向通知（§7.3）
 	FgTimeoutMS int
+	// 工具轮次上限（2026-10-05）：一轮 run 最多跑多少批工具调用。
+	// §8 死循环检测只认"完全相同"的调用——模型每次微调参数（时间戳、line+1）
+	// 就能永久绕开，所以需要次数兜底。触达后注入收尾提示并给模型最后一次作答
+	// 机会（与强停同一收尾方式，不硬 return）。0/负 = defaultMaxToolRounds。
+	MaxToolRounds int
 	// 轮内搭车（2026-09-14 统一）：工具循环中每次 LLM 调用前调用，取走运行期间
 	// 入队的全部消息——用户追加消息与已 settle 后台任务的通知（同一消息队列、
 	// 同一 splice 逻辑、取走即消费；纯追加，不加 LLM 调用）
@@ -80,6 +87,30 @@ type PartialContent struct {
 	Thinking string
 	Text     string
 }
+
+// injectFallbackMode 4xx 回退阶梯的模式（2026-10-05 提为类型化常量）。
+// 原实现在"组装降级请求"和"回写降级侧车"两处各写一份字符串字面量，一次拼写
+// 漂移（一边 "newest"、一边 "demote-newest"）让 demote-newest 长期退化成
+// demote-all——把会话里全部附件永久降级。同一个模式值只允许有一处定义。
+type injectFallbackMode string
+
+const (
+	fbDemoteNewest injectFallbackMode = "demote-newest"
+	fbDemoteAll    injectFallbackMode = "demote-all"
+	fbTruncate     injectFallbackMode = "truncate"
+)
+
+// defaultMaxToolRounds 未显式配置时的工具轮次上限（见 RunOptions.MaxToolRounds）
+const defaultMaxToolRounds = 100
+
+// stoppedPlaceholder /stop 中断且尚无增量流出时落会话的文本；Run 的返回值
+// 与之同源（2026-10-05 修：旧实现会话里存占位、返回空串，POST /chat 的 reply
+// 字段会拿到空值）
+const stoppedPlaceholder = "（已中断：用户手动停止）"
+
+// strongStopNoAnswer 强停收尾后模型仍未给出正文时的兜底回复
+// （2026-10-05：旧实现原样返回空串 → 前端出现空气泡）
+const strongStopNoAnswer = "（本轮已因重复工具调用被强制停止，模型未给出最终回答。请参考上方工具结果。）"
 
 // AgentStoppedError 用户 /stop 中断（2026-08-29）：runUserMessage 顶层捕获后收尾
 type AgentStoppedError struct {
@@ -287,25 +318,26 @@ func (a *Agent) retryTruncation(ctx context.Context, emit func(types.AgentEvent)
 // finishRunError runUserMessage 顶层错误收尾：AgentStoppedError → partial 收尾；
 // runCtx 已取消（压缩流被 /stop 中断等）→ 空 partial 收尾；其他 → 上抛
 func (a *Agent) finishRunError(err error, runCtx context.Context, emit func(types.AgentEvent), totals *TokenTotals) (string, error) {
-	if s, ok := err.(*AgentStoppedError); ok {
-		a.finishStopped(s.Partial, emit, totals)
-		return s.Partial.Text, nil
+	var s *AgentStoppedError
+	if errors.As(err, &s) {
+		// 返回值与落会话的文本同源（不给 ""，否则 HTTP /chat 的 reply 拿到空值）
+		return a.finishStopped(s.Partial, emit, totals), nil
 	}
 	if runCtx.Err() != nil {
 		// 压缩流被 /stop 中断（非 AgentStoppedError）→ 按"用户停止"收尾（空 partial），
 		// 不当系统错误抛（否则 drain 会广播 error 卡）
-		a.finishStopped(PartialContent{}, emit, totals)
-		return "", nil
+		return a.finishStopped(PartialContent{}, emit, totals), nil
 	}
 	return "", err
 }
 
 // finishStopped /stop 中断收尾：partial 内容存 assistant 消息，发 stopped 事件。
 // partial 正文已由 delta 逐块流出（流式），不重发全量。
-func (a *Agent) finishStopped(partial PartialContent, emit func(types.AgentEvent), totals *TokenTotals) {
+// 返回值 = 实际写入会话的正文（partial 为空时用占位文案），调用方原样返回即可。
+func (a *Agent) finishStopped(partial PartialContent, emit func(types.AgentEvent), totals *TokenTotals) string {
 	body := partial.Text
 	if body == "" {
-		body = "（已中断：用户手动停止）"
+		body = stoppedPlaceholder
 	}
 	var reasoning *string
 	if partial.Thinking != "" {
@@ -315,6 +347,7 @@ func (a *Agent) finishStopped(partial PartialContent, emit func(types.AgentEvent
 	a.cm.AddMessage(&types.RawEntry{Role: "assistant", Content: body, ReasoningContent: reasoning})
 	emit(types.AgentEvent{"type": "stopped"})
 	emit(types.AgentEvent{"type": "done", "usage": totals})
+	return body
 }
 
 // bgNoticePrefix 后台完成通知的固定开头——轮内搭车时据此区分"系统通知"与
@@ -431,8 +464,28 @@ func (a *Agent) llmCall(ctx context.Context, emit func(types.AgentEvent), totals
 	a.mu.Lock()
 	a.callCancel = callCancel
 	a.mu.Unlock()
+	// 2026-10-05 修：cancel 必须在【每条】返回路径上被调用（原实现只在成功路径
+	// 清字段，stopped/非4xx/阶梯耗尽三条错误路径都漏了 cancel）。今天的上游 ctx
+	// 是 runCtx、轮末必然被 cancel，泄漏有界；一旦哪天挂到长生命周期 ctx 上就是
+	// 真泄漏。用 defer 彻底免掉这件事（注意：这两个 defer 靠 LIFO 顺序，先清字段）。
+	defer func() {
+		a.mu.Lock()
+		a.callCancel = nil
+		a.mu.Unlock()
+	}()
+	defer callCancel()
 
 	partial := PartialContent{}
+	// rollbackPartial 阶梯重试前丢弃已累积的增量，并通知前端回滚本轮已渲染的内容
+	// （2026-10-05：光重置变量救不了 UI——增量早已 emit 出去，屏幕上会留着"被丢弃的
+	// 半截首流 + 重试全文"拼接出来的脏内容）
+	rollbackPartial := func() {
+		if partial == (PartialContent{}) {
+			return
+		}
+		partial = PartialContent{}
+		emit(types.AgentEvent{"type": "delta_reset"})
+	}
 	onDelta := func(d types.Delta) {
 		if d.Thinking != "" {
 			partial.Thinking += d.Thinking
@@ -460,43 +513,44 @@ func (a *Agent) llmCall(ctx context.Context, emit func(types.AgentEvent), totals
 			return nil, firstErr
 		}
 		// ===== 三级阶梯（有界，不循环）=====
-		var modes []string
+		var modes []injectFallbackMode
 		if a.sessionHasInject() {
-			modes = []string{"demote-newest", "demote-all", "truncate"}
+			modes = []injectFallbackMode{fbDemoteNewest, fbDemoteAll, fbTruncate}
 		} else {
-			modes = []string{"truncate"}
+			modes = []injectFallbackMode{fbTruncate}
 		}
 		for _, mode := range modes {
 			action := "触发兜底硬截断压缩"
+			var demoted []string
 			switch mode {
-			case "demote-newest":
+			case fbDemoteNewest:
 				action = "最近一条带附件的降级文本提示"
-			case "demote-all":
+				messages, demoted = a.cm.ComposeWithDemotion(&ctxmgr.ComposeOptions{DemoteInjects: ctxmgr.DemoteNewest})
+			case fbDemoteAll:
 				action = "全部附件降级文本提示"
+				messages, demoted = a.cm.ComposeWithDemotion(&ctxmgr.ComposeOptions{DemoteInjects: ctxmgr.DemoteAll})
+			default:
+				messages, demoted = a.cm.ComposeWithDemotion(nil)
 			}
 			fmt.Printf("[llm] LLM 4xx（%s）→ %s重试\n", truncateStr(firstErr.Error(), 200), action)
-			if mode == "truncate" {
+			if mode == fbTruncate {
 				a.cm.ForceHardTruncate()
 			}
-			switch mode {
-			case "demote-newest":
-				messages = a.cm.Compose(&ctxmgr.ComposeOptions{DemoteInjects: "newest"})
-			case "demote-all":
-				messages = a.cm.Compose(&ctxmgr.ComposeOptions{DemoteInjects: "all"})
-			default:
-				messages = a.cm.Compose(nil)
-			}
+			rollbackPartial()
 			err2 := a.streamOnce(callCtx, client, messages, onDelta, &resp)
 			if resp != nil {
 				detail := truncateStr(firstErr.Error(), 300)
 				fmt.Printf("[llm] 4xx 回退阶梯：%s 重试成功（首次报错：%s）\n", mode, detail)
-				emit(types.AgentEvent{"type": "inject_fallback", "mode": mode, "detail": detail})
+				emit(types.AgentEvent{"type": "inject_fallback", "mode": string(mode), "detail": detail})
 				// 2026-09-19：降级成功 → 回写侧车（治本）。降级本是请求级（不动侧车），
 				// 对持久坏附件（内容损坏的图片，每次调用必 400）每轮都先 4xx 再降级；
 				// 回写后侧车变文本提示，后续 resolve 不再发坏 part。
-				if mode != "truncate" {
+				// 2026-10-05：回写范围取 Compose 实际降级的 id（demoted），不再由本
+				// 函数按"哪些消息带附件"重算——重算那版用错了 mode，把 demote-newest
+				// 扩成了全量降级。
+				if mode != fbTruncate {
 					dir := a.injectDir
-					for _, id := range a.demotedInjectIDs(mode) {
+					for _, id := range demoted {
 						if inject.PersistDemotion(dir, id) {
 							ctxmgr.ClearResolverCacheEntry(id)
 							fmt.Printf("[inject] %s 降级回写侧车（后续调用不再发原 part）\n", id)
@@ -517,10 +571,6 @@ func (a *Agent) llmCall(ctx context.Context, emit func(types.AgentEvent), totals
 			ladderErr = fmt.Errorf("LLM 4xx 回退阶梯耗尽：%s", truncateStr(firstErr.Error(), 300))
 		}
 	}
-	a.mu.Lock()
-	a.callCancel = nil
-	a.mu.Unlock()
-
 	if resp == nil {
 		if ladderErr == nil {
 			ladderErr = fmt.Errorf("llmCall: 4xx 阶梯耗尽")
@@ -542,50 +592,23 @@ func (a *Agent) streamOnce(ctx context.Context, client llm.LlmClient, messages [
 	return err
 }
 
-// isLlm4xxErr LLM 4xx 判定（400/413/415 = 请求体被拒；与 TS 正则等价）
+// isLlm4xxErr LLM 4xx 判定（400/413/415 = 请求体被拒；与 TS 正则等价）。
+// 用 errors.As 而非类型断言：上游一旦用 fmt.Errorf("…: %w", err) 包一层，
+// 断言会漏判 → 4xx 阶梯被整体绕开。
 func isLlm4xxErr(e error) bool {
-	h, ok := e.(*llm.HTTPError)
-	if !ok {
+	var h *llm.HTTPError
+	if !errors.As(e, &h) {
 		return false
 	}
 	return h.Is4xx()
 }
 
 // sessionHasInject 会话里是否存在附件引用（inject_ref）——4xx 阶梯只对"有附件"的会话降级
-// demotedInjectIDs 返回本次降级覆盖的注入 id（2026-09-19）：
-// "newest"=会话里最近一条带附件的消息；"all"=会话内全部 inject_ref。
-func (a *Agent) demotedInjectIDs(mode string) []string {
-	sess := a.cm.Session()
-	refs := func(i int) (string, bool) {
-		for _, p := range types.AsParts(sess.Messages[i].Content) {
-			if p.Type == "inject_ref" && p.Ref != "" {
-				return p.Ref, true
-			}
-		}
-		return "", false
-	}
-	ids := map[string]bool{}
-	if mode == "newest" {
-		for i := len(sess.Messages) - 1; i >= 0; i-- {
-			if id, ok := refs(i); ok {
-				ids[id] = true
-				break
-			}
-		}
-	} else {
-		for i := range sess.Messages {
-			if id, ok := refs(i); ok {
-				ids[id] = true
-			}
-		}
-	}
-	out := make([]string, 0, len(ids))
-	for id := range ids {
-		out = append(out, id)
-	}
-	return out
-}
-
+//
+// 注（2026-10-05）：原先这里还有一个 demotedInjectIDs(mode)，由 agent 侧按同样的
+// mode 字符串重算"哪些附件被降级"，供侧车回写使用。它与 Compose 里的降级判定是
+// 同一件事的两份实现，两边字符串一漂移就出事（demote-newest 历史上退化成全量降级）。
+// 现已删除：降级范围由 ComposeResult.DemotedInjectIDs 单点给出。
 func (a *Agent) sessionHasInject() bool {
 	for _, m := range a.cm.Session().Messages {
 		if m.HasInjectRef() {
@@ -603,10 +626,32 @@ func (a *Agent) finishText(resp *types.Response, emit func(types.AgentEvent), to
 	return resp.Content, nil
 }
 
+// maxToolRounds 本轮工具轮次上限（0/负 → defaultMaxToolRounds）
+func maxToolRounds(opt RunOptions) int {
+	if opt.MaxToolRounds > 0 {
+		return opt.MaxToolRounds
+	}
+	return defaultMaxToolRounds
+}
+
 // runLoop 工具循环：从一次"带 tool_calls 的 LLM 响应"开始，逐个执行工具并回填，
-// 直到模型返回纯文本（或强停后收尾）。不设迭代上限：靠 §8 死循环检测兜底。
+// 直到模型返回纯文本（或强停后收尾）。
+//
+// 两道刹车（2026-10-05）：
+//  1. §8 死循环检测：连续 N 次【完全相同】的调用 → 警告 → 再犯强停；
+//  2. 轮次上限 MaxToolRounds：兜住"每次改一点点参数"（时间戳、line+1）的情况
+//     ——那种写法 1 永远不触发，只能靠次数。触达后注入收尾提示并给模型最后一次
+//     作答机会，不硬 return。
 func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(types.AgentEvent), totals *TokenTotals, opt RunOptions) (string, error) {
-	for {
+	roundLimit := maxToolRounds(opt)
+	for round := 1; ; round++ {
+		if round > roundLimit {
+			// 触达轮次上限：不再执行工具，给模型一次收尾机会（与强停同一收尾方式）
+			limitMsg := fmt.Sprintf("（系统：本轮工具调用已达上限 %d 次，请停止调用工具，基于已有信息直接回答用户。）", roundLimit)
+			a.cm.AddMessage(&types.RawEntry{Role: "user", Content: limitMsg})
+			emit(types.AgentEvent{"type": "round_limit", "detail": fmt.Sprintf("工具调用轮次达上限 %d，收尾本轮", roundLimit)})
+			return a.tailCall(ctx, emit, totals)
+		}
 		calls := resp.ToolCalls
 		if len(calls) == 0 {
 			return a.finishText(resp, emit, totals) // 防御：纯文本收尾
@@ -616,22 +661,28 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 
 		// 逐个执行（并行工具调用也按序回填，保持 tool 消息与 tool_calls 一一对应）
 		// 死循环（§8）：连续 N 次完全相同 → 注入警告；警告后仍重复 → 强停。
-		// 警告/强停消息都在本批 tool 结果之后插入，保证 assistant.tool_calls 与 tool 消息严格配对。
+		// 警告/强停消息都在本批【全部】tool 结果之后插入——本批每个 tool_call
+		// 都必须有 tool 消息，否则严格校验的 LLM 端点会直接 400（2026-10-05 修）。
 		stopped := false
 		doomWarnPending := false
-		for _, tc := range calls {
+		for ci, tc := range calls {
 			args := parseArgs(tc.Function.Arguments)
 			a.mu.Lock()
 			a.lastCalls = append(a.lastCalls, callRec{Name: tc.Function.Name, Key: stableKey(tc.Function.Name, args)})
+			trimCallRecs(&a.lastCalls, opt.DoomWarnAfter) // 滑窗，见 trimCallRecs 注释
 			sameRun := a.isSameRunLocked(opt.DoomWarnAfter)
 			warned := a.warned
 			a.mu.Unlock()
 
 			if warned && sameRun {
-				// 警告后仍重复 → 强停：不执行，补合成 tool 结果保持协议完整
+				// 警告后仍重复 → 强停：本条与【本批剩余全部】调用都不执行，各补一条
+				// 合成 tool 结果——少补任何一个都会让 assistant.tool_calls 失配。
 				syn := "（此调用已被系统强停：连续完全相同的调用，见随后系统消息）"
-				a.cm.AddMessage(&types.RawEntry{Role: "tool", ToolCallID: &tc.ID, Content: syn})
-				emit(types.AgentEvent{"type": "tool_result", "name": tc.Function.Name, "call_id": tc.ID, "truncated": false, "total_chars": 0, "content": syn})
+				for j := ci; j < len(calls); j++ {
+					c2 := calls[j]
+					a.cm.AddMessage(&types.RawEntry{Role: "tool", ToolCallID: &c2.ID, Content: syn})
+					emit(types.AgentEvent{"type": "tool_result", "name": c2.Function.Name, "call_id": c2.ID, "truncated": false, "total_chars": 0, "content": syn})
+				}
 				emit(types.AgentEvent{"type": "doom_stop", "detail": fmt.Sprintf("警告后仍重复完全相同调用 %s，强停本轮", tc.Function.Name)})
 				stopped = true
 				break
@@ -650,9 +701,14 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 					execDone <- r
 				}
 			}()
-			// §7.3 前台赛跑：超时前完成 → 正常回填；超时 → 转后台，回填"已转后台"通知
+			// §7.3 前台赛跑：超时前完成 → 正常回填；超时 → 转后台，回填"已转后台"通知。
+			// 定时器用 Stop 收尾即可（2026-10-05）：Go 1.23+ 起定时器通道是无缓冲的，
+			// 已触发且无人接收时那个值直接被丢弃 → 通道里永远没有"需要排出的旧值"，
+			// 再写 `<-timer.C` 排空反而会永久阻塞（goroutine 泄漏）。
+			fgTimer := time.NewTimer(time.Duration(opt.FgTimeoutMS) * time.Millisecond)
 			select {
 			case outcome := <-execDone:
+				fgTimer.Stop()
 				raw := outcome
 				totalChars := utf16Len(raw)
 				truncated := false
@@ -665,10 +721,10 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 				a.cm.AddMessage(&types.RawEntry{Role: "tool", ToolCallID: &tc.ID, Content: raw})
 				// content = 截断后 agent 实际回填给模型的内容（超长时 = 前 resultLimit 字符 + log 路径提示）
 				emit(types.AgentEvent{"type": "tool_result", "name": tc.Function.Name, "call_id": tc.ID, "truncated": truncated, "total_chars": totalChars, "content": raw})
-			case <-time.After(time.Duration(opt.FgTimeoutMS) * time.Millisecond):
+			case <-fgTimer.C:
 				// 转后台（不取消）：立即回填通知，模型不必傻等
 				startedAt := time.Now().UnixMilli()
-				bgNotice := fmt.Sprintf("（系统：此调用前台等待超过 %d 秒未完成，已自动转入后台继续执行。无需等待，可继续其他工作或直接基于已有信息回复；任务完成后系统会自动通知结果。）", roundMS(opt.FgTimeoutMS/1000))
+				bgNotice := fgTimeoutNotice(opt.FgTimeoutMS)
 				a.cm.AddMessage(&types.RawEntry{Role: "tool", ToolCallID: &tc.ID, Content: bgNotice})
 				emit(types.AgentEvent{"type": "tool_result", "name": tc.Function.Name, "call_id": tc.ID, "truncated": false, "total_chars": 0, "backgrounded": true, "content": bgNotice})
 				emit(types.AgentEvent{"type": "bg_start", "call_id": tc.ID, "tool_name": tc.Function.Name, "timeout_ms": opt.FgTimeoutMS})
@@ -724,11 +780,7 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 			stopMsg := "（系统：检测到重复工具调用，已强制停止本轮。请基于已有信息直接回答用户。）"
 			a.cm.AddMessage(&types.RawEntry{Role: "user", Content: stopMsg})
 			// 强停后再给模型一次机会收尾
-			tail, err := a.llmCall(ctx, emit, totals)
-			if err != nil {
-				return a.finishRunError(err, ctx, emit, totals)
-			}
-			return a.finishText(tail, emit, totals)
+			return a.tailCall(ctx, emit, totals)
 		}
 
 		// 下一轮 LLM 调用
@@ -741,6 +793,36 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 		}
 		resp = next
 	}
+}
+
+// tailCall 收尾调用：给模型最后一次作答机会，并且【不再执行任何工具】
+// （2026-10-05：强停/触达轮次上限的目的就是停止工具循环——再跑一轮工具等于
+// 绕开刚做的决定）。若模型这次仍然只给 tool_calls、没有正文，原来的实现会
+// 原样返回空串 → 前端出现空气泡，这里兜一句明确文案。
+func (a *Agent) tailCall(ctx context.Context, emit func(types.AgentEvent), totals *TokenTotals) (string, error) {
+	tail, err := a.llmCall(ctx, emit, totals)
+	if err != nil {
+		return a.finishRunError(err, ctx, emit, totals)
+	}
+	if len(tail.ToolCalls) > 0 {
+		emit(types.AgentEvent{"type": "doom_tail_pending", "detail": "收尾调用仍返回工具调用，已丢弃（本轮不再执行工具）"})
+		if strings.TrimSpace(tail.Content) == "" {
+			tail.Content = strongStopNoAnswer
+		}
+	}
+	return a.finishText(tail, emit, totals)
+}
+
+// trimCallRecs lastCalls 滑窗（2026-10-05）：run 内每个工具调用都追加一条记录，
+// 而 callRec.Key 里存的是"工具名 + 参数的完整 JSON"——bash 的 command 动辄几 KB，
+// 长任务会无限堆积。§8 判定只看尾部 doomWarnAfter 条，因此保留 DoomWarnAfter+1
+// 条就够（多留一条用于判断"连续序列是否刚被打断"）。
+func trimCallRecs(rc *[]callRec, doomWarnAfter int) {
+	if doomWarnAfter <= 0 || len(*rc) <= doomWarnAfter+1 {
+		return
+	}
+	keep := (*rc)[len(*rc)-(doomWarnAfter+1):]
+	*rc = append([]callRec(nil), keep...)
 }
 
 // isSameRunLocked §8：最近 doomWarnAfter 次调用是否完全相同（持锁调用；
@@ -794,8 +876,16 @@ func truncateStr(s string, n int) string {
 	return string(r[:n])
 }
 
-func roundMS(x int) int {
-	return int(float64(x) + 0.5)
+// fgTimeoutNotice 前台等待超时后回填给模型的通知（2026-10-05）。
+// 秒数取一位小数并【向下取整】：命中的目的是告诉模型"等了多久"，向上取整会把
+// 1.9 秒说成"超过 2 秒"——那是句假话；0.999 秒也只能说"超过 0.9 秒"。
+func fgTimeoutNotice(fgTimeoutMS int) string {
+	sec := float64(fgTimeoutMS) / 1000
+	if sec < 0 {
+		sec = 0
+	}
+	sec = math.Floor(sec*10) / 10
+	return fmt.Sprintf("（系统：此调用前台等待超过 %.1f 秒未完成，已自动转入后台继续执行。无需等待，可继续其他工作或直接基于已有信息回复；任务完成后系统会自动通知结果。）", sec)
 }
 
 // utf16Len 字符数（UTF-16 code units，对齐 TS text.length 口径）

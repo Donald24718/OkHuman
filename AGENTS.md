@@ -49,7 +49,7 @@
 - **更新时机**：
   | 变更类型 | 必须更新 | 位置 |
   |---|---|---|
-  | 新增 / 移除配置项 | ✅ | `config/default.json` + `AGENTS.md` 关键默认值表格 |
+  | 新增 / 移除配置项 | ✅ | `config/default.json` + `config/user.json.example` + `AGENTS.md` 关键默认值表格（`internal/config/config_test.go` 会拦截漏项） |
   | 新增 / 移除 API 端点 | ✅ | `AGENTS.md` 相关章节 |
   | 新增 / 移除插件能力 | ✅ | 插件 `README.md` + scout 索引 |
   | 新增 / 移除目录结构 | ✅ | `AGENTS.md` 目录布局 |
@@ -57,6 +57,10 @@
 - **格式要求**：
   - Markdown 优先，代码块标注语言
   - 配置项变更需同步更新 `config/default.json`
+  - **`config/user.json.example` 必须是严格合法 JSON**（不支持 `//` 注释行）：README
+    让用户直接 `cp` 它成 `user.json`，而 loader 用 `encoding/json`——带注释的模板会让
+    照文档操作的用户**启动即失败**。说明文字写进 `_comment` 字符串字段。模板里不要写
+    `data.dir`（会被合并生效，写错即数据目录错乱）。
   - 敏感信息（如密钥、端点）使用占位符或环境变量引用
 
 ## PR / Issue 流程
@@ -115,6 +119,7 @@ OkHuman/                     # 主程序仓（唯一 git 仓）
 | 提示词目录 | `prompts/`（相对可执行文件目录） | config/default.json |
 | 前台工具超时 | 30 s | config/default.json |
 | 工具总超时 | 600 s | config/default.json |
+| 工具轮次上限 | 200（0/负 → 200） | config/default.json（`tools.max_tool_rounds`） |
 | doom 检测 | 连续 3 次相同调用 | config/default.json |
 | Result limit | Default()=10000 / default.json=50000 / user.json=50000 | config/default.json, config/user.json |
 

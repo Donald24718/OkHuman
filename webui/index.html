@@ -633,6 +633,16 @@ function streamDelta(d) {
   const box = getBox().el;
   if (stick) box.scrollTop = box.scrollHeight;
 }
+function streamRollback() {
+  const c = state.stream;
+  if (!c) return;
+  c.thinking = "";
+  c.text = "";
+  if (c.thinkPre) c.thinkPre.textContent = "";
+  if (c.think) c.think.style.display = "none";
+  c.bubble.className = "bubble md streaming";
+  c.bubble.innerHTML = '<span class="cursor"></span>';
+}
 function streamEnd() {
   const c = state.stream;
   if (!c) return;
@@ -716,6 +726,11 @@ function handleChatEvent(type, data) {
       break;
     case "delta":
       streamDelta(data);
+      break;
+    case "delta_reset":
+      // agent 的 4xx 回退阶梯重试前会先发本事件：本轮首流那半截内容已被丢弃，
+      // UI 必须同步回滚，否则屏幕上会留下"被丢弃的半截 + 重试全文"拼出来的脏内容。
+      streamRollback();
       break;
     case "stopped":
       streamEnd();
@@ -833,6 +848,7 @@ function eventsFor() {
   on("run_msg", (d) => handleChatEvent("run_msg", d));
   on("run_end", (d) => handleChatEvent("run_end", d));
   on("delta", (d) => handleChatEvent("delta", d));
+  on("delta_reset", (d) => handleChatEvent("delta_reset", d));
   on("stopped", (d) => handleChatEvent("stopped", d));
   on("tool_call", (d) => handleChatEvent("tool_call", d));
   on("tool_result", (d) => handleChatEvent("tool_result", d));
