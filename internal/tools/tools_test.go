@@ -116,3 +116,18 @@ func TestBashViaTempScript(t *testing.T) {
 		}
 	}
 }
+
+// TestExecuteToolBashPassThrough 确认已知工具名透传（不改变既有行为）。
+//
+// 从 tools_ext_test.go 移来并加 `!windows`：它执行**真实 bash**，而 Windows 在
+// 阶段 3 前无 bash 实现（返回"未实现"错误）。平台无关的工具分发测试
+// （TestExecuteToolUnknownNameEscaped）留在 tools_ext_test.go 三平台共跑。
+func TestExecuteToolBashPassThrough(t *testing.T) {
+	out, err := ExecuteTool("bash", map[string]interface{}{"command": "echo passthrough-ok"})
+	if err != nil {
+		t.Fatalf("bash 执行不应报错：%v", err)
+	}
+	if !strings.Contains(out, "passthrough-ok") {
+		t.Errorf("输出不含预期 marker：%q", out)
+	}
+}

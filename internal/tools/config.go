@@ -57,9 +57,8 @@ func buildTools(fgMS, timeoutMS int) []types.ToolSpec {
 			Name: "bash",
 			Description: "执行 bash 命令（异步并行；输出超长被截断时，全文已写入 log 文件、截断处会给出路径，用 bash 的 cat / grep / tail 抓回）。" +
 				fmt.Sprintf("前台等待 %d 秒未完成自动转后台（你收到通知后继续干活，结果在轮内下一个工具调用间隙或下一次 run 带回来）；命令总时长超 %d 秒被强制终止（整个命令进程组）。", fgSec, toSec) +
-				fmt.Sprintf("起长驻服务（python 服务器等）必须完全脱离，否则服务占住本工具的进程组、会被 %d 秒超时连带杀掉：用 ", toSec) +
-				"(setsid <启动命令> < /dev/null > /tmp/<名>.log 2>&1 &)，之后用 curl 探活、cat 读日志。脱离后服务独立存活，不受前台超时/转后台影响。" +
-				"脱离必须三件套：setsid + 重定向 stdout/stderr + < /dev/null——只 setsid 不重定向，脱离子进程仍持有输出管道写端，Wait 收不到 EOF 会永久挂住，且超时杀组打不到它（上限彻底失效）。",
+				detachHint(toSec) +
+				tmpHint(), // 平台专属：Unix 为空串，Windows 提示别用 /tmp
 			Parameters: types.ToolParameters{
 				Type: "object",
 				Properties: map[string]interface{}{

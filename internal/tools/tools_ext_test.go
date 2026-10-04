@@ -45,13 +45,5 @@ func TestExecuteToolUnknownNameEscaped(t *testing.T) {
 	}
 }
 
-// TestExecuteToolBashPassThrough 确认已知工具名透传（不改变既有行为）。
-func TestExecuteToolBashPassThrough(t *testing.T) {
-	out, err := ExecuteTool("bash", map[string]interface{}{"command": "echo passthrough-ok"})
-	if err != nil {
-		t.Fatalf("bash 执行不应报错：%v", err)
-	}
-	if !strings.Contains(out, "passthrough-ok") {
-		t.Errorf("输出不含预期 marker：%q", out)
-	}
-}
+// TestExecuteToolBashPassThrough 见 tools_test.go（需真实 bash，带 !windows tag）。
+// 本文件保持平台无关：Windows 阶段 3 前无 bash，故真实执行类测试不放这里。

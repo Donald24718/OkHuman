@@ -143,16 +143,22 @@ func (o *BackgroundOrchestrator) OnBackgroundStart(a types.BackgroundStartArgs) 
 	}()
 }
 
-// capBytes 把 s 截到前 n 字节，回退到完整 UTF-8 字符边界
+// capBytes 把 s 截到前 n 字节，回退到完整 UTF-8 字符边界。
+//
+// 修复（2026-10-04 实证）：旧实现判断"最后一个字节是否 rune 起始"，
+// 方向错误——剥掉一字节后新的结尾可能仍是续字节，结果几乎完全失效
+// （实测 capBytes("中文abc", 1..6) 全部返回非法 UTF-8）。
+// 正确做法：从边界 n 往回退，直到 s[n] 是 rune 起始字节（或 n==0）。
+// 这样保证 s[:n] 是完整字符前缀，且回退不超过 3 字节（UTF-8 最长 4 字节）。
 func capBytes(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	cut := s[:n]
-	for len(cut) > 0 && !utf8.RuneStart(cut[len(cut)-1]) {
-		cut = cut[:len(cut)-1]
+	// 边界 n 处若是续字节（0x80~0xBF），说明切在字符中间，向前退到字符起始。
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
-	return cut
+	return s[:n]
 }
 
 // Snapshot 全部任务（含未完成）—— /backgrounds 端点用

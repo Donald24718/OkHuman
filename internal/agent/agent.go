@@ -238,7 +238,6 @@ func (a *Agent) runUserMessage(ctx context.Context, userText string, opt RunOpti
 	// 刷新/重开页面后"刷新瞬间在跑那轮"的 user 气泡不丢（前端按文本去重不重画）。
 	emit(types.AgentEvent{"type": "run_msg", "message": userText, "kind": kind})
 
-
 	resp, err := a.llmCall(runCtx, emit, &totals)
 	if err != nil {
 		return a.finishRunError(err, runCtx, emit, &totals)
@@ -336,13 +335,8 @@ func (a *Agent) FormatBackgroundNotice(task *types.PendingBackgroundTask, opt Ru
 	status = fmt.Sprintf("%s（耗时 %ss）", status, durSec)
 	head := fmt.Sprintf("（系统通知：后台任务完成——你此前调用 %s 时前台等待超时，已转入后台继续执行，现%s。结果如下：\n", task.ToolName, status)
 	if utf16Len(result) > opt.ResultLimit {
-		logPath := a.writeToolLog(opt, result)
-		tail := fmt.Sprintf("\n[已截断：完整结果 %d 字符在 %s，用 bash 的 cat / grep / tail 查看。]", utf16Len(result), logPath)
-		budget := opt.ResultLimit - utf16Len(head) - utf16Len(tail)
-		if budget < 0 {
-			budget = 0
-		}
-		return head + utf16Slice(result, budget) + tail
+		// 截断 + 全文落盘（失败时不给假路径，见 formatTruncatedWithHead）
+		return a.formatTruncatedWithHead(opt, result, opt.ResultLimit, head, "")
 	}
 	return head + result
 }
@@ -355,16 +349,64 @@ var toolLogSeq atomic.Uint64
 // writeToolLog 被截断的工具结果全文落文件
 // （<dataDir>/tool-results/tool-<时间戳>-<序号>.log），返回绝对路径。
 // 文件名秒精度 + 单调序号（tool- 前缀，与 session-records 的 ctx- 区分）。
+//
+// 失败时返回 ok=false（**不再返回一个"看似路径"的失败标记字符串**——
+// 旧实现返回 "[文件写入失败：写入失败]"，被调用方无条件当路径拼进提示，
+// 导致模型去 cat 一个不存在的路径且不知全文已丢。见 writeToolLogOK 注释。
 func (a *Agent) writeToolLog(opt RunOptions, full string) string {
+	path, _ := a.writeToolLogOK(opt, full)
+	return path
+}
+
+// writeToolLogOK writeToolLog 的显式成败版：成功 → (绝对路径, true)；
+// 失败 → (不含路径的说明, false)。调用方据此决定提示文案。
+func (a *Agent) writeToolLogOK(opt RunOptions, full string) (string, bool) {
 	dir := filepath.Join(opt.DataDir, "tool-results")
 	ts := time.Now().UTC().Format("2006-01-02_15-04-05")
 	path := filepath.Join(dir, fmt.Sprintf("tool-%s-%d.log", ts, toolLogSeq.Add(1)))
 	if err := os.MkdirAll(dir, 0o755); err == nil {
 		if err := os.WriteFile(path, []byte(full), 0o644); err == nil {
-			return path
+			return path, true
 		}
 	}
-	return fmt.Sprintf("[文件写入失败：%s]", "写入失败")
+	return "[落盘失败]", false
+}
+
+// quoteHintPath 把路径用反引号包裹，供模型安全复制（路径可能含空格/中文，
+// 裸拼 `cat <path>` 会因空格分词失败——Windows 用户名常见 "John Doe"）。
+func quoteHintPath(p string) string {
+	return "`" + p + "`"
+}
+
+// formatTruncatedForModel 生成"截断后回填给模型"的正文：
+// 成功落盘 → 前 limit 字符 + 含【引号包裹路径】的抓回指引；
+// 落盘失败 → 前 limit 字符 + 如实告知"全文已不可找回"（**不给假路径**）。
+//
+// head/tail 预算：调用方可传入 head 占用（后台通知场景），确保总长贴近 limit。
+func (a *Agent) formatTruncatedForModel(opt RunOptions, result string, limit int) string {
+	return a.formatTruncatedWithHead(opt, result, limit, "", "")
+}
+
+// formatTruncatedWithHead 带 head/tail 保留的通用实现。
+//   - head：截断区之前必须保留的前缀（如后台通知的状态行），参与预算；
+//   - tailExtra：截断提示之外必须追加的固定尾部（通常为空）。
+func (a *Agent) formatTruncatedWithHead(opt RunOptions, result string, limit int, head, tailExtra string) string {
+	total := utf16Len(result)
+	logPath, ok := a.writeToolLogOK(opt, result)
+	var tail string
+	if ok {
+		tail = fmt.Sprintf("\n[已截断：完整结果 %d 字符在 %s，用 bash 的 cat / grep / tail 查看。]",
+			total, quoteHintPath(logPath))
+	} else {
+		// 落盘失败：不给假路径，如实告知全文不可找回，模型据此自行决定是否重跑。
+		tail = fmt.Sprintf("\n[已截断：完整结果 %d 字符（全文落盘失败，无法找回，仅保留前部）。]",
+			total)
+	}
+	budget := limit - utf16Len(head) - utf16Len(tail) - utf16Len(tailExtra)
+	if budget < 0 {
+		budget = 0
+	}
+	return head + utf16Slice(result, budget) + tail + tailExtra
 }
 
 // llmCall 一次 LLM 调用（记 token 统计）。流式：delta 实时 emit（WebUI 边生成边显示）；
@@ -615,10 +657,10 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 				totalChars := utf16Len(raw)
 				truncated := false
 				if totalChars > opt.ResultLimit {
-					// 截断：全文落 log 文件，正文留前 resultLimit 字符 + 一句 log 路径提示（模型用 bash 抓回）
-					logPath := a.writeToolLog(opt, raw)
+					// 截断：全文落 log 文件（失败则如实说明），正文留前 resultLimit 字符 +
+					// 抓回指引（路径用反引号包裹，模型可安全复制）。
+					raw = a.formatTruncatedForModel(opt, raw, opt.ResultLimit)
 					truncated = true
-					raw = utf16Slice(raw, opt.ResultLimit) + fmt.Sprintf("\n[已截断：完整结果 %d 字符在 %s，用 bash 的 cat / grep / tail 查看。]", totalChars, logPath)
 				}
 				a.cm.AddMessage(&types.RawEntry{Role: "tool", ToolCallID: &tc.ID, Content: raw})
 				// content = 截断后 agent 实际回填给模型的内容（超长时 = 前 resultLimit 字符 + log 路径提示）

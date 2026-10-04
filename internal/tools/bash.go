@@ -2,14 +2,12 @@ package tools
 
 // bash 元工具实现。第二个元工具（如 ipython）应新建同目录 ipython.go，
 // 不要塞进本文件；本文件只放 bash 特有逻辑，公共设施见 output.go / args.go。
+// 平台无关的契约见 exec_domain.go；平台专属的进程控制见 bash_unix.go / bash_windows.go。
 
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -63,81 +61,46 @@ func toolBash(args map[string]interface{}) (string, error) {
 	// 命令文本的 -f 模式必然匹配到包装壳自己（自杀 exit 143 / 自匹配假 pid，2026-09-15
 	// 实测事故）。执行脚本文件是 bash 原生形态：命令文本既不在 argv 也不在 environ。
 	// 文件在 toolBash 返回时删除（= 前台命令结束），绑的是本函数的 defer，不是真正的
-	// 进程退出：命令转后台、或 setsid 完全脱离后本函数已返回，脚本此时已被删除，而
-	// 命令本身仍在运行。（提前 unlink 不中断执行，故此举无副作用。）
+	// 进程退出：命令转后台、或（Unix）setsid 完全脱离后本函数已返回，脚本此时已被删除，
+	// 而命令本身仍在运行。（提前 unlink 不中断执行，故此举无副作用。）
 	scriptPath := filepath.Join(os.TempDir(), fmt.Sprintf("okhuman-bash-%d-%s.sh", time.Now().UnixMilli(), randHex(4)))
 	if err := os.WriteFile(scriptPath, []byte(command), 0o700); err != nil {
 		return "", fmt.Errorf("写临时脚本失败: %w", err)
 	}
 	defer os.Remove(scriptPath)
-	cmd := exec.Command("bash", scriptPath)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // 独立进程组
 	// 审计 H3 修（2026-09-14）：输出按流封顶 32MB（防单条命令灌 GB 级输出
 	// OOM 整个进程；600s 只限时间不限大小）。超上限部分丢弃但持续读取
 	// （管道不堵，子进程不挂起），正文留前 32MB + 截断说明。
 	stdout := newCappedBuffer(maxToolOutputBytes)
 	stderr := newCappedBuffer(maxToolOutputBytes)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	if err := cmd.Start(); err != nil {
-		return "", err
-	}
-	// 超时标记用 atomic.Bool（2026-09-14 审计修：旧裸 bool 由 AfterFunc
-	// goroutine 写、主 goroutine 读，无同步 → 数据竞争）。
-	//
-	// 竞态修（2026-10-04，两轮）：旧写法在计时器回调里**先** killed.Store(true) 后 Kill。
-	// 若命令恰好在计时器触发后、SIGKILL 生效前自行 exit(0)，Wait 返回 nil（code=0），
-	// 但 killed 已为 true → 输出"退出码: 0（超过 N 秒上限被强制终止）"——自相矛盾
-	// （实测相位扫描命中 ~2-3%）。
-	//
-	// 第一层修（done 标志 + Kill 成功才置位 killed）经实测**不足以**根除：
-	// SIGKILL 送达时若组首进程已退出但尚未被 Wait 回收（僵尸态），Kill 返回 nil
-	// （杀僵尸是成功的空操作），killed 仍被置位，而 Wait 随后报告正常退出 0。
-	// 即"Kill 成功"推不出"是我们杀死的"。
-	//
-	// 第二层修（根治）：权威信号来自 wait 状态——Go 的 ExitError.Sys() 给出
-	// syscall.WaitStatus，Signaled() 为真表示进程**死于信号**（而非自己的退出码）。
-	// 只有 killed（我们发过 kill）**且** Signaled（进程确实死于此信号）才算超时终止；
-	// 进程自行 exit(0)/exit(N) 则不论 killed 与否都不加超时文案（见下方 timedOut 计算）。
-	//
-	// 注意：仍保留 done 快路径（Wait 已返回 → 回调直接不做），缩小无谓的 kill 尝试。
-	var killed atomic.Bool
-	var done atomic.Bool
-	timer := time.AfterFunc(time.Duration(timeoutSec)*time.Second, func() {
-		if done.Load() { // Wait 已返回 → 命令自行结束，不是超时
-			return
-		}
-		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err == nil {
-			killed.Store(true)
-		} else if err := cmd.Process.Kill(); err == nil {
-			killed.Store(true) // 组已不存在时兜底杀顶层，成功才计为超时
-		}
-	})
-	defer timer.Stop()
 
-	waitErr := cmd.Wait()
-	done.Store(true)
-	code := 0
-	signaled := false
-	if waitErr != nil {
-		if ee, ok := waitErr.(*exec.ExitError); ok {
-			code = ee.ExitCode()
-			if ws, ok := ee.Sys().(syscall.WaitStatus); ok {
-				signaled = ws.Signaled()
-			}
-		} else {
-			code = -1
-		}
+	// 平台专属执行：经 executor 接口（Unix 用独立进程组 + kill(-pgid)；
+	// Windows 用 Job Object，阶段 3）。startErr 非 nil 表示进程**未能启动**
+	// （对应原 `cmd.Start()` 的 error 语义）——原实现在此处直接 `return "", err`，
+	// 外化为接口后由平台实现回传，语义保持不变。
+	info, startErr := platformExecutor().Run(scriptPath, timeoutSec, stdout, stderr)
+	if startErr != nil {
+		return "", startErr
 	}
-	// 超时终止的权威判定：我们发过 kill **且** 进程死于信号。
-	// 只 killed 不看 signaled 会把"命令自行 exit(0)"误报成超时（退出码 0 + 超时文案）；
-	// 只 signaled 不看 killed 会把"命令自己 kill -9 自己"误报成超时。
-	timedOut := isTimeoutKill(killed.Load(), signaled)
-	head := fmt.Sprintf("退出码: %d", code)
+
+	// 权威判定用双条件（方案 §3.1：ExitReason 不取代 isTimeoutKill）。
+	// 平台实现的 Killed/Signaled 是原始条件，本处重算，得到与 Unix 原实现逐字同源的判定。
+	timedOut := isTimeoutKill(info.Killed, info.Signaled)
+	// 交叉校验：平台自报 Reason 若与双条件不一致 = 平台实现 bug（不改变判定，只暴露）。
+	if (info.Reason == ExitTimedOut) != timedOut {
+		info.Degraded = joinDegraded(info.Degraded,
+			fmt.Sprintf("reason-mismatch: 平台自报 %s，双条件判定 timedOut=%v", info.Reason, timedOut))
+	}
+
+	head := fmt.Sprintf("退出码: %d", info.Code)
 	if timedOut {
 		// 光说"已超时"不够：模型分不清"命令自己失败"与"被上限杀掉"，会误判重试。
-		// 给出上限值与出路（脱离进程组 / 调大配置）。
-		head += fmt.Sprintf("（超过 %d 秒上限被强制终止；要跑更久：用 setsid + 重定向完全脱离进程组，或调大配置 tools.timeout_ms）", timeoutSec)
+		// 给出上限值与出路（平台专属：Unix 用 setsid 脱离；Windows 无等价手段，见 detachHint）。
+		head += fmt.Sprintf("（超过 %d 秒上限被强制终止；要跑更久：%s）", timeoutSec, detachHintBrief())
+	}
+	// 不静默降级（方案 §3.2）：降级说明必须出现在**模型可见的返回值**里，而非仅日志。
+	if info.Degraded != "" {
+		head += "\n[平台降级] " + info.Degraded
 	}
 	out := stdout.String()
 	errOut := stderr.String()
@@ -152,22 +115,4 @@ func toolBash(args map[string]interface{}) (string, error) {
 		return head + "\n\n" + body, nil
 	}
 	return head, nil
-}
-
-// isTimeoutKill 判定一次执行是否属于"被本工具的超时机制强制终止"。
-//
-// 抽成纯函数是为了可确定性单测：真实竞态是概率性的（~2-3%），
-// 靠集成测试反复跑无法可靠区分真修与假修（变异测试会漏网）。
-//
-// 参数语义：
-//   - killed：计时器回调是否成功向进程组/顶层进程发出过 SIGKILL；
-//   - signaled：被 Wait 回收的进程是否死于信号（syscall.WaitStatus.Signaled()）。
-//
-// 两个条件缺一不可：
-//   - 只看 killed：命令在计时器触发的同一瞬间自行 exit(0) 时，Kill 会打在
-//     尚未回收的僵尸组上并"成功"返回，killed=true 而进程其实正常退出 →
-//     输出"退出码: 0（超过 N 秒上限被强制终止）"的自相矛盾文案。
-//   - 只看 signaled：命令自己 `kill -9 $$` 也会 Signaled=true，但那不是超时。
-func isTimeoutKill(killed, signaled bool) bool {
-	return killed && signaled
 }

@@ -193,10 +193,16 @@ WebUI 配置页的保存会触发 `POST /config`，patch 深合并进 `config/us
 
 ## 验收标准
 
-> 注意：当前代码含 `Setpgid`/`syscall.Kill` 等 Unix 专属调用，Windows 下构建会失败。验收需在 Linux 环境进行。
+> **平台支持**：自 2026-10-04 起，主程序**三平台可构建**（Linux / macOS / Windows）。
+> 原先 `bash` 工具内的 `Setpgid`/`syscall.Kill` 等 Unix 专属调用已按 build tag 拆入
+> `internal/tools/bash_unix.go` / `bash_windows.go`，平台无关层留在无 tag 文件。
+>
+> 验收**推荐在 Linux 环境**进行（行为基准），但 Windows 上 `go build/vet/test ./...`
+> 也应全绿 —— 二者都跑通才算完整验收。Windows 端到端需机器上有可用 bash
+> （Git for Windows 或 WSL）。详见 `internal/tools/README.md` §6。
 
-- `go build -o okhuman .` 成功，无 vet 错误
-- `go test ./...` 全部通过
+- `go build ./...` 成功，无 vet 错误（三平台）
+- `go test ./...` 全部通过（Linux 为准；Windows 亦应全绿）
 - 主程序启动后在 `http://127.0.0.1:<port>/` 看到 WebUI
 - scout 索引服务（`:8480`）可响应 `/search` 和 `/reindex`
 - 插件/skill 的 `meta.json` 含非空 `summary` 字段
