@@ -23,7 +23,12 @@ func toolBash(args map[string]interface{}) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("参数 command 缺失或不是字符串")
 	}
-	// 上限来自配置 tools.timeout_ms（2026-10-02；旧为硬编码 600）
+	// 上限来自配置 tools.timeout_ms（2026-10-02；旧为硬编码 600）。
+	//
+	// 粒度契约：配置以**毫秒**为单位，但执行上限按**秒向下取整**——超时语义是
+	// "最多等多久"，向下取整保证实际等待不超过配置值（向上取整会让 1001ms 变成
+	// 等 2 秒，违背配置意图）。因此 timeout_ms=1999 → 上限 1 秒（静默丢弃 999ms），
+	// timeout_ms 不足 1000 → limitSec=0 → 回落默认 600 秒（见下方 `< 1` 分支）。
 	limitSec := int(toolTimeoutMS.Load()) / 1000
 	if limitSec < 1 {
 		limitSec = DefaultToolTimeoutMS / 1000
@@ -31,9 +36,21 @@ func toolBash(args map[string]interface{}) (string, error) {
 	timeoutSec := limitSec
 	if v, ok := args["timeout_seconds"]; ok {
 		if f, ok := numArg(v); ok && f > 0 {
+			// 必须先在 float64 域 clamp 再转 int：numArg 的 Float64 分支只挡 NaN/±Inf，
+			// 不挡 1e300 这类"有限但远超 int64"的值。直接 int(f) 是 Go 规范的
+			// implementation-specific 溢出（amd64 得最小 int64 负数，arm64 可能饱和为正
+			// 最大值），随后被 `< 1` 兜底反转成 1 秒——模型意图"跑很久"变成"1 秒被杀"，
+			// 且跨架构行为不一致。先在 float64 域收敛到 [1, limitSec]，永不进溢出区。
+			if f > float64(limitSec) {
+				f = float64(limitSec)
+			}
+			if f < 1 {
+				f = 1
+			}
 			timeoutSec = int(f)
 		}
 	}
+	// 双保险：理论上上面已夹紧，但保留兜底以防御未来改动（如新增其它赋值路径）。
 	if timeoutSec < 1 {
 		timeoutSec = 1
 	}
@@ -66,27 +83,58 @@ func toolBash(args map[string]interface{}) (string, error) {
 		return "", err
 	}
 	// 超时标记用 atomic.Bool（2026-09-14 审计修：旧裸 bool 由 AfterFunc
-	// goroutine 写、主 goroutine 读，无同步 → 数据竞争）
+	// goroutine 写、主 goroutine 读，无同步 → 数据竞争）。
+	//
+	// 竞态修（2026-10-04，两轮）：旧写法在计时器回调里**先** killed.Store(true) 后 Kill。
+	// 若命令恰好在计时器触发后、SIGKILL 生效前自行 exit(0)，Wait 返回 nil（code=0），
+	// 但 killed 已为 true → 输出"退出码: 0（超过 N 秒上限被强制终止）"——自相矛盾
+	// （实测相位扫描命中 ~2-3%）。
+	//
+	// 第一层修（done 标志 + Kill 成功才置位 killed）经实测**不足以**根除：
+	// SIGKILL 送达时若组首进程已退出但尚未被 Wait 回收（僵尸态），Kill 返回 nil
+	// （杀僵尸是成功的空操作），killed 仍被置位，而 Wait 随后报告正常退出 0。
+	// 即"Kill 成功"推不出"是我们杀死的"。
+	//
+	// 第二层修（根治）：权威信号来自 wait 状态——Go 的 ExitError.Sys() 给出
+	// syscall.WaitStatus，Signaled() 为真表示进程**死于信号**（而非自己的退出码）。
+	// 只有 killed（我们发过 kill）**且** Signaled（进程确实死于此信号）才算超时终止；
+	// 进程自行 exit(0)/exit(N) 则不论 killed 与否都不加超时文案（见下方 timedOut 计算）。
+	//
+	// 注意：仍保留 done 快路径（Wait 已返回 → 回调直接不做），缩小无谓的 kill 尝试。
 	var killed atomic.Bool
+	var done atomic.Bool
 	timer := time.AfterFunc(time.Duration(timeoutSec)*time.Second, func() {
-		killed.Store(true)
-		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
-			_ = cmd.Process.Kill() // 组已不存在时兜底杀顶层
+		if done.Load() { // Wait 已返回 → 命令自行结束，不是超时
+			return
+		}
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err == nil {
+			killed.Store(true)
+		} else if err := cmd.Process.Kill(); err == nil {
+			killed.Store(true) // 组已不存在时兜底杀顶层，成功才计为超时
 		}
 	})
 	defer timer.Stop()
 
 	waitErr := cmd.Wait()
+	done.Store(true)
 	code := 0
+	signaled := false
 	if waitErr != nil {
 		if ee, ok := waitErr.(*exec.ExitError); ok {
 			code = ee.ExitCode()
+			if ws, ok := ee.Sys().(syscall.WaitStatus); ok {
+				signaled = ws.Signaled()
+			}
 		} else {
 			code = -1
 		}
 	}
+	// 超时终止的权威判定：我们发过 kill **且** 进程死于信号。
+	// 只 killed 不看 signaled 会把"命令自行 exit(0)"误报成超时（退出码 0 + 超时文案）；
+	// 只 signaled 不看 killed 会把"命令自己 kill -9 自己"误报成超时。
+	timedOut := isTimeoutKill(killed.Load(), signaled)
 	head := fmt.Sprintf("退出码: %d", code)
-	if killed.Load() {
+	if timedOut {
 		// 光说"已超时"不够：模型分不清"命令自己失败"与"被上限杀掉"，会误判重试。
 		// 给出上限值与出路（脱离进程组 / 调大配置）。
 		head += fmt.Sprintf("（超过 %d 秒上限被强制终止；要跑更久：用 setsid + 重定向完全脱离进程组，或调大配置 tools.timeout_ms）", timeoutSec)
@@ -104,4 +152,22 @@ func toolBash(args map[string]interface{}) (string, error) {
 		return head + "\n\n" + body, nil
 	}
 	return head, nil
+}
+
+// isTimeoutKill 判定一次执行是否属于"被本工具的超时机制强制终止"。
+//
+// 抽成纯函数是为了可确定性单测：真实竞态是概率性的（~2-3%），
+// 靠集成测试反复跑无法可靠区分真修与假修（变异测试会漏网）。
+//
+// 参数语义：
+//   - killed：计时器回调是否成功向进程组/顶层进程发出过 SIGKILL；
+//   - signaled：被 Wait 回收的进程是否死于信号（syscall.WaitStatus.Signaled()）。
+//
+// 两个条件缺一不可：
+//   - 只看 killed：命令在计时器触发的同一瞬间自行 exit(0) 时，Kill 会打在
+//     尚未回收的僵尸组上并"成功"返回，killed=true 而进程其实正常退出 →
+//     输出"退出码: 0（超过 N 秒上限被强制终止）"的自相矛盾文案。
+//   - 只看 signaled：命令自己 `kill -9 $$` 也会 Signaled=true，但那不是超时。
+func isTimeoutKill(killed, signaled bool) bool {
+	return killed && signaled
 }

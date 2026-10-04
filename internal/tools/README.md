@@ -114,13 +114,27 @@ args.command ──► 写入 /tmp/okhuman-bash-<ms>-<hex>.sh (0700)
 | 不给 `timeout_seconds` | `timeoutSec = limitSec`（配置上限） |
 | `timeout_seconds = 1` | 生效为 1 秒（下调） |
 | `timeout_seconds = 99999`，上限 5s | **clamp 到 5 秒** |
+| `timeout_seconds = 1e300`，上限 5s | **clamp 到 5 秒**（见下方溢出说明） |
 
-`TestModelCanLowerButNotRaise` 覆盖上表。数值参数经 `numArg` 收敛 ——
+`TestModelCanLowerButNotRaise` + `TestOversizedTimeoutNotInvertedTo1s` 覆盖上表。
+数值参数经 `numArg` 收敛 ——
 按 kind 覆盖**全部**整数/浮点家族（`int8/16/32/64`、`uint/uint8…uint64`、
 `float32/64`）并兼容 `json.Number`（`UseNumber()` 场景）：只认少数几种会把
 其余类型静默退回默认上限，**行为与调用方意图相反**。
 `numArg` 同时**拒绝** NaN / ±Inf / 超出 2^53 的整数——`int(+Inf)` 在 amd64 上
 溢出为最小 int64，会被 `timeoutSec < 1` 兜底误判成 **1 秒**，比调用方意图短数个数量级。
+
+**超大有限值的 clamp（2026-10-04 审查 P0 修）**：`numArg` 的 Float64 分支只挡
+NaN/±Inf，挡不住 `1e300` 这类「有限但远超 int64」。旧实现直接 `int(f)`，而
+`int(float64)` 溢出是 Go 规范的 implementation-specific 行为——amd64 得最小 int64
+（负数），arm64 可能饱和为最大 int64。amd64 上接着被 `timeoutSec < 1` 反转成
+**1 秒**：模型意图「跑很久」变成「1 秒被杀」，**且跨架构结果不一致**。
+修法：**先在 float64 域 clamp 到 `[1, limitSec]` 再转 int**，永不进溢出区。
+
+**配置粒度契约**：`tools.timeout_ms` 以**毫秒**为单位，但执行上限按**秒向下取整**
+（`limitSec := int(toolTimeoutMS.Load()) / 1000`）。向下取整保证实际等待不超过配置值
+（超时语义是「最多等多久」）。故 `timeout_ms=1999` → 上限 **1 秒**（静默丢弃 999ms），
+`timeout_ms<1000` → `limitSec=0` → 回落默认 600 秒。
 
 ### 3.3 输出封顶（32MB/流，审计 H3）
 
@@ -164,6 +178,41 @@ args.command ──► 写入 /tmp/okhuman-bash-<ms>-<hex>.sh (0700)
 设计意图：光说「已超时」不够 —— 模型分不清「命令自己失败」与「被上限杀掉」，
 会误判重试。**给出上限值与出路，让模型在「脱离」和「调配置」之间做选择。**
 
+### 5.1 超时判定的权威口径（2026-10-04 审查 P1 修）
+
+**是否追加超时文案 = `isTimeoutKill(killed, signaled)` = 我们发过 kill **且** 进程死于信号。**
+
+- `killed`：计时器回调是否成功发出过 SIGKILL。
+- `signaled`：被 `Wait` 回收的进程是否死于信号（`ExitError.Sys().(syscall.WaitStatus).Signaled()`）。
+
+两个条件**缺一不可**，原因：
+
+- **只看 `killed`**：命令恰好在计时器触发同一瞬间自行 `exit(0)` 时，`Kill(-pgid)`
+  会打在「已退出但尚未被 `Wait` 回收」的僵尸组上并**返回 nil（杀僵尸是成功的空操作）**，
+  `killed=true` 而进程其实**正常退出** → 输出 `退出码: 0（超过 N 秒上限被强制终止）`
+  的**自相矛盾文案**（旧实现实测相位扫描约 2–3% 命中）。即「Kill 成功」推不出「是我们杀死的」。
+- **只看 `signaled`**：命令自己 `kill -9 $$` 也会 `Signaled=true`，但那不是本工具超时。
+
+判定抽成纯函数 `isTimeoutKill` 以支持**确定性单测**：真实竞态是概率性的，
+集成断言会漏（变异测试证实 40 次迭代抓不到把 `&& signaled` 删掉的回退——
+**假绿**）。`TestIsTimeoutKillDecisionTable` 覆盖四种 `(killed, signaled)` 组合，
+变异测试验证其能捕获回退。集成测试 `TestKilledRaceNoContradictoryZeroExit`
+作端到端补充（`-short` 下跳过）。
+
+回调里另保留 `done` 快路径（`Wait` 已返回 → 直接不做），减少无谓的 kill 尝试。
+
+### 5.2 临时脚本的删除时机（契约，非缺陷）
+
+`defer os.Remove(scriptPath)` 绑定的是 **`toolBash` 返回**，不是真正的进程退出：
+
+- 命令转后台、或 `setsid` 完全脱离后，`toolBash` 已返回、脚本已被删除，而命令**仍在运行**。
+- 这是**有意为之**：提前 unlink 不中断执行（已在运行的进程继续持有该 inode），
+  且避免脚本堆积。
+
+**契约**：任何「读取自己脚本文件」的用法（如 `bash $0` 自引用）在本工具下**不可靠**——
+脚本在 `toolBash` 返回时即被删除。当前 `bash.go` 不涉及；后续新增工具
+（如 `ipython.go`）若需要脚本持久化，必须自行管理生命周期，不要沿用 `defer os.Remove`。
+
 ---
 
 ## 6. 实测记录与已知问题
@@ -192,22 +241,19 @@ FAIL
 
 → 在 Windows 上该测试会失败。**建议补 `//go:build !windows`。**
 
-### 6.3 ⚠️ 注释与代码不一致：临时脚本删除时机
+### 6.3 临时脚本删除时机：注释与代码不一致（已修正为契约）
 
-代码注释（L150-151）写：
+代码注释曾写「文件在**进程退出后**删除（绑退出，保留取证价值）」，但
+`defer os.Remove(scriptPath)` 绑定的是 **`toolBash` 返回**（= 前台命令结束时），
+两者语义不符 —— 命令转后台 / `setsid` 脱离后仍在跑，脚本此时已被删除。
 
-> 文件在**进程退出后**删除（绑退出，不绑 30s 前台超时……绑退出是保留取证价值）
+**2026-10-04 处理**：注释与 README 已改为**如实描述**（绑 `toolBash` 返回，
+提前 unlink 是有意为之、不中断执行），并把「脚本不持久」列为**显式契约**
+（见 §5.2），避免后续工具误以为脚本文件可自引用。
 
-**实际行为**：`defer os.Remove(scriptPath)`（L156）绑定的是
-**`toolBash` 函数返回**，而函数在 `cmd.Wait()` 返回时（即**前台命令结束**时）返回。
-
-因此注释描述的「绑退出」语义**没有实现**：命令一旦转后台、或 `setsid`
-脱离后仍在跑，脚本在 `toolBash` 返回时就已被删除 —— 所谓「保留取证价值」
-在最需要取证的场景（长驻服务）恰好不成立。
-
-> 影响：低（脚本内容 = 命令文本，agent 侧仍留有 tool_call 记录），
-> 但**注释会误导后续维护者**，建议改代码（改用独立 goroutine 等待）
-> 或改注释（如实说明绑前台返回）。
+> 影响：低（脚本内容 = 命令文本，agent 侧仍有 tool_call 记录）。
+> 未改成「绑真正进程退出」：那需要独立 goroutine 跟踪进程生命期，
+> 复杂度高于收益，且当前无消费方需要脚本留存。
 
 ---
 
@@ -231,6 +277,11 @@ OKHUMAN_FAKE=1 ./okhuman
 | `TestConfigureFallbackAndStability` | 非法值回落 + 同参数逐字同文本 |
 | `TestConfiguredLimitKillsProcessGroup` | 上限生效 + 结果自报上限与出路 |
 | `TestModelCanLowerButNotRaise` | 可下调、不可越权上调 |
+| `TestOversizedTimeoutNotInvertedTo1s` | `1e300`/`9.3e18`/`MaxFloat64` 不反转成 1 秒（P0 回归） |
+| `TestIsTimeoutKillDecisionTable` | 超时判定四组合（确定性，P1 回归） |
+| `TestKilledRaceNoContradictoryZeroExit` | 端到端无「退出码 0 + 超时」矛盾（概率性，`-short` 跳过） |
+| `TestNumArgTypeCoverage` 等 | `numArg` 类型覆盖 / NaN/Inf / 2^53 守卫（见 §3.2） |
+| `TestExecuteToolUnknownNameEscaped` | 未知工具名 `%q` 转义 |
 
 ---
 
