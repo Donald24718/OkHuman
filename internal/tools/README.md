@@ -116,9 +116,11 @@ args.command ──► 写入 /tmp/okhuman-bash-<ms>-<hex>.sh (0700)
 | `timeout_seconds = 99999`，上限 5s | **clamp 到 5 秒** |
 
 `TestModelCanLowerButNotRaise` 覆盖上表。数值参数经 `numArg` 收敛 ——
-同时接受 `float64/float32/int/int64`，因为 JSON 解码恒为 `float64`，
-但 Go 侧调用方可能传 `int`：只认 `float64` 会静默退回默认上限，
-**行为与调用方意图相反**。
+按 kind 覆盖**全部**整数/浮点家族（`int8/16/32/64`、`uint/uint8…uint64`、
+`float32/64`）并兼容 `json.Number`（`UseNumber()` 场景）：只认少数几种会把
+其余类型静默退回默认上限，**行为与调用方意图相反**。
+`numArg` 同时**拒绝** NaN / ±Inf / 超出 2^53 的整数——`int(+Inf)` 在 amd64 上
+溢出为最小 int64，会被 `timeoutSec < 1` 兜底误判成 **1 秒**，比调用方意图短数个数量级。
 
 ### 3.3 输出封顶（32MB/流，审计 H3）
 

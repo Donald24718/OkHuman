@@ -19,7 +19,7 @@ import (
 // 配套防死锁：独立进程组 + 超时杀整组（-pid）——孤儿子进程（管道写端持有者）
 // 一并 SIGKILL，管道必关，命令永不永久挂起。
 func toolBash(args map[string]interface{}) (string, error) {
-	command, ok := requireStr(args, "command")
+	command, ok := requireNonEmptyStr(args, "command")
 	if !ok {
 		return "", fmt.Errorf("参数 command 缺失或不是字符串")
 	}
