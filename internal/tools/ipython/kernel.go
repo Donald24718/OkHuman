@@ -57,7 +57,7 @@ const (
 // ErrDead 内核已不可用（进程退出或被上一次超时硬杀回收）。
 var ErrDead = errors.New("ipython: 内核已终止")
 
-// Response launcher 的一行 JSON 响应（与 docs/assets/ipython_launcher.py 对齐）。
+// Response 对应 launcher.py 的一行 JSON 响应（与 internal/tools/ipython/launcher.py 对齐，注意不是 docs/assets 的副本）。
 //
 // Result 是 MIME → 文本的映射（text/plain / text/html / image/png 等）。
 type Response struct {

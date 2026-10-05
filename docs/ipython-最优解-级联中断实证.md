@@ -133,13 +133,12 @@ numpy3k    未卡住（Linux BLAS 太快）
 internal/tools/
 ├── tools.go                  # ExecuteTool switch +1 case
 ├── config.go                 # buildTools +1 spec
-├── ipython/
-│   ├── ipython.go            # 入口 toolIPython + 级联超时
-│   ├── kernel.go             # Kernel：进程 + JSON Lines 协议 + 级联中断
-│   ├── manager.go            # KernelManager：按 sessionID 隔离
-│   └── config.go             # ipythonSpec（纯函数，KV 前缀稳定）
-└── embed/
-    └── ipython_launcher.py   # ← 已验证实现见 docs/assets/ipython_launcher.py
+└── ipython/
+    ├── ipython.go            # 入口 toolIPython + 级联超时
+    ├── kernel.go             # Kernel：进程 + JSON Lines 协议 + 级联中断
+    ├── manager.go            # KernelManager：按 sessionID 隔离
+    ├── config.go             # ipythonSpec（纯函数，KV 前缀稳定）
+    └── launcher.py           # kernel.go 中 //go:embed 嵌入运行时（非 docs/assets 副本）
 ```
 
 **零第三方 Go 依赖**：已用 `CGO_ENABLED=0` 编译出 Windows(4.4MB) / Linux(4.3MB) 双产物。
@@ -248,7 +247,7 @@ Python 环境可能没有装 ipython。两个选项：
 ## 七、实施步骤
 
 ```
-Phase 1  把 docs/assets/ipython_launcher.py 落到 internal/tools/embed/
+Phase 1  launcher.py 落到 internal/tools/ipython/（go:embed 嵌入，运行时生效）
          └── 冒烟：基础执行 + 级联中断 + 变量保留（脚本已就绪，6/6 通过）
 
 Phase 2  ExecuteTool 加 sessionID（1 处签名 + agent.go:697）
