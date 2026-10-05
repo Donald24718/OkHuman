@@ -131,24 +131,31 @@ func buildTools(fgMS, timeoutMS int) []types.ToolSpec {
 // 数字一律取自 ipython.DefaultSec()/MaxSec()，与实际执行时的夹逼同源——
 // 绝不在描述里写死数字（否则模型会按假数字决策）。
 //
+// 描述取材铁律：**写差异，不写常识**（与 bash 同一把尺子）。
+//   - 不写用法说明（%magic / !cmd / pandas / In-Out 历史…）：模型的 Python
+//     先验里全有，写出来是噪声，还会稀释它对真正关键条款的注意力。
+//   - 只写本实例偏离标准行为之处：超时是中断而非杀、变量条件性丢失、
+//     没有 stdin、图片走落盘路径而非回传 base64、哪类活该转给 bash。
+//   - 反直觉但重要：先验越强越危险——正因为它懂 Python，才会写出 input()，
+//     所以"没有交互输入"这条必须显式写。
+//
 // 注意描述里**不提平台差异**：级联中断已经在双平台实跑通过（Windows 命中
 // stage 1、Linux 自动升到 stage 2），行为一致就该给模型一致的承诺。
+// 副作用：本段文字跨平台逐字相同（bash 段因 tmpHint/detachHint 不同而不同）。
 func buildIPythonSpec() types.ToolSpec {
 	defSec, maxSec := ipython.DefaultSec(), ipython.MaxSec()
 	return types.ToolSpec{
 		Name: "ipython",
-		Description: "真 IPython 内核：变量跨调用保留，支持 %magic（如 %timeit）、!cmd 执行 shell、" +
-			"In/Out 历史与 DataFrame 富展示。适合数据处理与分析（pandas/numpy）、可视化（matplotlib）、" +
-			"科学计算、AI/ML 推理、写自动化脚本。不适合 grep/sed 这类纯文本处理，那用 bash。" +
-			fmt.Sprintf("单次执行默认 %d 秒、最多 %d 秒；超时先尝试中断（内核保留、变量不丢），中断不了才重启内核（变量会丢，会在返回值里说明）。", defSec, maxSec) +
-			"图片/PDF 会自动落盘并在返回值里给出绝对路径（可用 bash 或素材插件读取），" +
-			"display() 推送的富内容同样会被捕获。" +
-			"**没有交互输入**：input() / getpass 会立刻报错，请把值直接写进代码，或向用户提问。",
+		Description: "IPython 内核，变量、导入、函数跨调用保留（常驻进程）。" +
+			fmt.Sprintf("单次执行默认 %d 秒、最多 %d 秒；超时先尝试中断（内核保留、变量不丢），无法中断时重启内核（丢变量）。", defSec, maxSec) +
+			"图片/PDF 自动落盘并在返回值给出绝对路径；display() 的富内容同样被捕获。" +
+			"无交互输入：input() / getpass 会立刻报错，请把值直接写进代码。" +
+			"grep/sed 纯文本处理，用 bash。",
 		Parameters: types.ToolParameters{
 			Type: "object",
 			Properties: map[string]interface{}{
 				"code": map[string]interface{}{"type": "string",
-					"description": "要执行的 Python/IPython 代码（最后一条表达式自动求值；可用 %magic 与 !cmd）"},
+					"description": "要执行的 Python/IPython 代码"},
 				"timeout_seconds": map[string]interface{}{"type": "number",
 					"description": fmt.Sprintf("超时秒数（默认 %d，上限 %d）", defSec, maxSec)},
 			},

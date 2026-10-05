@@ -18,6 +18,24 @@
 - **交互输入**：`input()` / `getpass()` 被接管为快速失败（抛 `InputUnavailable`），避免工具挂死（实测从 23.8s 降到 0.64s）。
 - **图形与富输出**：`matplotlib` 强制 inline 后端（`module://matplotlib_inline.backend_inline`，仅 `configure_inline_support` 不够），`plt.show()` 出图自动落盘；`display()` 通过实例级 patch `publish` 捕获（IPython 9 无 `publish_display_data`），回显为 `display[N]`；`image/png|jpeg|gif|webp`、`application/pdf` 落盘到 `<dataDir>/ipython-output/`。
 
+### perf(tools): 精简 ipython 工具描述（−63 token/轮）
+
+按「**写差异，不写常识**」重写 `buildIPythonSpec` 的描述：模型的 Python 先验已覆盖用法，
+提示词只需交代本实例偏离标准行为之处。
+
+- **删**用法说明与推销语：`%magic（如 %timeit）`、`!cmd 执行 shell`、`In/Out 历史与 DataFrame 富展示`、
+  `适合数据处理/可视化/科学计算/AI-ML`、以及多余的 `真` 字（零信息修辞）。
+- **留/改**五条猜不到或会猜错的契约：状态跨调用保留（`常驻进程`——正向陈述优于
+  `不是每次新建` 这类双重否定）、
+  超时双限（取 `DefaultSec()/MaxSec()`，仍不写死）、`超时先中断（变量不丢）· 无法中断时重启（丢变量）`、
+  图片/PDF 落盘给绝对路径、`无交互输入：input() / getpass 会立刻报错，请把值直接写进代码`
+  （先验有害，必须显式否定 + **给明确替代动作**，不能只陈述症状）。
+- **留**路由句（原 `不适合 grep/sed 这类纯文本处理，那用 bash。` → 精简为 `grep/sed 纯文本处理，用 bash。`）。
+- 参数 `code` 的描述同步精简（`…（最后一条表达式自动求值；可用 %magic 与 !cmd）` 删除）。
+- 实测（配置中的线上后端，同一 system/user 只换 tools）：ipython 段 **250 → 184 token**（−66，26%），
+  整请求 **2727 → 2661**。每条消息都付，200 轮会话省约 1.3 万 token。
+- 代码注释里固化该取材铁律，防止后人重新把推销文案加回去。
+
 ### fix(tools): 修复与 ipython 相关的三个缺陷
 
 - **会话隔离未接线**：`SetSessionKey` 此前全仓无生产调用 → `POST /reset` 现在会重置 ipython 会话（端到端验证：`/reset` 后读变量得 `NameError`）。
