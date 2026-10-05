@@ -1068,6 +1068,7 @@ const CFG_SCHEMA = [
     { key: "fg_timeout_ms", label: "fg_timeout_ms：前台执行超时（毫秒，超时转后台）", type: "number" },
     { key: "result_limit", label: "result_limit：工具结果回填上限（字符，超出截断+全文落带时间戳文件）", type: "number" },
     { key: "timeout_ms", label: "timeout_ms：命令总时长上限（毫秒，超时 SIGKILL 整个命令进程组；转后台不重置此计时器，长驻服务须 setsid+重定向脱离）", type: "number" },
+    { key: "ipython_python", label: "ipython_python：ipython 元工具（持久内核，变量跨调用保留）。留空 = 不启用；auto = 探测第一个装了 IPython 的解释器；或填解释器绝对路径（该解释器需 pip install ipython）", type: "text" },
   ]},
   { section: "doom", title: "死循环保护", fields: [
     { key: "warn_after", label: "warn_after：连续 N 次相同调用后警告（≥2）", type: "number" },

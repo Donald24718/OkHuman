@@ -1,8 +1,9 @@
 # OkHuman
 
 **一个进程 = 一个 agent。** Go 单仓实现的个人 agent 运行时：每个实例是一个独立进程，
-自带系统提示词、消息队列、上下文管理、工具循环和 WebUI；agent 只有一个元工具
-`bash`，一切能力（浏览器、QQ、语音、定时、素材注入……）都以**解耦插件**的形式挂在旁边，
+自带系统提示词、消息队列、上下文管理、工具循环和 WebUI。agent 的核心元工具是 `bash`
+（一切外部操作都靠它）；另有**可选**的第二个元工具 `ipython`（见文末），用于数据分析类任务。
+其余能力（浏览器、QQ、语音、定时、素材注入……）都以**解耦插件**的形式挂在旁边，
 通过 HTTP 接口交互——主程序对插件零感知。
 
 ## 快速开始
@@ -52,6 +53,85 @@ open http://127.0.0.1:8451/
 `config/user.json` < 环境变量（`OKHUMAN_PORT` / `OKHUMAN_LLM_BASE_URL` /
 `OKHUMAN_LLM_MODEL` / `OKHUMAN_DATA_DIR`）。所有路径相对**可执行文件所在目录**解析，
 仓库 clone 到哪都能跑，无需改任何绝对路径。
+
+### 可选元工具：ipython
+
+默认关闭。启用后模型多一个持久 IPython 内核（变量跨调用保留、`%magic`、`!cmd`、
+DataFrame 富展示），适合数据处理 / 可视化 / 科学计算——这些用 bash 拼脚本很别扭。
+
+```bash
+pip install ipython          # 只需这一句，不需要 ipykernel / pyzmq
+```
+
+装到**你打算用的那个解释器**里；然后在 `config/user.json` 指定它：
+
+```json
+{ "tools": { "ipython_python": "C:/Users/me/AppData/Local/Programs/Python/Python311/python.exe" } }
+```
+
+- `""`（默认）：不注册该工具，工具表与关闭时逐字一致。
+- `"auto"`：按 `python3` → `python` 探测第一个装了 IPython 的解释器。
+  **注意**：PATH 上第一个解释器若没装 IPython，`auto` 就静默不启用（只会在启动日志
+  里留一行告警），此时必须写**绝对路径**。
+- 具体路径：直接用该解释器（正斜杠 / 反斜杠都行）。
+
+重启后看启动日志确认：出现 `ipython 工具已启用（<解释器>）` 才算真的注册成功。
+
+**已在跑的实例可以热更新**，不必重启（配置同样会落盘 `user.json`）：
+
+```bash
+curl -X POST http://127.0.0.1:8451/config -H 'Content-Type: application/json' \
+  -d '{"patch":{"tools":{"ipython_python":"C:/Users/me/.../python.exe"}}}'
+```
+
+一个易踩的坑：body 必须套一层 `"patch"`，直接发 `{"tools":{...}}` 会被拒。
+
+**WebUI 也能改**（2026-10-05 起）：配置页「工具」段有 `ipython_python` 输入框，
+保存即时生效，不用重启。结果会列在该页下方——成功是 `tools:ipython 已启用（<解释器>）`，
+失败是 `tools:ipython 未启用（<原因>）`，不会静默。
+
+**多实例要分两种情形看**（别混为一谈）：
+
+- **同一棵代码树起多个进程**：**共享同一份 `config/user.json`**，配一次全部生效；
+  只有工作区不同——数据目录按端口区分（`$HOME/.okhuman-<port>`），端口冲突时
+  自动 +1（`main.go:96`）。
+- **多棵代码树**（AGENTS.md 的生产 / 副本 / 救生艇）：各有自己的 `config/user.json`，
+  **要逐个开启**，在一棵树开启不影响其它树。
+
+图形与富展示（2026-10-05 实测）：
+
+- `plt.show()` 与「`fig` 作最后一条表达式」都会产出 **image/png**（后端已强制为
+  无头 inline，不需要 `%matplotlib inline`——那个魔术在这类 shell 里会抛
+  `NotImplementedError`）。
+- 图片 / PDF / SVG **自动落盘**到 `<数据目录>/ipython-output/`，返回值里给出
+  绝对路径与大小；模型可用 bash 读，或交给素材类插件真正"看见"这张图。
+- `display(HTML(...))` 的富内容会被捕获并在返回值里标成 `display[N]`。
+  （旧行为是退化成 `<IPython.core.display.HTML object>` 一行 repr。）
+
+三条使用边界（2026-10-05 实测确认）：
+
+- **没有交互输入**：`input()` / `%debug` / `getpass` 会立刻报 `InputUnavailable`
+  ——stdin 已被宿主协议占用，与其挂死到超时不如快速失败。需要人给的值请直接
+  写进代码，或在回复里向用户提问。
+- **变量不跨会话**：变量在同一个会话内跨调用保留；`/reset` 重建会话时会连带
+  清掉内核，新会话从干净状态开始（否则模型以为从零开始、实际旧变量还在）。
+- **不是 Jupyter 内核**：没有 wire protocol / comm / ipywidgets，JupyterLab、
+  VSCode、nbclient 都连不上它。要的是"IPython 的语言能力"，不是前端协议。
+
+单次执行默认 60 秒、上限同 `tools.timeout_ms`。超时先看能否中断（成功则**内核保留、
+变量不丢**），中断不了才重启内核（变量丢失，会在返回值里说明）。
+
+> 为什么不用 Jupyter/ZMQ：Windows 上 ipykernel 拒收 `interrupt_request` 却仍回
+> `status:ok`（静默假成功），导致"超时后变量保留"在那条路线上做不到。
+
+配置细节见 **`docs/ipython-配置参考.md`**（三份配置文件的分工、`auto` 探测的
+真实顺序与超时、热更新的三条硬约束、**不存在的配置项**、排错清单）。
+
+设计依据与实测数据（三篇，按阅读顺序）：
+
+- `docs/ipython-方案实证评审.md` — 对最初 Jupyter/ZMQ 方案的逐条实测否决。
+- `docs/ipython-实施方案决策.md` — 改走 pipe 路线的选型理由与取舍。
+- `docs/ipython-最优解-级联中断实证.md` — 跨平台中断矩阵与三级级联的双平台实测数据。
 
 ## 插件（plugins/）
 

@@ -1,4 +1,4 @@
-# internal/tools — 唯一元工具 `bash`
+# internal/tools — 元工具 `bash`（+ 可选 `ipython`）
 
 > 一个进程 = 一个 agent，而 agent 的**一切外部操作**（命令执行、文件读写改、搜索、
 > 抓被截断的 log 全文）都通过这一个工具完成。没有第二个工具。
@@ -16,7 +16,7 @@
 | 本包负责 | 本包不负责 |
 |---|---|
 | 生成工具表（`Specs()`），注入 LLM 请求 | 解析 LLM 返回的 tool_call（在 `internal/agent`） |
-| 执行 `bash` 工具（`ExecuteTool`） | 前台/后台赛跑与轮内搭车（在 `internal/agent`） |
+| 执行 `bash` 工具（`ExecuteTool`）与可选的 `ipython` | 前台/后台赛跑与轮内搭车（在 `internal/agent`） |
 | 超时、杀整组、输出封顶 | 超长结果的 log 落盘与截断（在 `internal/agent.writeToolLog`） |
 | 配置热更新（`Configure`） | 配置解析（在 `internal/config`） |
 
@@ -26,7 +26,10 @@
 |---|---|
 | `Configure(fgMS, timeoutMS int)` | 设超时并重建工具表；启动时一次，`tools` 段热更新时再调 |
 | `Specs() []types.ToolSpec` | 取当前工具表（注入 LLM） |
-| `ExecuteTool(name, args)` | 执行工具，目前只认 `bash` |
+| `ExecuteTool(name, args)` | 分发工具：`bash` 恒在；`ipython` 仅在 `ConfigureIPython` 启用后可用 |
+| `ConfigureIPython(python string)` | 启用/禁用 ipython 并重建工具表；`""` = 不注册（工具表与未接入时逐字一致） |
+| `ResetIPythonSession(key string)` | 新会话边界（`/reset`）调用：作废旧会话内核，否则变量会跨会话污染 |
+| `SetIPythonArtifactDir(dir string)` | ipython 图片/PDF 的落盘根目录（`<dir>/ipython-output`） |
 | `ToolFailPrefix` | `"工具执行失败: "`，agent 与后台据此判定成败 |
 
 ---

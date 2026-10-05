@@ -15,6 +15,8 @@ package tools
 
 import (
 	"fmt"
+
+	"okhuman/internal/tools/ipython"
 )
 
 // ToolFailPrefix 工具执行失败结果的统一前缀（agent 与后台判定成功/失败用）
@@ -34,6 +36,10 @@ func ExecuteTool(name string, args map[string]interface{}) (string, error) {
 	switch name {
 	case "bash":
 		return toolBash(args) // 参数错误 → error，由 agent 并入 ToolFailPrefix 字符串（与 TS throw→catch 等价）
+	case "ipython":
+		// 会话隔离：当前会话的内核隔离键由 ipython.SetSessionKey 设置。
+		// 未设置时整个进程共用一个内核（OkHuman「一进程 = 一 agent」的默认形态）。
+		return ipython.Exec(args)
 	default:
 		// %q 转义：name 来自 LLM 的 tool_calls[].function.name（模型可控），
 		// 可能含换行/ANSI 等，直接 %s 会污染日志与 LLM 上下文。

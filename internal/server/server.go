@@ -534,7 +534,9 @@ func applyConfigPatch(a *AgentState, patch map[string]interface{}) PatchResult {
 		applied = append(applied, "context（压缩参数，即时生效）")
 	}
 	if has("tools") {
-		applied = append(applied, "tools（前台超时/命令总时长上限/结果上限，下条命令起生效）")
+		// 不逐项列举：枚举会随新增键过时（ipython_python 就是后加的）。
+		// ipython 有独立的状态条目（见下），这里只作段级提示。
+		applied = append(applied, "tools（工具参数，下条命令起生效）")
 	}
 	if has("doom") {
 		applied = append(applied, "doom（死循环告警阈值，下轮运行生效）")
@@ -565,6 +567,20 @@ func applyConfigPatch(a *AgentState, patch map[string]interface{}) PatchResult {
 	}
 	if has("tools") { // 工具超时热更新（2026-10-02）：重建工具表 + 新上限，下条命令生效
 		tools.Configure(nc.Tools.FgTimeoutMS, nc.Tools.TimeoutMS)
+		// ipython 的启用状态与上界随 tools 段一起热更新（同段但不同 key，
+		// 必须一起处理，否则改了 ipython_python 却不生效）。
+		if err := tools.ConfigureIPython(nc.Tools.IPythonPython); err != nil {
+			applied = append(applied, "tools:ipython 未启用（"+err.Error()+"）")
+		} else if old.Tools.IPythonPython != nc.Tools.IPythonPython {
+			// 只有该键真的变了才报状态：否则改个超时也会刷一条 ipython 消息。
+			// 启用的成功反馈此前缺失——界面只显示段级文案，用户无法确认到底
+			// 启没启用（填错路径有报错，但成功时静默）。
+			if tools.IPythonEnabled() {
+				applied = append(applied, "tools:ipython 已启用（"+tools.PythonPathForLog()+"）")
+			} else {
+				applied = append(applied, "tools:ipython 已停用")
+			}
+		}
 	}
 	// 自我生命感知输入随配置热更新（llm base_url / server 段变化）
 	a.CM().SetSelfInfo(ctxmgr.SelfInfo{Port: nc.Server.Port, DataDir: nc.Data.Dir, LLMBaseURL: nc.LLM.BaseURL})
@@ -1276,6 +1292,10 @@ func (ap *App) handleReset(w http.ResponseWriter, r *http.Request) {
 		a.DoomLog = nil
 		a.logMu.Unlock()
 		a.BG().Clear() // 未完成后台任务随会话清除（旧编排器随后整体废弃）
+		// ipython 内核随会话清除（2026-10-05）：变量跨调用保留是它的核心卖点，
+		// 但**跨会话**保留就是污染——模型 reset 后以为从零开始，实际 x/df 还在。
+		// 换隔离键即可，下次调用会拿到一个干净内核。
+		tools.ResetIPythonSession(fmt.Sprintf("s%d", a.SessionNo.Load()))
 		if res := ap.resolver.Load(); res != nil {
 			res.ClearCache("")
 		}

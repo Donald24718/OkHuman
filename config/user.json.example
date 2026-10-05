@@ -16,10 +16,12 @@
     "chars_per_token": 1.5
   },
   "tools": {
+    "_comment": "ipython_python 启用 ipython 元工具：留空 = 不注册该工具；auto = 自动探测第一个装了 IPython 的解释器；或填解释器绝对路径。依赖只需 pip install ipython（不需要 ipykernel / pyzmq）。",
     "fg_timeout_ms": 30000,
     "result_limit": 50000,
     "timeout_ms": 600000,
-    "max_tool_rounds": 200
+    "max_tool_rounds": 200,
+    "ipython_python": ""
   },
   "doom": { "warn_after": 3 }
 }

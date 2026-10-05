@@ -20,7 +20,11 @@ func TestExecuteToolUnknownNameEscaped(t *testing.T) {
 		{"换行", "bash\necho injected", `"bash\necho injected"`},
 		{"ANSI", "bash\x1b[31mred", `"bash\x1b[31mred"`},
 		{"制表符", "bash\ttab", `"bash\ttab"`},
-		{"普通", "ipython", `"ipython"`},
+		// "普通" 一条曾填 "ipython"——那时它还不是工具。2026-10-05 它成为
+		// 第二个元工具后该样例不再走 default 分支。**教训**：这里的样例名
+		// 不能用真实世界可能成为工具名的词（本文件自己的原则：switch 是
+		// 可扩展点，硬编码工具集合会随新增工具过时）。改用明显的伪名。
+		{"普通", "__never_registered__", `"__never_registered__"`},
 		{"空", "", `""`},
 	}
 	for _, c := range cases {

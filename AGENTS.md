@@ -87,6 +87,7 @@
 多 agent = 多个独立端口的进程。插件与技能**设计为独立仓库**（`plugins/RULE.md` 为唯一规范），当前 `plugins/` 下的各插件是主仓子目录（各自独立的 git 仓是规范目标）。
 
 **单一元工具**：`bash`——一切外部操作（命令执行、文件读写、搜索、抓截断日志）都靠它。
+另有**可选**的第二个元工具 `ipython`（默认不注册，见 README「可选元工具：ipython」）。
 
 ---
 
@@ -107,6 +108,12 @@ OkHuman/                     # 主程序仓（唯一 git 仓）
 
 **布局规范以 `plugins/RULE.md` 为唯一权威**，本文件不重复细节。
 
+### 元工具落点（`internal/tools/`）
+
+新增元工具的**三处落点**：`<工具名>.go`（实现）+ `tools.go` 的 `ExecuteTool` switch（分发）
++ `config.go` 的 `buildTools`（工具规格）。第二个元工具 `ipython` 住在
+`internal/tools/ipython/`（自带 `launcher.py`，用 `go:embed` 嵌入 → 仍可单二进制分发）。
+
 ---
 
 ## 关键默认值（验证过）
@@ -122,6 +129,8 @@ OkHuman/                     # 主程序仓（唯一 git 仓）
 | 工具轮次上限 | 200（0/负 → 200） | config/default.json（`tools.max_tool_rounds`） |
 | doom 检测 | 连续 3 次相同调用 | config/default.json |
 | Result limit | Default()=10000 / default.json=50000 / user.json=50000 | config/default.json, config/user.json |
+| ipython 解释器 | `""`（不启用该工具） | config/default.json（`tools.ipython_python`） |
+| ipython 单次超时 | 默认 60 s，上限同 `tools.timeout_ms` | internal/tools/config.go（`DefaultIPythonMS`） |
 
 配置优先级：**内置默认值 < config/default.json < config/user.json < 环境变量**（`OKHUMAN_PORT` / `OKHUMAN_LLM_BASE_URL` / `OKHUMAN_LLM_MODEL` / `OKHUMAN_DATA_DIR` / `OKHUMAN_FAKE`）。
 
@@ -206,8 +215,51 @@ WebUI 配置页的保存会触发 `POST /config`，patch 深合并进 `config/us
 > 也应全绿 —— 二者都跑通才算完整验收。Windows 端到端需机器上有可用 bash
 > （Git for Windows 或 WSL）。详见 `internal/tools/README.md` §6。
 
-- `go build ./...` 成功，无 vet 错误（三平台）
+- `go build ./...` 成功，无 vet 错误（三平台；本项目**不需要 gcc/cgo**，`CGO_ENABLED=0` 即可）
 - `go test ./...` 全部通过（Linux 为准；Windows 亦应全绿）
 - 主程序启动后在 `http://127.0.0.1:<port>/` 看到 WebUI
 - scout 索引服务（`:8480`）可响应 `/search` 和 `/reindex`
 - 插件/skill 的 `meta.json` 含非空 `summary` 字段
+
+### ipython 元工具（可选）的额外验收
+
+工具默认关闭，只有显式配置 `tools.ipython_python` 才注册。验收两点，缺一不可：
+
+1. **不启用时不得有影响**：工具表应仅含 `bash`，描述文本与未接入时逐字相同
+   （守护测试 `TestIPythonAbsentByDefault`）。
+2. **启用后真能跑**：本机验收需指定解释器，否则集成测试自动 Skip。
+
+```bash
+pip install ipython            # 只需这一句
+OKHUMAN_IPYTHON_PYTHON=$(command -v python3) go test ./internal/tools/... -count=1 -v
+```
+
+集成测试覆盖：变量跨调用保留、`%magic`、rich display 多 MIME、`Out` 历史、
+用户异常≠宿主中断、**超时软中断后变量保留**、`os._exit` 暴毙后自动重建。
+其中「超时软中断」在 Windows 与 Linux 走**不同的级联级别**均属正常
+（Windows stage 1 命中约 3.8s；Linux 升级到 stage 2 约 4.7s）。
+
+配置面（三份文件分工 / `auto` 探测顺序 / 热更新约束 / 不存在的配置项 / 排错）
+见 `docs/ipython-配置参考.md`。
+
+设计依据与双平台实测数据见 `docs/ipython-方案实证评审.md`（为何否决原 Jupyter/ZMQ
+方案）、`docs/ipython-实施方案决策.md`（pipe 路线选型）、
+`docs/ipython-最优解-级联中断实证.md`（级联中断实证）。
+
+**运行时排错**：若模型说"没有这个工具"，先看 `GET /config` 的
+`effective.tools.ipython_python` 是否非空；改配置走 `POST /config`
+（`{"patch":{"tools":{...}}}`）可热更新，无需重启，成功时启动日志会打印
+`ipython 工具已启用（<解释器>）`。注意 `auto` 只按 `python3`→`python` 的顺序探测，
+若 PATH 上第一个解释器没装 IPython 就会静默不启用——此时要写**绝对路径**。
+
+另外两条容易白费功夫的：**WebUI 配置页没有该字段**（改不了，只能改 `user.json`
+或调 `POST /config`）；**多实例逐个生效**——每棵树各有自己的 `config/user.json`，
+在生产树开启不会影响副本 / 救生艇。
+
+**新会话边界**：`/reset` 必须调用 `tools.ResetIPythonSession`（→ `ipython.ResetSession`）
+换隔离键并作废旧内核，否则旧会话变量会活着进入新会话（2026-10-05 修复的接线缺失）。
+守护测试：`TestResetSessionSwitchesKey`（单元）+ `TestIntegrationResetSessionClearsState`（集成）。
+
+**交互输入不可用**：`launcher.py` 把 `builtins.input` / `getpass` 换成抛
+`InputUnavailable`——stdin 是宿主协议通道，不接管就会挂死到超时（实测挂 23.8s）。
+守护测试：`TestIntegrationInputFailsFast`。
