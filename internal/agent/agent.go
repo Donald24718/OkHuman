@@ -26,6 +26,8 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,11 +47,20 @@ import (
 )
 
 // RunOptions 一轮 run 的参数
+//
+// 数值字段在 run 入口统一归一化（见 normalizeRunOptions，那里逐项论证了
+// "为什么这个取值非法"以及"哪些项刻意不归一化"）：
+// ResultLimit / FgTimeoutMS 非正 → 取默认值。
+//
+// DoomWarnAfter 与 DataDir 刻意【不】归一化：0/1 与空串都是合法的用户意图
+// （关闭检测 / 无处落盘），安全性由 isSameRunLocked 与 writeToolLogOK 就地保证。
 type RunOptions struct {
-	// 落盘根目录：截断工具结果写 <dataDir>/tool-results/<时间戳>.log
+	// 落盘根目录：截断工具结果写 <dataDir>/tool-results/<时间戳>.log。
+	// 空 = 不落盘（截断提示会如实告知"全文不可找回"，不会给模型假路径）。
 	DataDir string
 	// 工具结果回填上限（字符，可配置，默认 50000）：超出截断 + 全文落文件
-	ResultLimit   int
+	ResultLimit int
+	// 连续多少次完全相同调用触发警告。< 2 = 关闭死循环检测（见 isSameRunLocked）。
 	DoomWarnAfter int
 	// 前台执行超时（毫秒）：超时不取消，转后台 + 双向通知（§7.3）
 	FgTimeoutMS int
@@ -60,8 +71,13 @@ type RunOptions struct {
 	MaxToolRounds int
 	// 轮内搭车（2026-09-14 统一）：工具循环中每次 LLM 调用前调用，取走运行期间
 	// 入队的全部消息——用户追加消息与已 settle 后台任务的通知（同一消息队列、
-	// 同一 splice 逻辑、取走即消费；纯追加，不加 LLM 调用）
-	TakePendingUsers func() []string
+	// 同一 splice 逻辑、取走即消费；纯追加，不加 LLM 调用）。
+	//
+	// 2026-10-06 审查修：早先这里返回 []string，agent 靠
+	// strings.HasPrefix(m, bgNoticePrefix) 区分"系统通知"与"用户追加"——
+	// 用户消息只要以那句中文开头就会被误判成系统通知（不加【用户追加】前缀）。
+	// 类型判别不该靠内容前缀，现改为结构化：System 字段由入队方给出。
+	TakePendingUsers func() []PendingMessage
 	// 工具转后台时回调（由 server.runOpt 实现：注册任务 + 挂 settle 回调；
 	// settle 时通知自动入消息队列，2026-09-14）
 	OnBackgroundStart func(types.BackgroundStartArgs)
@@ -73,6 +89,16 @@ type RunOptions struct {
 	Messages int
 	// 描述性标签（事件广播展示用，如 "3 条合并 / 1234 字符"）
 	Label *string
+}
+
+// PendingMessage 轮内搭车的一条待注入消息（2026-10-06 结构化，取代前缀识别）
+type PendingMessage struct {
+	// Text 消息正文（后台通知已由 FormatBackgroundNotice 格式化好）
+	Text string
+	// System=true：后台任务 settle 通知等系统消息（原样注入，不加【用户追加】）；
+	// false：用户追加消息（加【用户追加】前缀，模型明确知道是追加指令而非新任务，
+	// 2026-09-09）
+	System bool
 }
 
 // TokenTotals 一轮 run 的 token 累计（done 事件 usage 字段）
@@ -101,7 +127,36 @@ const (
 )
 
 // defaultMaxToolRounds 未显式配置时的工具轮次上限（见 RunOptions.MaxToolRounds）
-const defaultMaxToolRounds = 100
+//
+// 2026-10-06 三轮反思：这里原本是 100，而 `config/default.json` 的
+// tools.max_tool_rounds 与 AGENTS.md 关键默认值表【都写 200】——文档说"0/负 → 200"，
+// 代码却给 100，是句假话。兜底值必须与"配置缺失时的期望"一致，故改 200。
+const defaultMaxToolRounds = 200
+
+// maxCallRecs lastCalls 滑窗的硬上限（2026-10-06 三轮反思，四轮修正数值）。
+//
+// 目的只是防【荒谬配置】下的无界增长，绝不是用来省内存——单条记录的内存
+// 已由 stableKey 的定长摘要解决（见其注释），与参数大小无关。
+//
+// ⚠️ 这个上限有一条硬约束：**必须远大于任何合理的 doom.warn_after**。
+// isSameRunLocked(n) 需要尾部 n 条才能判定，若窗口小于 n，则
+// `len(lastCalls) < n` 恒成立 → 检测【永久失效】。
+// 三轮时这里设成 64，直接导致 doom.warn_after=100/200 的连续重复调用
+// 一次都检测不到（实测确认）——用户把阈值调大，反而彻底关掉了检测，
+// 与他的意图完全相反。故放宽到 4096：内存上仍只有几百 KB，
+// 而 n 超过 4095 的配置本身既荒谬也不可能触发（轮次上限 MaxToolRounds=200 先到）。
+const maxCallRecs = 4096
+
+// 入口归一化默认值（2026-10-06 审查修；同年二次反思修正范围）：RunOptions 的
+// 数值来自外部配置（user.json / POST /config 的 tools.result_limit、
+// tools.fg_timeout_ms），都可以被设成 0 或负数，而旧实现把它们原样带进主循环：
+//   - ResultLimit <= 0 → 每个工具结果都判定"超长"被截到接近空，模型瞎掉；
+//   - FgTimeoutMS <= 0 → 定时器立即到期，与 execDone 同时就绪时 select 随机分支。
+//
+// doom.warn_after（DoomWarnAfter）也曾在此列（<=0 会让 isSameRunLocked panic），
+// 但二次反思后改为【不归一化】：用户写 0/1 的意图就是"不检测"，归一化成 3 等于
+// 偷偷打开一个被关掉的功能。安全性改由 isSameRunLocked 的 n<2 就地保证。
+const defaultResultLimit = 50000
 
 // stoppedPlaceholder /stop 中断且尚无增量流出时落会话的文本；Run 的返回值
 // 与之同源（2026-10-05 修：旧实现会话里存占位、返回空串，POST /chat 的 reply
@@ -112,6 +167,11 @@ const stoppedPlaceholder = "（已中断：用户手动停止）"
 // （2026-10-05：旧实现原样返回空串 → 前端出现空气泡）
 const strongStopNoAnswer = "（本轮已因重复工具调用被强制停止，模型未给出最终回答。请参考上方工具结果。）"
 
+// noContentReply 模型既没给正文也没给工具调用时的兜底回复（2026-10-06 审查修）：
+// 旧实现原样返回空串 → HTTP /chat 的 reply 为空、前端出一个空气泡。与
+// strongStopNoAnswer 同理：任何返回给前端的 reply 都不该是空串。
+const noContentReply = "（本轮模型未输出任何正文或工具调用，无法生成回复。请稍后重试或换个说法。）"
+
 // AgentStoppedError 用户 /stop 中断（2026-08-29）：runUserMessage 顶层捕获后收尾
 type AgentStoppedError struct {
 	Partial PartialContent
@@ -120,10 +180,15 @@ type AgentStoppedError struct {
 func (e *AgentStoppedError) Error() string { return "agent stopped by user" }
 
 // Agent 单实例 agent（运行锁在 server 层持有；同 agent 内 run 串行）
+//
+// 系统提示词的唯一持有者是 cm（ctxmgr.Manager）：组装请求时由它 prepend。
+// 2026-10-06 审查修：本结构体曾有一个只写不读的 systemPrompt 字段——
+// SetSystemPrompt 只改它、llmCall 从不读它，热更新实际全靠 server 额外调
+// cm.SetSystemPrompt 才生效。留着这种"看起来是真相源、其实没人读"的字段
+// 就是下一次热更新失效的伏笔，已删除；SetSystemPrompt 直接委托给 cm。
 type Agent struct {
 	mu            sync.Mutex
 	llm           llm.LlmClient
-	systemPrompt  string
 	cm            *ctxmgr.Manager
 	injectDir     string // 注入侧车目录（4xx 降级成功回写用，2026-09-19；""=不回写）
 	lastCalls     []callRec
@@ -138,9 +203,9 @@ type callRec struct {
 	Key  string
 }
 
-// New 新建 agent
-func New(client llm.LlmClient, systemPrompt string, cm *ctxmgr.Manager, injectDir string) *Agent {
-	return &Agent{llm: client, systemPrompt: systemPrompt, cm: cm, injectDir: injectDir}
+// New 新建 agent（系统提示词由 cm 持有，创建时已注入）
+func New(client llm.LlmClient, cm *ctxmgr.Manager, injectDir string) *Agent {
+	return &Agent{llm: client, cm: cm, injectDir: injectDir}
 }
 
 // SetLLM 运行时热更新 LLM 客户端（WebUI 配置页改 llm 段后）
@@ -150,11 +215,11 @@ func (a *Agent) SetLLM(client llm.LlmClient) {
 	a.mu.Unlock()
 }
 
-// SetSystemPrompt 运行时热更新系统提示词（WebUI 提示词页重载后）
+// SetSystemPrompt 运行时热更新系统提示词（WebUI 提示词页重载后）。
+// 权威源是 cm（组装请求时由它 prepend），这里直接委托过去——agent 自身不再
+// 持有系统提示词副本（2026-10-06：删掉只写不读的 systemPrompt 字段）。
 func (a *Agent) SetSystemPrompt(p string) {
-	a.mu.Lock()
-	a.systemPrompt = p
-	a.mu.Unlock()
+	a.cm.SetSystemPrompt(p)
 }
 
 // Stop /stop 入口：中断当前 LLM 输出（含 llama.cpp 侧生成）；工具执行完后的下一次 LLM 前强停
@@ -183,6 +248,7 @@ func (a *Agent) Run(ctx context.Context, userText string, opt RunOptions) (strin
 
 // runUserMessage 通用 run 内核：注入一条 user 消息 → LLM 迭代（工具循环）→ 最终文本
 func (a *Agent) runUserMessage(ctx context.Context, userText string, opt RunOptions) (string, error) {
+	opt = normalizeRunOptions(opt)
 	emit := opt.OnEvent
 	if emit == nil {
 		emit = func(types.AgentEvent) {}
@@ -237,8 +303,10 @@ func (a *Agent) runUserMessage(ctx context.Context, userText string, opt RunOpti
 	})
 
 	defer func() {
-		// 正常/中断/出错统一收尾（defer 保证恰好一次）
-		emit(types.AgentEvent{"type": "run_end"})
+		// 正常/中断/出错统一收尾（defer 保证恰好一次）。
+		// 顺序（2026-10-06 审查修）：**先拆监听、再取消 runCtx、最后才发 run_end**。
+		// 旧实现先发 run_end——此时压缩监听还挂着、压缩流可能还在跑，前端已认定
+		// 本轮结束却又收到本轮的 compress / compress_delta，轮次状态被打乱。
 		offCompress()
 		offCompressDelta()
 		a.cm.SetRunSignal(nil)
@@ -247,6 +315,7 @@ func (a *Agent) runUserMessage(ctx context.Context, userText string, opt RunOpti
 		a.mu.Unlock()
 		runCancel()
 		a.stopRequested.Store(false)
+		emit(types.AgentEvent{"type": "run_end"})
 	}()
 
 	// run 生命周期标记（2026-08-31 事件广播用）：前端据 run_start 建流式占位、
@@ -275,7 +344,7 @@ func (a *Agent) runUserMessage(ctx context.Context, userText string, opt RunOpti
 	}
 	// 异常截断（2026-09-15）：有 thinking 但无正文也无工具调用 → 不是"纯文本回复"：提示模型 + 重试一次
 	if isTruncated(resp) {
-		r2, err2 := a.retryTruncation(runCtx, emit, &totals)
+		r2, err2 := a.retryTruncation(runCtx, emit, &totals, resp)
 		if err2 != nil {
 			return a.finishRunError(err2, runCtx, emit, &totals)
 		}
@@ -290,6 +359,38 @@ func (a *Agent) runUserMessage(ctx context.Context, userText string, opt RunOpti
 	return a.runLoop(runCtx, resp, emit, &totals, opt)
 }
 
+// normalizeRunOptions run 入口的参数归一化（2026-10-06 审查修）：把外部配置
+// 可能给到的非正值兜成合法值，主循环不再需要到处防御。
+//
+// 逐项说明【为什么这个值是"非法"而不是"用户意图"】——归一化会把用户显式写的
+// 值改掉，所以每项都必须论证，不能笼统说"兜成合法值"：
+//   - ResultLimit：非正 → defaultResultLimit。0 意味着每条工具结果都被截成空
+//     字符串，任何下游都无从工作，没有任何合理意图会想要这个结果。
+//   - FgTimeoutMS：非正 → tools.DefaultFgTimeoutMS（与工具层同一口径、单一真相源，
+//     不在这里另写一个数字；否则两个默认值迟早漂移）。0 会让 time.NewTimer(0)
+//     立刻到期，与 execDone 同时就绪，select 随机二选一 → 同一条命令有时回填
+//     真实结果、有时转后台，行为不确定。想要"立即转后台"在实践中也没有价值
+//     （模型拿不到结果，只能等后台 settle 通知，更慢也更贵）。
+//
+// 【刻意不归一化】的两项，改了就会违背用户显式意图：
+//   - DoomWarnAfter：0/1 的语义是"不检测"（见 isSameRunLocked）。用户把
+//     doom.warn_after 写成 0 大概率是想关掉死循环检测——归一化成 3 等于偷偷
+//     打开一个用户关掉的功能。安全性由 isSameRunLocked 的 n<2 防御保证，
+//     不需要改写配置值。
+//   - DataDir：空意味着"没有可落盘的位置"，正确反应是【禁用落盘】而不是
+//     【退到某个别的目录】。曾经兜成 os.TempDir()，那只是换了个错误位置——
+//     临时目录会被系统清理，且与实例数据目录无关，模型照提示去 cat 会扑空。
+//     真正的处理在 writeToolLogOK（DataDir 空 → 不写文件、返回失败）。
+func normalizeRunOptions(opt RunOptions) RunOptions {
+	if opt.ResultLimit <= 0 {
+		opt.ResultLimit = defaultResultLimit
+	}
+	if opt.FgTimeoutMS <= 0 {
+		opt.FgTimeoutMS = tools.DefaultFgTimeoutMS
+	}
+	return opt
+}
+
 // isTruncated 异常截断判定（2026-09-15）：响应有 thinking 但无正文也无工具调用。
 //  服务端提前收笔（Q2 量化提前 stop token / MTP 投机解码异常）——OkHuman 请求不发
 //  max_tokens（纯协议层），客户端没有截断理由，流是干净结束的 HTTP 200。
@@ -302,8 +403,20 @@ func isTruncated(resp *types.Response) bool {
 
 // retryTruncation 异常截断处置：WebUI 事件 + 向模型注入提示 + 重试一次 llmCall。
 //  只重试一次（防死循环）；重试仍截断 → emit 放弃事件后原样返回。
-func (a *Agent) retryTruncation(ctx context.Context, emit func(types.AgentEvent), totals *TokenTotals) (*types.Response, error) {
+//
+// 2026-10-06 审查修（两处，都是"重试了但没重试对"）：
+//  1. 第一次的响应（只有思考、没有正文）必须落会话再提示。旧实现只注入一句
+//     "你上一条响应有思考内容…"，可上下文里根本没有那条 assistant 消息——
+//     对无状态 LLM 来说，这句话没有对象（它看不到自己"上一条"说了什么）；
+//     而且前端已经把这段思考显示给用户了，会话里却没有，历史也对不上；
+//  2. 重试前必须发 delta_reset。第一次的思考增量早已 emit 出去，不回滚的话
+//     前端会把"第一次的半截思考 + 第二次的正文"拼成一条脏内容（与 4xx 阶梯
+//     的 rollbackPartial 同一个道理）。
+func (a *Agent) retryTruncation(ctx context.Context, emit func(types.AgentEvent), totals *TokenTotals, first *types.Response) (*types.Response, error) {
 	emit(types.AgentEvent{"type": "trunc_warn", "detail": "有 thinking 但无正文也无工具调用 → 异常截断，提示模型重发"})
+	emit(types.AgentEvent{"type": "delta_reset"})
+	// 被判定截断的那次响应（正文为空、思考保留）——协议允许 assistant 正文为空串
+	a.cm.AddMessage(&types.RawEntry{Role: "assistant", Content: "", ReasoningContent: first.ReasoningContent})
 	a.cm.AddMessage(&types.RawEntry{Role: "user", Content: "（系统提示：你上一条响应有思考内容，但未输出正文或工具调用，判定为异常截断。请基于当前上下文重新输出完整正文或工具调用。）"})
 	resp, err := a.llmCall(ctx, emit, totals)
 	if err != nil {
@@ -350,8 +463,10 @@ func (a *Agent) finishStopped(partial PartialContent, emit func(types.AgentEvent
 	return body
 }
 
-// bgNoticePrefix 后台完成通知的固定开头——轮内搭车时据此区分"系统通知"与
-// 用户追加消息（不加【用户追加】前缀，2026-09-14）。
+// bgNoticePrefix 后台完成通知的固定开头（FormatBackgroundNotice 的唯一来源）。
+// 2026-10-06：它**不再**用于类型判别（早先轮内搭车靠 strings.HasPrefix 区分
+// "系统通知"与"用户追加"，用户消息以这句中文开头就会被误判）——类型由
+// PendingMessage.System 给出，这里只剩"文案前缀"一个职责。
 const bgNoticePrefix = "（系统通知：后台任务完成"
 
 // FormatBackgroundNotice 后台完成通知的格式化（settle 入队与轮内搭车共用，
@@ -366,7 +481,7 @@ func (a *Agent) FormatBackgroundNotice(task *types.PendingBackgroundTask, opt Ru
 		status = "已失败"
 	}
 	status = fmt.Sprintf("%s（耗时 %ss）", status, durSec)
-	head := fmt.Sprintf("（系统通知：后台任务完成——你此前调用 %s 时前台等待超时，已转入后台继续执行，现%s。结果如下：\n", task.ToolName, status)
+	head := fmt.Sprintf("%s——你此前调用 %s 时前台等待超时，已转入后台继续执行，现%s。结果如下：\n", bgNoticePrefix, task.ToolName, status)
 	if utf16Len(result) > opt.ResultLimit {
 		// 截断 + 全文落盘（失败时不给假路径，见 formatTruncatedWithHead）
 		return a.formatTruncatedWithHead(opt, result, opt.ResultLimit, head, "")
@@ -394,9 +509,26 @@ func (a *Agent) writeToolLog(opt RunOptions, full string) string {
 // writeToolLogOK writeToolLog 的显式成败版：成功 → (绝对路径, true)；
 // 失败 → (不含路径的说明, false)。调用方据此决定提示文案。
 func (a *Agent) writeToolLogOK(opt RunOptions, full string) (string, bool) {
+	// DataDir 空 = 没有可落盘的位置 → 禁用落盘，如实返回失败。
+	//
+	// 2026-10-06 二次反思：这里曾经先 Join 再 filepath.Abs，空 DataDir 会被
+	// Abs 解析成【进程当前工作目录】——于是工具日志真的写进了 cwd（跑测试时就是
+	// 源码目录 internal/agent/tool-results/）。"保证绝对路径"的契约满足了，
+	// 但落到的是一个完全错误、还会污染仓库的位置。缺位置就该说缺位置，
+	// 不该拿 cwd 或系统临时目录去填。
+	//
+	// 不依赖"调用方已跑过 normalizeRunOptions"：不变量要在被使用的地方强制。
+	if strings.TrimSpace(opt.DataDir) == "" {
+		return "[落盘失败：未配置数据目录]", false
+	}
 	dir := filepath.Join(opt.DataDir, "tool-results")
 	ts := time.Now().UTC().Format("2006-01-02_15-04-05")
 	path := filepath.Join(dir, fmt.Sprintf("tool-%s-%d.log", ts, toolLogSeq.Add(1)))
+	// 契约是"绝对路径"——DataDir 是相对路径时 filepath.Join 出来的也是相对路径，
+	// 而工具的工作目录未必等于进程 cwd，模型照提示去 cat 会扑空（2026-10-06 修）。
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
 	if err := os.MkdirAll(dir, 0o755); err == nil {
 		if err := os.WriteFile(path, []byte(full), 0o644); err == nil {
 			return path, true
@@ -424,6 +556,14 @@ func (a *Agent) formatTruncatedForModel(opt RunOptions, result string, limit int
 //   - head：截断区之前必须保留的前缀（如后台通知的状态行），参与预算；
 //   - tailExtra：截断提示之外必须追加的固定尾部（通常为空）。
 func (a *Agent) formatTruncatedWithHead(opt RunOptions, result string, limit int, head, tailExtra string) string {
+	// ResultLimit 就地防御（2026-10-06 三轮反思）：与 writeToolLogOK 对 DataDir 的
+	// 处理同理——本函数可以绕过 Run 入口被直接调用，limit<=0 会让 budget 直接归零，
+	// 正文被截成空（工具结果等于全丢，只留一句"已截断"）。不变量在被使用的地方强制。
+	// 与入口 normalizeRunOptions 是双保险：入口那份保证主循环的 `totalChars > limit`
+	// 判定正确，这份保证直调路径也安全。
+	if limit <= 0 {
+		limit = defaultResultLimit
+	}
 	total := utf16Len(result)
 	logPath, ok := a.writeToolLogOK(opt, result)
 	var tail string
@@ -467,7 +607,11 @@ func (a *Agent) llmCall(ctx context.Context, emit func(types.AgentEvent), totals
 	// 2026-10-05 修：cancel 必须在【每条】返回路径上被调用（原实现只在成功路径
 	// 清字段，stopped/非4xx/阶梯耗尽三条错误路径都漏了 cancel）。今天的上游 ctx
 	// 是 runCtx、轮末必然被 cancel，泄漏有界；一旦哪天挂到长生命周期 ctx 上就是
-	// 真泄漏。用 defer 彻底免掉这件事（注意：这两个 defer 靠 LIFO 顺序，先清字段）。
+	// 真泄漏。用 defer 彻底免掉这件事。
+	//
+	// 顺序（2026-10-06 注释修正）：这两个 defer 按 LIFO 执行——**先** callCancel()、
+	// **后** 清字段（旧注释写反了）。这个顺序才是对的：若先清字段，
+	// Stop() 可能在"字段已清、cancel 未调"的窗口里拿到 nil 而漏掉中断。
 	defer func() {
 		a.mu.Lock()
 		a.callCancel = nil
@@ -529,13 +673,17 @@ func (a *Agent) llmCall(ctx context.Context, emit func(types.AgentEvent), totals
 			case fbDemoteAll:
 				action = "全部附件降级文本提示"
 				messages, demoted = a.cm.ComposeWithDemotion(&ctxmgr.ComposeOptions{DemoteInjects: ctxmgr.DemoteAll})
+			case fbTruncate:
+				// 顺序不可颠倒（2026-10-06 审查修）：旧实现先 Compose 后
+				// ForceHardTruncate——截断只改 cm 内部状态，不会回溯改已经
+				// 组装出来的 messages 切片，于是这一级重试发的仍是那份被拒的
+				// 超长请求，几乎必然再 4xx，兜底形同虚设。必须先截断再组装。
+				a.cm.ForceHardTruncate()
+				messages, demoted = a.cm.ComposeWithDemotion(nil)
 			default:
 				messages, demoted = a.cm.ComposeWithDemotion(nil)
 			}
 			fmt.Printf("[llm] LLM 4xx（%s）→ %s重试\n", truncateStr(firstErr.Error(), 200), action)
-			if mode == fbTruncate {
-				a.cm.ForceHardTruncate()
-			}
 			rollbackPartial()
 			err2 := a.streamOnce(callCtx, client, messages, onDelta, &resp)
 			if resp != nil {
@@ -620,10 +768,18 @@ func (a *Agent) sessionHasInject() bool {
 
 // finishText 纯文本收尾：存 assistant 消息 + 发事件。流式下正文/思考已由 delta
 // 逐块发出，这里不再重发全量 text/thinking（避免 WebUI 重复渲染）。
+//
+// 2026-10-06：正文为空且无工具调用（异常截断重试后仍截断 / 模型直接给空响应）
+// → 落会话与返回值统一用 noContentReply 兜底，不给前端空气泡，也让"会话里存的
+// 文本"与"返回值"继续同源（同 finishStopped 的口径）。
 func (a *Agent) finishText(resp *types.Response, emit func(types.AgentEvent), totals *TokenTotals) (string, error) {
-	a.cm.AddMessage(&types.RawEntry{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent})
+	content := resp.Content
+	if strings.TrimSpace(content) == "" && len(resp.ToolCalls) == 0 {
+		content = noContentReply
+	}
+	a.cm.AddMessage(&types.RawEntry{Role: "assistant", Content: content, ReasoningContent: resp.ReasoningContent})
 	emit(types.AgentEvent{"type": "done", "usage": totals})
-	return resp.Content, nil
+	return content, nil
 }
 
 // maxToolRounds 本轮工具轮次上限（0/负 → defaultMaxToolRounds）
@@ -646,7 +802,11 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 	roundLimit := maxToolRounds(opt)
 	for round := 1; ; round++ {
 		if round > roundLimit {
-			// 触达轮次上限：不再执行工具，给模型一次收尾机会（与强停同一收尾方式）
+			// 触达轮次上限：不再执行工具，给模型一次收尾机会（与强停同一收尾方式）。
+			// 注：本条响应里未执行的 tool_calls 有意【不】存进会话——存了就必须为它们
+			// 补合成 tool 结果（否则 assistant.tool_calls 失配，严格端点直接 400），
+			// 而"已达上限"的合成结果只是噪音；不存则上下文是干净的：上一批工具调用
+			// 与其结果已完整配对，最后一条是收尾提示（2026-10-06 复审确认）。
 			limitMsg := fmt.Sprintf("（系统：本轮工具调用已达上限 %d 次，请停止调用工具，基于已有信息直接回答用户。）", roundLimit)
 			a.cm.AddMessage(&types.RawEntry{Role: "user", Content: limitMsg})
 			emit(types.AgentEvent{"type": "round_limit", "detail": fmt.Sprintf("工具调用轮次达上限 %d，收尾本轮", roundLimit)})
@@ -659,12 +819,18 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 		// 先存 assistant 消息（带 tool_calls，原样回传）
 		a.cm.AddMessage(&types.RawEntry{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent, ToolCalls: calls})
 
-		// 逐个执行（并行工具调用也按序回填，保持 tool 消息与 tool_calls 一一对应）
+		// 逐个【顺序】执行，按 tool_calls 顺序回填（保持 tool 消息与 tool_calls
+		// 一一对应）。2026-10-06 注释修正：旧注释写"并行工具调用也按序回填"，
+		// 读起来像并行执行——实际是一条响应里的多个 tool_call 排着队跑（只有
+		// 前台超时转后台的那个会继续在后台跑，与后续调用重叠）。保持顺序执行是
+		// 有意的：bash 共用一个工作目录、ipython 共用一个内核，并发调用会互相
+		// 踩（同一内核上的两段代码交错执行，语义不可控）。
 		// 死循环（§8）：连续 N 次完全相同 → 注入警告；警告后仍重复 → 强停。
 		// 警告/强停消息都在本批【全部】tool 结果之后插入——本批每个 tool_call
 		// 都必须有 tool 消息，否则严格校验的 LLM 端点会直接 400（2026-10-05 修）。
 		stopped := false
 		doomWarnPending := false
+		doomWarnName := "" // 触发警告的那个工具名（批末警告用），见下方说明
 		for ci, tc := range calls {
 			args := parseArgs(tc.Function.Arguments)
 			a.mu.Lock()
@@ -688,12 +854,29 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 				break
 			}
 			if sameRun && !warned {
-				doomWarnPending = true // 先执行，整批结束后再警告
+				// 先执行，整批结束后再警告。工具名必须在【触发这一刻】记下来：
+				// 旧实现在批末取 lastCalls 最后一条的名字，遇到 A,A,A,B 这种
+				// 批次会警告成"连续 3 次调用 B"——重复的是 A，B 只出现一次
+				// （2026-10-06 修）。
+				doomWarnPending = true
+				doomWarnName = tc.Function.Name
 			}
 
 			emit(types.AgentEvent{"type": "tool_call", "name": tc.Function.Name, "args": args, "call_id": tc.ID})
 			execDone := make(chan string, 1)
+			// 2026-10-06 修：StartedAt 必须在【启动工具之前】取——旧实现在
+			// 前台超时那一刻才取，后台任务的 DurationMs = settle - StartedAt
+			// 就永远少算一整段前台等待（FgTimeoutMS）。
+			startedAt := time.Now().UnixMilli()
 			go func() {
+				// 2026-10-06 修：工具实现 panic 会顺着 goroutine 打挂整个进程
+				// （Go 里未 recover 的 panic 是进程级致命错误）。这里收住并
+				// 转成"工具失败"文本——与 ExecuteTool 返回 error 走同一条路。
+				defer func() {
+					if rec := recover(); rec != nil {
+						execDone <- tools.ToolFailPrefix + fmt.Sprintf("工具内部 panic：%v", rec)
+					}
+				}()
 				r, err := tools.ExecuteTool(tc.Function.Name, args)
 				if err != nil {
 					execDone <- tools.ToolFailPrefix + err.Error()
@@ -723,7 +906,6 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 				emit(types.AgentEvent{"type": "tool_result", "name": tc.Function.Name, "call_id": tc.ID, "truncated": truncated, "total_chars": totalChars, "content": raw})
 			case <-fgTimer.C:
 				// 转后台（不取消）：立即回填通知，模型不必傻等
-				startedAt := time.Now().UnixMilli()
 				bgNotice := fgTimeoutNotice(opt.FgTimeoutMS)
 				a.cm.AddMessage(&types.RawEntry{Role: "tool", ToolCallID: &tc.ID, Content: bgNotice})
 				emit(types.AgentEvent{"type": "tool_result", "name": tc.Function.Name, "call_id": tc.ID, "truncated": false, "total_chars": 0, "backgrounded": true, "content": bgNotice})
@@ -743,27 +925,31 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 		// 轮内搭车（2026-09-14 统一）：本批工具结果之后、本次 LLM 调用之前，取走
 		// 运行期间入队的全部消息——用户追加消息与已 settle 后台任务的通知（同一
 		// 消息队列、同一逻辑），同车注入（纯追加：不加 LLM 调用、不加 KV 缓存代价
-		// ——已缓存前缀不变）。后台通知自带"（系统通知：…）"标记，不加【用户追加】
-		// 前缀；用户消息加前缀——模型明确知道是"追加指令"而非"新任务"（2026-09-09）。
+		// ——已缓存前缀不变）。系统通知（后台任务完成）原样注入；用户消息加
+		// 【用户追加】前缀——模型明确知道是"追加指令"而非"新任务"（2026-09-09）。
+		// 2026-10-06：System 标记由入队方给出（见 PendingMessage），不再靠文本前缀猜。
 		if opt.TakePendingUsers != nil {
 			for _, m := range opt.TakePendingUsers() {
-				if strings.HasPrefix(m, bgNoticePrefix) {
-					a.cm.AddMessage(&types.RawEntry{Role: "user", Content: m})
-				} else {
-					a.cm.AddMessage(&types.RawEntry{Role: "user", Content: "【用户追加】" + m})
+				text := m.Text
+				if !m.System {
+					text = "【用户追加】" + text
 				}
-				emit(types.AgentEvent{"type": "user_piggyback", "message": m})
+				a.cm.AddMessage(&types.RawEntry{Role: "user", Content: text})
+				emit(types.AgentEvent{"type": "user_piggyback", "message": m.Text, "system": m.System})
 			}
 		}
 
 		a.mu.Lock()
 		needWarn := !stopped && doomWarnPending
-		var warnName string
-		if needWarn && len(a.lastCalls) > 0 {
+		warnName := doomWarnName
+		if needWarn {
 			a.warned = true
-			warnName = a.lastCalls[len(a.lastCalls)-1].Name
 		}
-		sequenceBroken := !a.isSameRunLocked(opt.DoomWarnAfter)
+		// 连续序列是否已被打断（决定 warned 是否复位）。2026-10-06 修：只在
+		// 【本批没有刚发出警告】时才判定复位——旧实现在 A,A,A,B 这种批次里
+		// 先置 warned=true、转身又因尾部是 B 判定"序列已断"把它清掉，于是
+		// 模型只要每批末尾换个调用就永远停在警告档、永远不会被强停。
+		sequenceBroken := !needWarn && !a.isSameRunLocked(opt.DoomWarnAfter)
 		a.mu.Unlock()
 		if needWarn {
 			warn := fmt.Sprintf("（系统警告：你已连续 %d 次用完全相同的参数调用 %s。请改变策略：换工具、换参数，或基于已有信息直接回答。）", opt.DoomWarnAfter, warnName)
@@ -814,21 +1000,43 @@ func (a *Agent) tailCall(ctx context.Context, emit func(types.AgentEvent), total
 }
 
 // trimCallRecs lastCalls 滑窗（2026-10-05）：run 内每个工具调用都追加一条记录，
-// 而 callRec.Key 里存的是"工具名 + 参数的完整 JSON"——bash 的 command 动辄几 KB，
-// 长任务会无限堆积。§8 判定只看尾部 doomWarnAfter 条，因此保留 DoomWarnAfter+1
-// 条就够（多留一条用于判断"连续序列是否刚被打断"）。
+// §8 判定只看尾部 doomWarnAfter 条，因此保留 doomWarnAfter+1 条就够
+// （多留一条用于判断"连续序列是否刚被打断"）。
+//
+// 2026-10-06 三轮反思：keep 不再直接取 doomWarnAfter+1，而是夹到 [2, maxCallRecs]
+// ——旧实现在 n<=0 时直接 return 一条不裁，等于"关掉死循环检测"会顺带关掉裁剪。
+//
+// 2026-10-06 四轮修正：上限从 64 放宽到 4096。窗口绝不能小于 doomWarnAfter，
+// 否则 isSameRunLocked 永远凑不齐 n 条 → 检测永久失效（见 maxCallRecs 注释）。
 func trimCallRecs(rc *[]callRec, doomWarnAfter int) {
-	if doomWarnAfter <= 0 || len(*rc) <= doomWarnAfter+1 {
+	keep := doomWarnAfter + 1
+	if keep < 2 {
+		keep = 2
+	}
+	if keep > maxCallRecs {
+		keep = maxCallRecs
+	}
+	if len(*rc) <= keep {
 		return
 	}
-	keep := (*rc)[len(*rc)-(doomWarnAfter+1):]
-	*rc = append([]callRec(nil), keep...)
+	kept := (*rc)[len(*rc)-keep:]
+	*rc = append([]callRec(nil), kept...)
 }
 
-// isSameRunLocked §8：最近 doomWarnAfter 次调用是否完全相同（持锁调用；
-// 工具名+参数，稳定序列化比较）
+// isSameRunLocked §8：最近 n 次调用是否完全相同（持锁调用；工具名+参数，
+// 稳定序列化比较）
+//
+// n < 2 一律判"不是"，两个理由各自独立：
+//   - n <= 0：序列长度无意义（n=0 时 len-n == len → tail 是空切片，取 tail[0]
+//     必然 panic；负数则下标越界）。语义上等于"关闭检测"——用户显式把
+//     doom.warn_after 写成 0 就是想关掉它，不该被悄悄改成 3。
+//   - n == 1：单元素序列【恒等于自身】→ 恒 true → 第一次工具调用就会被警告
+//     "你已连续 1 次用完全相同的参数调用 X"。这是配置里完全合法的取值
+//     （warn_after: 1），却产出荒谬行为（2026-10-06 二次反思实测确认）。
+//
+// 防御放在这里而不是只靠入口归一化：判定函数不该假设调用方传的参数合法。
 func (a *Agent) isSameRunLocked(n int) bool {
-	if len(a.lastCalls) < n {
+	if n < 2 || len(a.lastCalls) < n {
 		return false
 	}
 	tail := a.lastCalls[len(a.lastCalls)-n:]
@@ -854,13 +1062,26 @@ func parseArgs(s string) map[string]interface{} {
 	return map[string]interface{}{"_raw": s}
 }
 
-// stableKey 稳定序列化（Go map JSON 序列化自动键排序）→ 逐字符比较（§8 参数比较口径）
+// stableKey 调用指纹（§8 参数比较口径）：工具名 + 参数摘要。
+//
+// 2026-10-06 四轮反思：这里原本返回 `name + 完整参数 JSON`，而 Key **只用于相等比较**
+// （isSameRunLocked 里 `c.Key != first`），从不展示、从不解析——存全文纯属浪费：
+// bash 的 command 动辄几 KB，实测一条 100KB 的命令就产出 100018 字节的 Key。
+//
+// 改为【定长摘要】（SHA-256 前 16 字节 hex，32 字符）：
+//   - 语义不变：同参数 → 同摘要（Go 的 map JSON 序列化自动键排序，输入稳定）；
+//   - 内存与参数长度脱钩，单条记录从"几 KB"降到"几十字节"。
+//
+// 这一改动是 trimCallRecs 能放宽窗口上限的前提：内存瓶颈本来就不在"保留几条"，
+// 而在"每条多大"。上一轮在错误的维度上加了 64 条硬上限，反而把
+// doom.warn_after > 64 的检测能力裁没了（见 maxCallRecs 注释）。
 func stableKey(name string, args map[string]interface{}) string {
 	b, err := json.Marshal(args)
 	if err != nil {
-		return name + sJSON(args)
+		b = []byte(sJSON(args))
 	}
-	return name + string(b)
+	sum := sha256.Sum256(b)
+	return name + ":" + hex.EncodeToString(sum[:16])
 }
 
 func sJSON(v interface{}) string {

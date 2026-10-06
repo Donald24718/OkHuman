@@ -146,7 +146,7 @@ func newAgent(client llm.LlmClient, injectDir string) *Agent {
 		MaxTokens: 1000000, KeepRecentChars: 60000, HardTruncChars: 50000,
 		StreamIdleMS: 30000, CharsPerToken: 2,
 	}, "系统提示", filepath.Join(os.TempDir(), "okhuman-agent-hardening"))
-	return New(client, "系统提示", cm, injectDir)
+	return New(client, cm, injectDir)
 }
 
 // eventRecorder 记录事件序列（类型 + 少量关键字段）

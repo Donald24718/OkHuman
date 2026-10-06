@@ -127,7 +127,7 @@ OkHuman/                     # 主程序仓（唯一 git 仓）
 | 前台工具超时 | 30 s | config/default.json |
 | 工具总超时 | 600 s | config/default.json |
 | 工具轮次上限 | 200（0/负 → 200） | config/default.json（`tools.max_tool_rounds`） |
-| doom 检测 | 连续 3 次相同调用 | config/default.json |
+| doom 检测 | 连续 3 次相同调用（设为 0 或 1 = 关闭检测） | config/default.json |
 | Result limit | Default()=10000 / default.json=50000 / user.json=50000 | config/default.json, config/user.json |
 | ipython 解释器 | `""`（不启用该工具） | config/default.json（`tools.ipython_python`） |
 | ipython 单次超时 | 默认 60 s，上限同 `tools.timeout_ms` | internal/tools/config.go（`DefaultIPythonMS`） |

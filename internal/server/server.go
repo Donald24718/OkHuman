@@ -149,12 +149,33 @@ type AppState struct {
 	Agent         *AgentState
 	mu            sync.Mutex // 保护下面全部字段
 	BroadcastSubs []subEntry
-	MessageQueue  []string
-	ActiveDrain   *drainHandle
-	RoundBuf      *roundBuf
-	RunSeq        int
-	InjectSeq     int
-	Injects       []InjectInfo
+	// MessageQueue 待发消息队列（/chat /chat/stream /enqueue 与后台 settle 通知
+	// 共用）。2026-10-06：元素带 System 标记——早先是 []string，agent 只能靠
+	// 文本前缀猜"这条是后台通知还是用户追加"，用户消息以那句中文开头就会被
+	// 误判。类型由入队方显式给出，不再靠内容识别。
+	MessageQueue []queuedMsg
+	ActiveDrain  *drainHandle
+	RoundBuf     *roundBuf
+	RunSeq       int
+	InjectSeq    int
+	Injects      []InjectInfo
+}
+
+// queuedMsg 队列里的一条消息：Text 正文；System=true 表示后台任务完成通知等
+// 系统消息（轮内搭车时原样注入，不加【用户追加】前缀）。
+type queuedMsg struct {
+	Text   string
+	System bool
+}
+
+// textsOf 取队列快照的正文（/queue、/events 的 JSON 字段形状保持 []string，
+// 前端无需改动）
+func textsOf(msgs []queuedMsg) []string {
+	out := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, m.Text)
+	}
+	return out
 }
 
 // NewAppState AppState 工厂（2026-08-31）：统一初始化事件广播集 + 消息队列 + 活动 drain + 轮次缓冲。
@@ -164,7 +185,7 @@ func NewAppState(cfg *config.Config, root string, agent *AgentState) *AppState {
 		Root:          root,
 		Agent:         agent,
 		BroadcastSubs: []subEntry{},
-		MessageQueue:  []string{},
+		MessageQueue:  []queuedMsg{},
 		Injects:       []InjectInfo{},
 	}
 }
@@ -188,7 +209,7 @@ func CreateAgentState(cfg *config.Config, client llm.LlmClient, systemPrompt str
 	a.CfgRef.Store(cfg)
 	a.SessionNo.Store(1)
 	cm := makeCm(a)
-	a.rt.Store(&agentRuntime{CM: cm, Agent: agent.New(client, systemPrompt, cm, filepath.Join(a.Cfg().Data.Dir, "inject")), BG: background.NewOrchestrator()})
+	a.rt.Store(&agentRuntime{CM: cm, Agent: agent.New(client, cm, filepath.Join(a.Cfg().Data.Dir, "inject")), BG: background.NewOrchestrator()})
 	return a
 }
 
@@ -250,12 +271,16 @@ func runOpt(a *AgentState, state *AppState) agent.RunOptions {
 		// 携带用户追加消息 + 已 settle 后台任务的通知（同一队列、同一逻辑）。
 		// 安全：本回调只在 lock.Run 内被调用（runLoop 持锁），drain 的下一轮
 		// splice 只会在本轮结束后执行 → 无并发竞态。
-		TakePendingUsers: func() []string {
+		TakePendingUsers: func() []agent.PendingMessage {
 			state.mu.Lock()
 			defer state.mu.Unlock()
 			q := state.MessageQueue
 			state.MessageQueue = nil
-			return q
+			out := make([]agent.PendingMessage, 0, len(q))
+			for _, m := range q {
+				out = append(out, agent.PendingMessage{Text: m.Text, System: m.System})
+			}
+			return out
 		},
 		OnBackgroundStart: func(bg types.BackgroundStartArgs) {
 			// settle → 格式化通知 → push 进消息队列 + 唤醒 drain（2026-09-14：
@@ -267,7 +292,7 @@ func runOpt(a *AgentState, state *AppState) agent.RunOptions {
 					ResultLimit: cfg.Tools.ResultLimit,
 					DataDir:     cfg.Data.Dir,
 				})
-				_, _ = enqueueAndWake(state, a, notice, makeOnEvent(state, a))
+				_, _ = enqueueAndWake(state, a, notice, true, makeOnEvent(state, a))
 			}
 			a.BG().OnBackgroundStart(bg)
 		},
@@ -382,11 +407,11 @@ func makeOnEvent(state *AppState, a *AgentState) func(types.AgentEvent) {
 // 不存在"drain 正要退出时入队落空、消息挂起"的竞态（旧 startDrain 两把锁
 // 判定之间的窗口，2026-09-14 修）。四个调用方：/chat /chat/stream /enqueue
 // 与后台 settle 通知（同一逻辑）。返回 handle（可等 done 读 res）+ 入队前
-// 队列已有条数。
-func enqueueAndWake(state *AppState, a *AgentState, msg string, onEvent func(types.AgentEvent)) (*drainHandle, int) {
+// 队列已有条数。system=true 标记后台任务通知（轮内搭车时原样注入）。
+func enqueueAndWake(state *AppState, a *AgentState, msg string, system bool, onEvent func(types.AgentEvent)) (*drainHandle, int) {
 	state.mu.Lock()
 	queuedBefore := len(state.MessageQueue)
-	state.MessageQueue = append(state.MessageQueue, msg)
+	state.MessageQueue = append(state.MessageQueue, queuedMsg{Text: msg, System: system})
 	if state.ActiveDrain != nil {
 		h := state.ActiveDrain
 		state.mu.Unlock()
@@ -456,7 +481,7 @@ func runDrain(state *AppState, a *AgentState, h *drainHandle, onEvent func(types
 	started := time.Now()
 	var reply string
 	for {
-		var msgs []string
+		var msgs []queuedMsg
 		var batchErr error
 		// splice + 发送在 RunLock 内原子完成（2026-09-14 审计 H1 修）：/reset 也持同一
 		// 锁清队列+重建 → 两者互斥——要么整批在 reset 前跑完（旧会话），要么 reset
@@ -473,7 +498,7 @@ func runDrain(state *AppState, a *AgentState, h *drainHandle, onEvent func(types
 			if len(msgs) == 0 {
 				return nil // 防御：空队列不发 LLM 调用
 			}
-			message, kind, label, messages := assembleBatch(msgs)
+			message, kind, label, messages := assembleBatch(textsOf(msgs))
 			r, err := runBatch(a, runOpt(a, state), message, kind, label, messages, onEvent)
 			if err == nil {
 				reply = r
@@ -866,7 +891,7 @@ func (ap *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 func (ap *App) handleQueue(w http.ResponseWriter, r *http.Request) {
 	a := ap.state.Agent
 	ap.state.mu.Lock()
-	queued := append([]string(nil), ap.state.MessageQueue...)
+	queued := textsOf(ap.state.MessageQueue)
 	running := a.Lock.Running() || ap.state.ActiveDrain != nil
 	ap.state.mu.Unlock()
 	// 快照取一次（2026-09-14 审计修：旧代码每次迭代都调 Session() 取活引用，
@@ -955,7 +980,7 @@ func (ap *App) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	started := time.Now()
 	// 入队 + 活动 drain（2026-08-31，同 /chat/stream）：运行中发的消息合并成一条一起发
-	h, _ := enqueueAndWake(ap.state, a, message, onEvent)
+	h, _ := enqueueAndWake(ap.state, a, message, false, onEvent)
 	<-h.done
 	if h.res.Err != nil {
 		writeJSON(w, 500, map[string]interface{}{"error": h.res.Err.Error(), "events": events, "ms": time.Since(started).Milliseconds()})
@@ -1036,7 +1061,7 @@ func (ap *App) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		// 本流也推全量事件（API 流式客户端兼容；WebUI 走 /enqueue + /events，不用本端点）
 		conn.push(strOf(e["type"]), e)
 	}
-	h, queuedBefore := enqueueAndWake(ap.state, a, message, onEvent)
+	h, queuedBefore := enqueueAndWake(ap.state, a, message, false, onEvent)
 	conn.push("start", map[string]interface{}{"message": message, "queued_before": queuedBefore})
 	<-h.done
 	if h.res.Err != nil {
@@ -1063,7 +1088,7 @@ func (ap *App) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 	ap.state.mu.Lock()
 	running := a.Lock.Running() || ap.state.ActiveDrain != nil
 	ap.state.mu.Unlock()
-	h, queuedBefore := enqueueAndWake(ap.state, a, message, makeOnEvent(ap.state, a))
+	h, queuedBefore := enqueueAndWake(ap.state, a, message, false, makeOnEvent(ap.state, a))
 	position := queuedBefore + 1
 	broadcastEvent(ap.state, types.AgentEvent{"type": "enqueued", "message": message, "position": position, "running": running})
 	go func() { <-h.done }() // 防 unhandledRejection 等价：错误广播由 drain 统一处理
@@ -1084,7 +1109,7 @@ func (ap *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 	ap.state.BroadcastSubs = append(ap.state.BroadcastSubs, subEntry{ID: subID, Fn: sub})
 	// 连接建立即报当前状态（前端据此对齐：running + 排队消息全文 + 后台任务数）。
 	// queued 带全文：刷新/重开/重连后前端据此补显"排队中"气泡（与历史去重）。
-	queued := append([]string(nil), ap.state.MessageQueue...)
+	queued := textsOf(ap.state.MessageQueue)
 	running := a.Lock.Running() || ap.state.ActiveDrain != nil
 	session := int(a.SessionNo.Load())
 	bgPending := a.BG().Count()
@@ -1306,11 +1331,9 @@ func (ap *App) handleReset(w http.ResponseWriter, r *http.Request) {
 		a.llmMu.Lock()
 		client := a.LLM
 		a.llmMu.Unlock()
-		a.promptMu.Lock()
-		sp := a.SystemPrompt
-		a.promptMu.Unlock()
+		// 系统提示词由 makeCm 从 a.SystemPrompt 现取注入 CM（agent 自身不再持有副本）
 		newCM := makeCm(a)
-		a.rt.Store(&agentRuntime{CM: newCM, Agent: agent.New(client, sp, newCM, filepath.Join(a.Cfg().Data.Dir, "inject")), BG: background.NewOrchestrator()})
+		a.rt.Store(&agentRuntime{CM: newCM, Agent: agent.New(client, newCM, filepath.Join(a.Cfg().Data.Dir, "inject")), BG: background.NewOrchestrator()})
 		if ap.hooks != nil && ap.hooks.OnSessionRebuilt != nil {
 			ap.hooks.OnSessionRebuilt(a)
 		}

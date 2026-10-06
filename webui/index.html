@@ -765,7 +765,9 @@ function handleChatEvent(type, data) {
       // 让后台通知"排队成功后从用户侧发出"，且同一文本双气泡重复渲染。
       const msg = String(data.message ?? "");
       if (!msg) break;
-      const isBg = msg.startsWith(BG_NOTICE_PREFIX);
+      // 2026-10-06：后端已结构化（data.system 由入队方给出）。优先用它，
+      // 文本前缀只作兜底（重放帧缺该字段时仍要画对）。
+      const isBg = data.system === true || msg.startsWith(BG_NOTICE_PREFIX);
       const pre = msg.slice(0, isBg ? 80 : 40);
       const box = getBox().el;
       const bub = Array.from(box.querySelectorAll(isBg ? ".msg.sys .bubble" : ".msg.user .bubble"))
