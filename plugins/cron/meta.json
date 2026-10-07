@@ -1,0 +1,1 @@
+{"summary": "定时任务插件（:8601）：为多个 OkHuman 实例管理定时任务，到点把任务 prompt 作为 user 消息 POST 到对应实例的 /chat 同步等完整 reply；每实例独立 CronStore 原子落盘，自带 HTTP 管理 API（/cron/*）与独立管理页，与主程序零代码耦合"}

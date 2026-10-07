@@ -1,0 +1,8 @@
+{
+  "port": 8480,
+  "plugin_root": "..",
+  "model_path": "models/Qwen3-Embedding-0.6B-f16.gguf",
+  "server_bin": "llama-server",
+  "embed_port": 8591,
+  "embed_ctx": 1024
+}

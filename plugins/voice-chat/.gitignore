@@ -1,0 +1,13 @@
+# 插件依赖与运行时目录（用户私有）
+venv/
+kokoro_venv/
+asr/bin/
+asr/models/
+speaker/models/
+speaker/enrollments/
+**/__pycache__/
+**/*.log
+data/
+*.bak-*
+# 个人部署值（唤醒词/音色/端口），只入库 example
+config.json

@@ -1,3 +1,44 @@
+# 主程序
 /okhuman
-/config/user.json
+*.log
+
+# 配置里的部署值（模板入库，实值不入库）
+config/user.json
+
+# 插件：编译产物（-o 命名与裸 go build 两种都挡）/ 运行态 / 重资产
+plugins/attach/okattach
+plugins/attach/attach
+plugins/computer/xusectl
+plugins/computer/computer
+plugins/cron/okhuman-cron
+plugins/cron/cron
+plugins/okmon/okmon
+plugins/qq-channel/okhuman-qq-bridge
+plugins/qq-channel/qq-channel
+plugins/scout/scout
+plugins/browser/browserd
+plugins/browser/browserctl
+plugins/browser/cmd/browserd/browserd
+plugins/browser/cmd/browserctl/browserctl
+plugins/*/data/
+plugins/*/archive/
+plugins/scout/index.json
+plugins/scout/models/
+plugins/scout/llama-server
+
+# voice-chat：Python 环境与模型权重
+plugins/voice-chat/venv/
+plugins/voice-chat/kokoro_venv/
+plugins/voice-chat/asr/
+plugins/voice-chat/data/
+plugins/voice-chat/speaker/enrollments/
+plugins/voice-chat/speaker/__pycache__/
+**/__pycache__/
+*.pyc
+*.gguf
+*.ggml
+*.onnx
+*.so
+
+# 测试产物
 *.test

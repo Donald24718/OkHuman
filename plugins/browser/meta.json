@@ -1,0 +1,6 @@
+{
+  "name": "browser",
+  "summary": "浏览器操作插件：agent 经 browserctl 轻 CLI 驱动本地 Firefox 做页面导航、元素定位、表单填写、点击、文本提取，给只有 bash 一个工具的 agent 提供真实浏览器能力，主程序零改动。",
+  "updated": "2026-09-16",
+  "note": "agent 自写简介，scout 扫描时优先于 README 首段"
+}

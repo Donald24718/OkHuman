@@ -1,0 +1,6 @@
+{
+  "name": "computer",
+  "summary": "电脑操作插件：给 agent 装\"手\"——整屏截图（ffmpeg x11grab，经 okattach 注入 LLM 上下文）+ X11 鼠标键盘事件（xdotool/XTest），agent 可看屏幕、点鼠标、敲键盘，内核零改动。",
+  "updated": "2026-09-16",
+  "note": "agent 自写简介，scout 扫描时优先于 README 首段"
+}

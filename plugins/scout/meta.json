@@ -1,0 +1,1 @@
+{"summary": "语义检索服务（Go 版，移植自 TS 版 scout）：对插件目录/技能建关键词+语义混合索引，:8480 提供 /search /reindex /doc /health；embed 模型 Qwen3-Embedding-0.6B 走常驻 llama-server :8591（健康探测复用，拉起后不重载）"}

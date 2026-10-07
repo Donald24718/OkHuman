@@ -79,7 +79,7 @@ func Default() *Config {
 	}
 	return &Config{
 		Server:       ServerCfg{Host: "127.0.0.1", Port: 8451},
-		LLM:          LLMCfg{BaseURL: "http://127.0.0.1:8081/v1", Model: "local", TimeoutMS: 300000},
+		LLM:          LLMCfg{BaseURL: "http://127.0.0.1:8080/v1", Model: "local", TimeoutMS: 300000},
 		SystemPrompt: SystemPromptCfg{Dir: "prompts"},
 		Data:         DataCfg{Dir: filepath.Join(home, ".okhuman")},
 		Context:      ContextCfg{MaxTokens: 150000, KeepRecentChars: 60000, HardTruncChars: 150000, StreamIdleMS: 90000, CharsPerToken: 1.5},

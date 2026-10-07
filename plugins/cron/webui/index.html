@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OkHuman cron 插件</title>
+<style>
+  :root {
+    --bg: #0e1116; --bg2: #151a22; --bg3: #1c2330; --border: #2a3444;
+    --text: #dbe4f0; --dim: #8494ab; --accent: #4f9cff; --green: #3ecf8e;
+    --red: #ff6b6b; --amber: #ffb454;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    overflow-y: auto;
+  }
+  button {
+    font: inherit; cursor: pointer; border: 1px solid var(--border);
+    background: var(--bg3); color: var(--text); border-radius: 8px; padding: 6px 14px;
+    transition: all .15s;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled) { filter: brightness(1.12); }
+  button.danger { background: transparent; border-color: #5a2a2a; color: var(--red); }
+  button.danger:hover:not(:disabled) { border-color: var(--red); background: rgba(255,107,107,.08); }
+  button.small { padding: 2px 9px; font-size: 12px; border-radius: 6px; }
+  select, textarea {
+    font: inherit; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; width: 100%;
+  }
+  select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  textarea { resize: vertical; font-family: var(--mono); font-size: 13px; }
+  label.f { display: block; margin-bottom: 10px; }
+  label.f span { display: block; color: var(--dim); font-size: 12px; margin-bottom: 4px; }
+  header {
+    position: sticky; top: 0; z-index: 10; background: var(--bg2);
+    border-bottom: 1px solid var(--border); padding: 12px 22px;
+    display: flex; align-items: center; gap: 16px;
+  }
+  header .logo { font-size: 16px; font-weight: 700; letter-spacing: .5px; }
+  header .logo em { color: var(--accent); font-style: normal; }
+  header .inst { display: flex; align-items: center; gap: 8px; }
+  header .inst select { width: auto; min-width: 140px; }
+  header .health { margin-left: auto; font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 7px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
+  .dot.ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot.err { background: var(--red); box-shadow: 0 0 6px var(--red); }
+  main { padding: 22px 26px; max-width: 1080px; margin: 0 auto; }
+  h2 { font-size: 16px; margin: 22px 0 12px; }
+  .card { background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; margin-bottom: 18px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--dim); font-weight: 500; font-size: 12px; }
+  td.mono, .mono { font-family: var(--mono); font-size: 12px; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 6px; font-size: 11px; border: 1px solid var(--border); }
+  .tag.every { color: var(--accent); border-color: var(--accent); }
+  .tag.once { color: var(--amber); border-color: var(--amber); }
+  .tag.paused { color: var(--red); border-color: var(--red); }
+  .ok { color: var(--green); }
+  .fail { color: var(--red); }
+  .empty { color: var(--dim); font-size: 13px; padding: 14px 0; }
+  #toast { position: fixed; bottom: 20px; right: 20px; background: var(--bg3); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 16px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 99; }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">⏰ OkHuman <em>cron</em></div>
+  <div class="inst">
+    <span style="color:var(--dim);font-size:12px">实例</span>
+    <select id="instSel" onchange="switchInst()"></select>
+  </div>
+  <div class="health"><span class="dot" id="dot"></span><span id="healthTxt">连接中…</span></div>
+</header>
+<main>
+  <div class="card">
+    <h2 style="margin-top:0">新建任务（实例：<span id="newInst" class="mono" style="color:var(--accent)"></span>）</h2>
+    <label class="f"><span>任务名（展示用，可空）</span><input id="fName" style="width:auto;max-width:340px"></label>
+    <label class="f"><span>触发类型</span>
+      <select id="fKind" style="width:auto" onchange="kindChanged()">
+        <option value="every">循环（每 N 秒）</option>
+        <option value="once">单次（指定时刻）</option>
+      </select>
+    </label>
+    <label class="f" id="fEveryWrap"><span>间隔秒数（≥1）</span><input id="fEvery" type="number" min="1" style="width:auto;max-width:200px" placeholder="60"></label>
+    <label class="f" id="fAtWrap" style="display:none"><span>执行时刻（本地时间）</span><input id="fAt" type="datetime-local" style="width:auto;max-width:260px"></label>
+    <label class="f"><span>提示词（到点作为 user 消息发给该实例）</span><textarea id="fPrompt" rows="3" placeholder="例：检查 /tmp 磁盘占用，超 90% 提醒"></textarea></label>
+    <button class="primary" id="btnAdd" onclick="addJob()">创建任务</button>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">任务列表</h2>
+    <div id="jobList"><div class="empty">加载中…</div></div>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">最近执行记录</h2>
+    <div id="runList"><div class="empty">加载中…</div></div>
+  </div>
+</main>
+<div id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let INST = "";
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+async function api(path, opt) {
+  const r = await fetch(path, opt);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+  return j;
+}
+function toast(msg, isErr) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.style.borderColor = isErr ? "var(--red)" : "var(--border)";
+  t.classList.add("show");
+  setTimeout(() => t.classList.remove("show"), 2600);
+}
+
+async function loadInstances() {
+  try {
+    const j = await api("/instances");
+    const sel = $("instSel");
+    sel.innerHTML = j.instances.map((i) => `<option value="${esc(i.id)}">${esc(i.id)}（:${(i.url.split(":").pop() || "").split("/")[0] || "?"}）</option>`).join("");
+    INST = j.instances[0]?.id ?? "";
+    sel.value = INST;
+    $("newInst").textContent = INST;
+  } catch (e) {
+    $("healthTxt").textContent = "插件不可达：" + e.message;
+    $("dot").className = "dot err";
+    return;
+  }
+  await refresh();
+}
+
+async function refresh() {
+  if (!INST) return;
+  try {
+    const h = await api("/health");
+    const inst = h.instances.find((i) => i.id === INST);
+    $("dot").className = "dot ok";
+    $("healthTxt").textContent = `插件正常 · ${h.instances.length} 实例 · ${INST} 有 ${inst ? inst.jobs : "?"} 个任务`;
+  } catch (e) {
+    $("dot").className = "dot err";
+    $("healthTxt").textContent = "插件异常：" + e.message;
+  }
+  if (!INST) return;
+  try {
+    const j = await api("/cron?inst=" + encodeURIComponent(INST));
+    window.__jobs = j.jobs;
+    $("jobList").innerHTML = j.jobs.length ? jobsTable(j.jobs) : '<div class="empty">暂无定时任务</div>';
+    $("runList").innerHTML = j.recent_runs.length ? runsTable(j.recent_runs) : '<div class="empty">暂无执行记录</div>';
+  } catch (e) {
+    $("jobList").innerHTML = '<div class="empty">加载失败：' + esc(e.message) + "</div>";
+  }
+}
+
+function fmt(ms) { return ms > 0 ? new Date(ms).toLocaleString("zh-CN", { hour12: false }) : "—"; }
+
+function jobsTable(jobs) {
+  return `<table><tr><th>名称</th><th>类型</th><th>间隔/时刻</th><th>下次触发</th><th>上次执行</th><th>提示词</th><th>操作</th></tr>` +
+    jobs.map((j) => {
+      const paused = j.kind === "every" && j.paused;
+      const interval = j.kind === "every" ? `每 ${j.every_ms >= 3600000 ? (j.every_ms / 3600000) + " 小时" : j.every_ms >= 60000 ? (j.every_ms / 60000) + " 分钟" : (j.every_ms / 1000) + " 秒"}` : new Date(j.at).toLocaleString("zh-CN", { hour12: false });
+      return `<tr>
+        <td><b>${esc(j.name)}</b> <span class="mono" style="color:var(--dim)">${esc(j.id)}</span>${paused ? ' <span class="tag paused">已暂停</span>' : ""}</td>
+        <td><span class="tag ${j.kind}">${j.kind === "every" ? "循环" : "单次"}</span></td>
+        <td class="mono">${esc(interval)}</td>
+        <td class="mono">${paused ? "—" : fmt(j.next_run_at)}</td>
+        <td class="mono">${fmt(j.last_run_at)}</td>
+        <td style="max-width:280px" title="${esc(j.prompt)}">${esc(j.prompt.length > 40 ? j.prompt.slice(0, 40) + "…" : j.prompt)}</td>
+        <td>
+          <button class="small" onclick="runJob('${esc(j.id)}')">▶ 立即执行</button>
+          ${j.kind === "every" ? `<button class="small" onclick="pauseResume('${esc(j.id)}')">${paused ? "恢复" : "暂停"}</button>` : ""}
+          <button class="small danger" onclick="removeJob('${esc(j.id)}')">删除</button>
+        </td>
+      </tr>`;
+    }).join("") + "</table>";
+}
+
+function runsTable(runs) {
+  return `<table><tr><th>任务</th><th>时间</th><th>结果</th><th>回复长度</th><th>耗时</th><th>补跑</th></tr>` +
+    runs.map((r) => `<tr>
+      <td>${esc(r.name)} <span class="mono" style="color:var(--dim)">${esc(r.job_id)}</span></td>
+      <td class="mono">${new Date(r.at).toLocaleString("zh-CN", { hour12: false })}</td>
+      <td class="${r.ok ? "ok" : "fail"}">${r.ok ? "✓ 成功" : "✗ 失败"}</td>
+      <td class="mono">${r.reply_chars} 字</td>
+      <td class="mono">${(r.duration_ms / 1000).toFixed(1)}s</td>
+      <td>${r.catchup ? "是" : "—"}</td>
+    </tr>`).join("") + "</table>";
+}
+
+function switchInst() {
+  INST = $("instSel").value;
+  $("newInst").textContent = INST;
+  refresh();
+}
+
+function kindChanged() {
+  const k = $("fKind").value;
+  $("fEveryWrap").style.display = k === "every" ? "" : "none";
+  $("fAtWrap").style.display = k === "once" ? "" : "none";
+}
+
+async function addJob() {
+  const kind = $("fKind").value;
+  const body = { inst: INST, name: $("fName").value.trim(), prompt: $("fPrompt").value.trim() };
+  if (!body.prompt) return toast("提示词必填", true);
+  if (kind === "every") {
+    const sec = parseInt($("fEvery").value, 10);
+    if (!sec || sec < 1) return toast("间隔秒数需 ≥1", true);
+    body.every_ms = sec * 1000;
+  } else {
+    const at = $("fAt").value;
+    if (!at) return toast("请选择执行时刻", true);
+    const t = new Date(at).getTime();
+    if (isNaN(t) || t <= Date.now()) return toast("单次时刻必须晚于现在", true);
+    body.at = t;
+  }
+  try {
+    const j = await api("/cron/add", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    toast("已创建：" + j.job.name);
+    $("fName").value = ""; $("fPrompt").value = ""; $("fEvery").value = ""; $("fAt").value = "";
+    await refresh();
+  } catch (e) { toast("创建失败：" + e.message, true); }
+}
+
+async function runJob(id) {
+  try {
+    const j = await api("/cron/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ inst: INST, id }) });
+    toast("执行完成，回复 " + j.reply.length + " 字");
+    await refresh();
+  } catch (e) { toast("执行失败：" + e.message, true); }
+}
+
+async function pauseResume(id) {
+  const job = (window.__jobs || []).find((x) => x.id === id);
+  const wantResume = !!job && job.kind === "every" && job.paused;
+  const doCall = (resume) => api(resume ? "/cron/resume" : "/cron/pause",
+    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ inst: INST, id }) });
+  try {
+    await doCall(wantResume);
+    toast(wantResume ? "已恢复" : "已暂停");
+    await refresh();
+  } catch (e) {
+    // 兜底：页面未刷新导致状态判断过期 → 试另一个动作
+    try {
+      await doCall(!wantResume);
+      toast(!wantResume ? "已恢复" : "已暂停");
+      await refresh();
+    } catch (e2) { toast("操作失败：" + e2.message, true); }
+  }
+}
+
+async function removeJob(id) {
+  if (!confirm("删除该定时任务？")) return;
+  try {
+    await api("/cron/remove", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ inst: INST, id }) });
+    toast("已删除");
+    await refresh();
+  } catch (e) { toast("删除失败：" + e.message, true); }
+}
+
+loadInstances();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
