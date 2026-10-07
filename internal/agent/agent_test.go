@@ -20,7 +20,7 @@ func newTestAgent(steps []llm.FakeStep) (*Agent, *llm.FakeLLM) {
 		MaxTokens: 1000000, KeepRecentChars: 60000, HardTruncChars: 50000,
 		StreamIdleMS: 30000, CharsPerToken: 2,
 	}, "系统提示", t0TempDir())
-	return New(fake, "系统提示", cm, ""), fake // injectDir=""：既有测试不触注入回写
+	return New(fake, cm, ""), fake // injectDir=""：既有测试不触注入回写
 }
 
 func t0TempDir() string { return "/tmp/okhuman-agent-test" }
@@ -48,7 +48,9 @@ func TestTruncationRetry(t *testing.T) {
 	}
 }
 
-// TestTruncationGiveUp 重试后仍截断 → 第 2 条 trunc_warn（放弃事件）后原样收尾（空正文）。
+// TestTruncationGiveUp 重试后仍截断 → 第 2 条 trunc_warn（放弃事件）后原样收尾。
+// 2026-10-06：收尾正文不再是空串（前端空气泡），改用 noContentReply 兜底；
+// 返回值与落会话的文本同源（同 finishStopped 口径）。
 func TestTruncationGiveUp(t *testing.T) {
 	thinking := "思考了很久但忘了写正文……"
 	a, _ := newTestAgent([]llm.FakeStep{
@@ -61,11 +63,22 @@ func TestTruncationGiveUp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run 失败: %v", err)
 	}
-	if reply != "" {
-		t.Errorf("放弃轮回复应为空，实际: %q", reply)
+	if strings.TrimSpace(reply) == "" || reply != noContentReply {
+		t.Errorf("放弃轮回复应为非空兜底文案，实际: %q", reply)
 	}
 	if len(warns) != 2 {
 		t.Errorf("应有 2 条 trunc_warn，实际 %d 条: %v", len(warns), warns)
+	}
+	// 被判定截断的那次 assistant 响应必须留在上下文里（否则"你上一条响应…"没有对象）
+	sess := a.cm.Session()
+	nAssistant := 0
+	for _, m := range sess.Messages {
+		if m.Role == "assistant" && m.ReasoningContent != nil && strings.Contains(*m.ReasoningContent, "忘了写正文") {
+			nAssistant++
+		}
+	}
+	if nAssistant == 0 {
+		t.Errorf("❌ 截断的那次响应（带 thinking 的 assistant 消息）应已存入会话")
 	}
 }
 
@@ -143,7 +156,7 @@ func TestInjectDemotePersist(t *testing.T) {
 		types.TextPart("[okattach] 附件 inj-1"),
 		types.RefPart("inj-1"),
 	}})
-	a := New(&failOnceClient{inner: inner, fails: 1}, "系统提示", cm, injectDir)
+	a := New(&failOnceClient{inner: inner, fails: 1}, cm, injectDir)
 
 	var warns []string
 	reply, err := a.Run(context.Background(), "你好", testRunOpt(&warns))

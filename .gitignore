@@ -1,5 +1,5 @@
-# 主程序
-/okhuman
+# 主程序（二进制产物，一网打尽）
+okhuman*
 *.log
 
 # 配置里的部署值（模板入库，实值不入库）
@@ -39,3 +39,10 @@ plugins/voice-chat/speaker/__pycache__/
 *.ggml
 *.onnx
 *.so
+
+# WorkBuddy agent workspace (local memory, skills, scratch): never committed
+.workbuddy/
+
+# 其它会话/工具残留的临时目录（勿入库）
+.ipynb_checkpoints/
+.reasonix/

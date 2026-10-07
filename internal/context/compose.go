@@ -49,8 +49,28 @@ type ComposeOptions struct {
 	DemoteInjects string
 }
 
-// ComposeMessages 会话状态 → LLM 请求（纯函数）
-func ComposeMessages(session *types.SessionState, systemPrompt string, opts *ComposeOptions) []types.Message {
+// demote 模式取值（2026-10-05 提为常量：agent 侧的回退阶梯与此处各写一份字符串
+// 字面量时，两边漂移过一次——详见 ComposeResult 注释）
+const (
+	DemoteNone   = ""
+	DemoteNewest = "newest"
+	DemoteAll    = "all"
+)
+
+// ComposeResult Compose 的产物（2026-10-05）：
+//
+//	DemotedInjectIDs 是本次【真正被降级】的注入 id——由组装过程就地记下，
+//	而非调用方按"哪些消息带附件"自行重算。降级范围只在组装里定义一次，
+//	调用方（agent 4xx 阶梯的侧车回写）只能消费它。
+//	历史 bug：调用方重算时用错了 mode 字符串，导致 demote-newest 成功后
+//	把会话里【全部】附件永久回写成文本提示（更早的好附件被不可逆降级）。
+type ComposeResult struct {
+	Messages         []types.Message
+	DemotedInjectIDs []string
+}
+
+// ComposeMessages 会话状态 → LLM 请求 + 本次实际降级的注入 id（纯函数）
+func ComposeMessages(session *types.SessionState, systemPrompt string, opts *ComposeOptions) ComposeResult {
 	// 孤儿 tool 判定：tool_call_id 不在任何 assistant.tool_calls 里
 	callIds := map[string]bool{}
 	for i := range session.Messages {
@@ -59,11 +79,21 @@ func ComposeMessages(session *types.SessionState, systemPrompt string, opts *Com
 		}
 	}
 	newestInjectIdx := -1
-	if opts != nil && opts.DemoteInjects == "newest" {
+	if opts != nil && opts.DemoteInjects == DemoteNewest {
 		for i := len(session.Messages) - 1; i >= 0; i-- {
 			if session.Messages[i].HasInjectRef() {
 				newestInjectIdx = i
 				break
+			}
+		}
+	}
+	demoted := []string{}
+	seen := map[string]bool{}
+	noteDemoted := func(parts []types.ContentPart) {
+		for _, p := range parts {
+			if p.Type == "inject_ref" && p.Ref != "" && !seen[p.Ref] {
+				seen[p.Ref] = true
+				demoted = append(demoted, p.Ref)
 			}
 		}
 	}
@@ -88,10 +118,13 @@ func ComposeMessages(session *types.SessionState, systemPrompt string, opts *Com
 				out = append(out, types.Message{Role: "user", Content: fmt.Sprintf("%s %s]\n%s", ToolResultMarker, label, types.AsString(e.Content))})
 			}
 		} else {
-			demote := (opts != nil && opts.DemoteInjects == "all") ||
-				(opts != nil && opts.DemoteInjects == "newest" && i == newestInjectIdx)
+			demote := (opts != nil && opts.DemoteInjects == DemoteAll) ||
+				(opts != nil && opts.DemoteInjects == DemoteNewest && i == newestInjectIdx)
 			m := types.Message{Role: e.Role, Content: e.Content}
 			if parts := types.AsParts(e.Content); parts != nil {
+				if demote {
+					noteDemoted(parts) // 就地记录，是降级范围的唯一真相来源
+				}
 				m.Content = resolveContentParts(parts, demote)
 			}
 			if e.Role == "assistant" && len(e.ToolCalls) > 0 {
@@ -103,7 +136,7 @@ func ComposeMessages(session *types.SessionState, systemPrompt string, opts *Com
 			out = append(out, m)
 		}
 	}
-	return out
+	return ComposeResult{Messages: out, DemotedInjectIDs: demoted}
 }
 
 // resolveContentParts 把 content parts 里的 inject_ref 解析成真实 parts（带缓存）；

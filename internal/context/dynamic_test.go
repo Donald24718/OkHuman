@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -12,7 +13,17 @@ import (
 )
 
 // TestPortToPID 真实监听端口 → 应找到自己（/proc 扫描链路 e2e）
+//
+// 平台限定：portToPID 依赖 /proc/net/tcp（Linux 专属）。Windows/macOS 上
+// 该函数恒定返回 -1，测试无意义——用运行时跳过而非 build tag，以保留同文件
+// 其它两个平台无关测试（TestParseHostPort / TestComposeLocked）的全平台覆盖。
+//
+// 注：Windows 上 portToPID **功能缺失**（非本测试的问题），属内部 context 包的
+// 独立待办（见 docs/跨平台-bash-工具完整方案-v2-实证修订.md §8.2 边界外问题）。
 func TestPortToPID(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("portToPID 依赖 /proc/net/tcp，仅 Linux 有效（当前 %s）", runtime.GOOS)
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -29,7 +40,10 @@ func TestPortToPID(t *testing.T) {
 
 // TestParseHostPort base_url 解析
 func TestParseHostPort(t *testing.T) {
-	cases := []struct{ in, wantHost string; wantPort int }{
+	cases := []struct {
+		in, wantHost string
+		wantPort     int
+	}{
 		{"http://127.0.0.1:8080/v1", "127.0.0.1:8080", 8080},
 		{"http://localhost:9000", "localhost:9000", 9000},
 		{"", "", 0},
@@ -41,7 +55,6 @@ func TestParseHostPort(t *testing.T) {
 		}
 	}
 }
-
 
 // TestComposeLocked 动态注入：系统首自我块 + 每条消息尾时间戳
 func TestComposeLocked(t *testing.T) {

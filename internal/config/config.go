@@ -55,6 +55,15 @@ type ToolsCfg struct {
 	// TimeoutMS 命令总时长上限（毫秒）：超时 SIGKILL 整个命令进程组。
 	// 转后台不重置此计时器——后台任务同样受约束（长驻服务须 setsid 脱离）。
 	TimeoutMS int `json:"timeout_ms"`
+	// IPythonPython 启用 ipython 元工具所用的 Python 解释器。
+	// 空串 = 不启用（工具表不含该工具，既有工具的 KV 前缀不受影响）；
+	// "auto" = 自动探测第一个装了 IPython 的解释器（python3 → python）；
+	// 其余按可执行文件路径使用。依赖只需 pip install ipython（无需 ipykernel/pyzmq）。
+	IPythonPython string `json:"ipython_python"`
+	// MaxToolRounds 一轮 run 的工具轮次上限（2026-10-05）：兜住"每次改一点参数"
+	// 绕过 §8 死循环检测的跑飞。0/负/缺省 = 200。触达后注入收尾提示 + 给模型
+	// 最后一次作答机会（不再执行工具）。
+	MaxToolRounds int `json:"max_tool_rounds"`
 }
 
 type DoomCfg struct {
@@ -74,7 +83,7 @@ func Default() *Config {
 		SystemPrompt: SystemPromptCfg{Dir: "prompts"},
 		Data:         DataCfg{Dir: filepath.Join(home, ".okhuman")},
 		Context:      ContextCfg{MaxTokens: 150000, KeepRecentChars: 60000, HardTruncChars: 150000, StreamIdleMS: 90000, CharsPerToken: 1.5},
-		Tools:        ToolsCfg{FgTimeoutMS: 30000, ResultLimit: 10000, TimeoutMS: 600000},
+		Tools:        ToolsCfg{FgTimeoutMS: 30000, ResultLimit: 10000, TimeoutMS: 600000, MaxToolRounds: 200},
 		Doom:         DoomCfg{WarnAfter: 3},
 	}
 }

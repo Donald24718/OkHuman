@@ -222,6 +222,13 @@ func removeFn[T any](l []T, fn T) []T {
 
 // Compose 组装发给 LLM 的消息（主循环与压缩请求共用 → 前缀逐 token 一致）
 func (m *Manager) Compose(opts *ComposeOptions) []types.Message {
+	msgs, _ := m.ComposeWithDemotion(opts)
+	return msgs
+}
+
+// ComposeWithDemotion Compose + 本次实际降级的注入 id（2026-10-05）：
+// 4xx 回退阶梯据此回写侧车——降级范围由组装过程给出，调用方不重算。
+func (m *Manager) ComposeWithDemotion(opts *ComposeOptions) ([]types.Message, []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.composeLocked(opts)
@@ -231,14 +238,15 @@ func (m *Manager) Compose(opts *ComposeOptions) []types.Message {
 // prepend 自我生命感知块（本实例端口/pid + LLM 端口/pid，每次调用现算 →
 // 端口/pid 变化实时更新）。消息本体不再注入任何东西（时间戳功能同日砍掉），
 // 会话前缀跨 run 逐 token 稳定 → KV 前缀可复用。
-func (m *Manager) composeLocked(opts *ComposeOptions) []types.Message {
-	msgs := ComposeMessages(m.session, m.systemPrompt, opts)
+func (m *Manager) composeLocked(opts *ComposeOptions) ([]types.Message, []string) {
+	r := ComposeMessages(m.session, m.systemPrompt, opts)
+	msgs := r.Messages
 	if sb := m.selfBlockLocked(); sb != "" {
 		if sp, ok := msgs[0].Content.(string); ok {
 			msgs[0].Content = sb + "\n\n" + sp
 		}
 	}
-	return msgs
+	return msgs, r.DemotedInjectIDs
 }
 
 // EstimateTotalTokens 总 token 估算：system + summary + 全部消息
@@ -332,7 +340,7 @@ func (m *Manager) doCompress(batch []types.RawEntry) {
 		oldSummary = m.session.Summary.Content
 	}
 	beforeChars := sessionChars(m.session)
-	prefix := m.composeLocked(nil)
+	prefix, _ := m.composeLocked(nil)
 	streamIdleMS := m.cfg.StreamIdleMS
 	m.mu.Unlock()
 

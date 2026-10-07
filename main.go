@@ -69,6 +69,15 @@ func main() {
 	// 不再出现"配置可改、描述写死"的不一致。
 	tools.Configure(cfg.Tools.FgTimeoutMS, cfg.Tools.TimeoutMS)
 
+	// ipython 元工具（可选）：未配置 tools.ipython_python 时不注册，
+	// 工具表保持原样（既有 KV 前缀不失效）。探测失败只告警、不阻断启动——
+	// 不会因为没装 IPython 就让整个 agent 起不来。
+	if err := tools.ConfigureIPython(cfg.Tools.IPythonPython); err != nil {
+		fmt.Fprintf(os.Stderr, "⚠️ ipython 工具未启用：%v\n", err)
+	} else if tools.IPythonEnabled() {
+		fmt.Fprintf(os.Stdout, "ipython 工具已启用（%s）\n", tools.PythonPathForLog())
+	}
+
 	// ---------- 可选提示词目录（命令行第一个非 flag 参数） ----------
 	// 指定则覆盖 cfg.system_prompt.dir（解析为绝对路径）；缺省用 config 里的相对目录。
 	var promptDirRel string
@@ -96,7 +105,8 @@ func main() {
 			_ = ln.Close()
 			break
 		}
-		if strings.Contains(strings.ToLower(err.Error()), "in use") {
+		if strings.Contains(strings.ToLower(err.Error()), "in use") ||
+			strings.Contains(err.Error(), "Only one usage of each socket address") {
 			port++
 			fmt.Fprintf(os.Stderr, "[server] 端口 %d 被占用，试 %d\n", port-1, port)
 			continue
@@ -115,6 +125,10 @@ func main() {
 		dataDir += suffix
 	}
 	cfg.Data.Dir = dataDir
+
+	// ipython 的图片/PDF 落盘目录（<dataDir>/ipython-output）。
+	// 放在数据目录而非临时目录：临时目录会被系统清理，而模型可能隔几轮才来读。
+	tools.SetIPythonArtifactDir(dataDir)
 
 	p, err := persist.Init(dataDir)
 	if err != nil {
