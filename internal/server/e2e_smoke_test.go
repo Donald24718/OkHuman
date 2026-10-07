@@ -20,6 +20,10 @@ import (
 // → /history（空）→ /chat（新会话续跑）。-race 下抓 COW/reset/队列路径的竞态。
 func TestHTTPEndToEnd(t *testing.T) {
 	cfg := config.Default()
+	// 本冒烟测试脚本化 FakeLLM 步骤按旧行为（无工具调用即收笔）设计，
+	// 显式关轮末校验避免每轮多一次 LLM 调用把步骤队列错位
+	//（end_check 行为本身有 internal/agent 单测覆盖）
+	cfg.Agent.EndCheck = false
 	cfg.Data.Dir = t.TempDir()
 	fake := llm.NewFakeLLM([]llm.FakeStep{
 		{Type: "text", Text: "回复一"},
@@ -174,6 +178,10 @@ func TestHistoryTruncatedDuringRunningRound(t *testing.T) {
 	})
 	fake.ChunkDelayMS = 15
 	cfg := config.Default()
+	// 本冒烟测试脚本化 FakeLLM 步骤按旧行为（无工具调用即收笔）设计，
+	// 显式关轮末校验避免每轮多一次 LLM 调用把步骤队列错位
+	//（end_check 行为本身有 internal/agent 单测覆盖）
+	cfg.Agent.EndCheck = false
 	cfg.Data.Dir = t.TempDir()
 	a := CreateAgentState(cfg, fake, "sys", []PromptFileInfo{}, true, "")
 	st := NewAppState(cfg, t.TempDir(), a)

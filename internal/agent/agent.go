@@ -51,6 +51,10 @@ type RunOptions struct {
 	DoomWarnAfter int
 	// 前台执行超时（毫秒）：超时不取消，转后台 + 双向通知（§7.3）
 	FgTimeoutMS int
+	// 轮末校验（2026-09-26）：模型无工具调用结束输出（=发出本轮停止信号）时，
+	// 注入校验提示"目前有没有还未完成的事情"——模型发工具调用则马上继续做，
+	// 仍无工具调用才正式收笔（每次停止至多校验一次）
+	EndCheck bool
 	// 轮内搭车（2026-09-14 统一）：工具循环中每次 LLM 调用前调用，取走运行期间
 	// 入队的全部消息——用户追加消息与已 settle 后台任务的通知（同一消息队列、
 	// 同一 splice 逻辑、取走即消费；纯追加，不加 LLM 调用）
@@ -251,10 +255,9 @@ func (a *Agent) runUserMessage(ctx context.Context, userText string, opt RunOpti
 		}
 		resp = r2
 	}
-	// 纯文本回复 → 本轮结束
-	if len(resp.ToolCalls) == 0 {
-		return a.finishText(resp, emit, &totals)
-	}
+	// 收笔路径统一走 runLoop：纯文本回复（=本轮停止信号）进轮末校验分支
+	// （end_check 开 → 先追问"有无未完成事项"一次再收笔；关 → 直接收笔），
+	// 工具调用进工具循环。
 	// 注意：必须等 runLoop 完成后再 return（Go 无 JS 的 return-promise 陷阱，
 	// defer 顺序天然正确）
 	return a.runLoop(runCtx, resp, emit, &totals, opt)
@@ -561,13 +564,47 @@ func (a *Agent) finishText(resp *types.Response, emit func(types.AgentEvent), to
 	return resp.Content, nil
 }
 
-// runLoop 工具循环：从一次"带 tool_calls 的 LLM 响应"开始，逐个执行工具并回填，
-// 直到模型返回纯文本（或强停后收尾）。不设迭代上限：靠 §8 死循环检测兜底。
+// endCheckMsg 轮末校验提示文案（2026-09-26，用户定语义）：模型过早发出本轮
+// 停止信号（输出结束但无工具调用）→ 追问"目前有没有还未完成的事情"：
+// 没有就直接发停止信号（纯文本收笔），有就马上开始做（发工具调用继续执行）。
+const endCheckMsg = "（系统校验：你刚结束输出但没有工具调用——即已发出本轮停止信号。请检查目前有没有还未完成的事情：没有就直接发停止信号；有就马上开始做，发出工具调用继续执行。）"
+
+// runLoop 工具循环：从一次 LLM 响应开始，带 tool_calls → 逐个执行工具并回填 →
+// 再 LLM；无工具调用（=本轮停止信号）→ 轮末校验分支。不设迭代上限：
+// 靠 §8 死循环检测兜底。
+//
+// 轮末校验（end_check，2026-09-26 用户定）：模型过早发停止信号（如说了
+// "接下来做 X"却收笔）时，收笔前注入校验提示追问一次：
+//   - 模型发工具调用 → 有未完成事项，本循环马上继续做；
+//   - 模型仍无工具调用 → 确认真的做完了，正式收笔（本轮回复取校验前正文）。
+//
+// 每次停止至多校验一次（校验后仍停 → 直接收笔，防追问乒乓）；
+// end_check 关（配置 agent.end_check=false）→ 无工具调用即收笔（旧行为）。
 func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(types.AgentEvent), totals *TokenTotals, opt RunOptions) (string, error) {
 	for {
 		calls := resp.ToolCalls
 		if len(calls) == 0 {
-			return a.finishText(resp, emit, totals) // 防御：纯文本收尾
+			// 模型输出结束无工具调用 = 发出本轮停止信号（2026-09-26 轮末校验）
+			if opt.EndCheck {
+				a.cm.AddMessage(&types.RawEntry{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent})
+				emit(types.AgentEvent{"type": "end_check", "detail": "输出结束无工具调用（=停止信号）→ 追问有无未完成事项"})
+				a.cm.AddMessage(&types.RawEntry{Role: "user", Content: endCheckMsg})
+				r, err := a.llmCall(ctx, emit, totals)
+				if err != nil {
+					return a.finishRunError(err, ctx, emit, totals)
+				}
+				if len(r.ToolCalls) == 0 {
+					// 校验确认：追问后仍无工具调用 → 确无未完成事项，正式收笔。
+					// 校验回复存 assistant 消息（与校验提示配对，协议完整），
+					// 但本轮回复文本取校验前的正文（真实答案，而非校验应答）。
+					a.cm.AddMessage(&types.RawEntry{Role: "assistant", Content: r.Content, ReasoningContent: r.ReasoningContent})
+					emit(types.AgentEvent{"type": "done", "usage": totals})
+					return resp.Content, nil
+				}
+				resp = r // 有未完成事项 → 马上开始做（继续工具循环）
+				continue
+			}
+			return a.finishText(resp, emit, totals) // 校验关：无工具调用即收笔（旧行为）
 		}
 		// 先存 assistant 消息（带 tool_calls，原样回传）
 		a.cm.AddMessage(&types.RawEntry{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent, ToolCalls: calls})
@@ -694,10 +731,7 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 		if err != nil {
 			return a.finishRunError(err, ctx, emit, totals)
 		}
-		if len(next.ToolCalls) == 0 {
-			return a.finishText(next, emit, totals)
-		}
-		resp = next
+		resp = next // 无工具调用（=停止信号）→ 下一圈顶部进轮末校验分支
 	}
 }
 

@@ -69,6 +69,68 @@ func TestTruncationGiveUp(t *testing.T) {
 	}
 }
 
+// TestEndCheckContinue 轮末校验-继续干活（2026-09-26）：模型过早发停止信号
+// （无工具调用）→ 注入校验提示 → 模型发工具调用 → 继续干活 → 再停止 → 再校验 →
+// 模型仍停 → 正式收笔。断言：两次停止各校验一次、工具确实执行、回复取校验前正文
+// （而非校验应答）、校验提示确实注入进上下文（第 2/4 次请求末条消息）。
+func TestEndCheckContinue(t *testing.T) {
+	a, fake := newTestAgent([]llm.FakeStep{
+		{Type: "text", Text: "我先说完这句话"}, // 第一次"停止"（过早）
+		{Type: "tool", Name: "bash", Args: map[string]interface{}{"command": "echo hi"}},
+		{Type: "text", Text: "活干完了，这是最终答案"}, // 第二次"停止"（真做完）
+		{Type: "text", Text: "确认没有未完成事项"},   // 校验回复（收笔，不当回复）
+	})
+	var checks int
+	opt := testRunOptEndCheck(&checks)
+	reply, err := a.Run(context.Background(), "你好", opt)
+	if err != nil {
+		t.Fatalf("run 失败: %v", err)
+	}
+	if reply != "活干完了，这是最终答案" {
+		t.Errorf("回复应取校验前正文，实际: %q", reply)
+	}
+	if checks != 2 {
+		t.Errorf("两次停止应各校验一次（2 条 end_check 事件），实际 %d 条", checks)
+	}
+	if len(fake.Requests) != 4 {
+		t.Errorf("应共 4 次 LLM 请求（2 停止 + 2 校验），实际 %d 次", len(fake.Requests))
+	}
+	// 校验提示注入断言：第 2 次（index 1）与第 4 次（index 3）请求末条消息 = endCheckMsg
+	for _, i := range []int{1, 3} {
+		req := fake.Requests[i]
+		last := req[len(req)-1]
+		s, ok := last.Content.(string)
+		if !ok || s != endCheckMsg {
+			t.Errorf("第 %d 次请求末条消息应为校验提示，实际 role=%s content=%q", i+1, last.Role, s)
+		}
+	}
+}
+
+// TestEndCheckOff 轮末校验关（end_check=false）→ 旧行为：无工具调用立即收笔，
+// 不注入校验提示、不多发 LLM 请求（回归保护）。
+func TestEndCheckOff(t *testing.T) {
+	a, fake := newTestAgent([]llm.FakeStep{
+		{Type: "text", Text: "直接收笔"},
+		{Type: "text", Text: "不应被消费"},
+	})
+	var checks int
+	opt := testRunOptEndCheck(&checks)
+	opt.EndCheck = false
+	reply, err := a.Run(context.Background(), "你好", opt)
+	if err != nil {
+		t.Fatalf("run 失败: %v", err)
+	}
+	if reply != "直接收笔" {
+		t.Errorf("回复应为第一次文本，实际: %q", reply)
+	}
+	if checks != 0 {
+		t.Errorf("end_check 关不应有校验事件，实际 %d 条", checks)
+	}
+	if len(fake.Requests) != 1 {
+		t.Errorf("应只有 1 次 LLM 请求，实际 %d 次", len(fake.Requests))
+	}
+}
+
 func testRunOpt(warns *[]string) RunOptions {
 	return RunOptions{
 		DataDir:       "/tmp/okhuman-agent-test",
@@ -76,6 +138,7 @@ func testRunOpt(warns *[]string) RunOptions {
 		DoomWarnAfter: 3,
 		FgTimeoutMS:   30000,
 		Kind:          "user",
+		EndCheck:      true, // 默认开（与出厂配置一致）；个别测试显式关
 		OnEvent: func(e types.AgentEvent) {
 			if e["type"] == "trunc_warn" {
 				if d, ok := e["detail"].(string); ok {
@@ -84,6 +147,20 @@ func testRunOpt(warns *[]string) RunOptions {
 			}
 		},
 	}
+}
+
+// testRunOptEndCheck 带 end_check 事件计数的 RunOptions（EndCheck 开）
+func testRunOptEndCheck(checks *int) RunOptions {
+	opt := testRunOpt(&[]string{})
+	opt.EndCheck = true
+	orig := opt.OnEvent
+	opt.OnEvent = func(e types.AgentEvent) {
+		if e["type"] == "end_check" {
+			*checks++
+		}
+		orig(e)
+	}
+	return opt
 }
 
 // failOnceClient 第一次 Complete/CompleteStream 返回 400（模拟坏图片 part 被

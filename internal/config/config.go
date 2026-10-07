@@ -19,6 +19,7 @@ type Config struct {
 	Context      ContextCfg      `json:"context"`
 	Tools        ToolsCfg        `json:"tools"`
 	Doom         DoomCfg         `json:"doom"`
+	Agent        AgentCfg        `json:"agent"`
 }
 
 type ServerCfg struct {
@@ -61,6 +62,14 @@ type DoomCfg struct {
 	WarnAfter int `json:"warn_after"`
 }
 
+// AgentCfg agent 主循环行为参数
+type AgentCfg struct {
+	// EndCheck 轮末校验（2026-09-26 用户定）：模型无工具调用结束输出（=发出本轮
+	// 停止信号）时，追问一次"目前有没有还未完成的事情"——有则马上开始做，
+	// 没有才正式收笔（每次停止至多校验一次）
+	EndCheck bool `json:"end_check"`
+}
+
 // Default 出厂默认（2026-09-14 易迁移：data 目录默认 $HOME/.okhuman；
 // 部署可用 config/default.json 或 OKHUMAN_DATA_DIR 环境变量覆盖）
 func Default() *Config {
@@ -76,6 +85,7 @@ func Default() *Config {
 		Context:      ContextCfg{MaxTokens: 150000, KeepRecentChars: 60000, HardTruncChars: 150000, StreamIdleMS: 90000, CharsPerToken: 1.5},
 		Tools:        ToolsCfg{FgTimeoutMS: 30000, ResultLimit: 10000, TimeoutMS: 600000},
 		Doom:         DoomCfg{WarnAfter: 3},
+		Agent:        AgentCfg{EndCheck: true},
 	}
 }
 

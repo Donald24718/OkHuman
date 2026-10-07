@@ -244,6 +244,7 @@ func runOpt(a *AgentState, state *AppState) agent.RunOptions {
 		DataDir:       cfg.Data.Dir,
 		ResultLimit:   cfg.Tools.ResultLimit,
 		DoomWarnAfter: cfg.Doom.WarnAfter,
+		EndCheck:      cfg.Agent.EndCheck,
 		FgTimeoutMS:   cfg.Tools.FgTimeoutMS,
 		// 轮内搭车（2026-09-14 统一）：与 drain（runDrain）共享同一队列、splice 原子取走，
 		// 携带用户追加消息 + 已 settle 后台任务的通知（同一队列、同一逻辑）。
@@ -487,7 +488,7 @@ func runDrain(state *AppState, a *AgentState, h *drainHandle, onEvent func(types
 
 // ---------- 运行时配置热更新（WebUI 配置页，2026-08-29，2026-09-09 单实例化） ----------
 
-var hotSections = []string{"llm", "context", "tools", "doom"}
+var hotSections = []string{"llm", "context", "tools", "doom", "agent"}
 var restartSections = []string{"server", "data", "system_prompt"} // 改后需重启进程
 
 type PatchResult struct {
@@ -527,6 +528,9 @@ func applyConfigPatch(a *AgentState, patch map[string]interface{}) PatchResult {
 	}
 	if has("doom") {
 		applied = append(applied, "doom（死循环告警阈值，下轮运行生效）")
+	}
+	if has("agent") {
+		applied = append(applied, "agent（轮末校验开关，下轮运行生效）")
 	}
 
 	// COW 热更新（2026-09-14 审计修：旧实现 ApplyPatchInPlace 原地改共享
@@ -1439,7 +1443,7 @@ func (ap *App) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 	}
 	for k := range patch {
 		if !known[k] {
-			writeJSON(w, 400, map[string]interface{}{"error": fmt.Sprintf("未知配置段：%s（允许：llm / context / tools / doom / server / data / system_prompt）", k)})
+			writeJSON(w, 400, map[string]interface{}{"error": fmt.Sprintf("未知配置段：%s（允许：llm / context / tools / doom / agent / server / data / system_prompt）", k)})
 			return
 		}
 	}
