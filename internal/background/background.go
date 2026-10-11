@@ -166,21 +166,6 @@ func (o *BackgroundOrchestrator) Snapshot() []types.PendingBackgroundTask {
 	return out
 }
 
-// Unsettled 未 settle 的后台任务数（2026-10-11）：>0 表示模型正在等外部结果，
-// 结果会自动通知 → end_check 据此不追问，省一次真实推理算力。
-// 注意：只统计经编排器注册的转后台任务；setsid 完全脱离的任务不在表里。
-func (o *BackgroundOrchestrator) Unsettled() int {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	n := 0
-	for _, t := range o.tasks {
-		if !t.Settled {
-			n++
-		}
-	}
-	return n
-}
-
 // Count 任务总数（含未完成）
 func (o *BackgroundOrchestrator) Count() int {
 	o.mu.Lock()
