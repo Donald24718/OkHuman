@@ -9,7 +9,7 @@
 
 ```bash
 # 0) 依赖：一个 OpenAI 兼容的 LLM 端点（llama.cpp / Ollama / vLLM 均可）
-#    不想编译的话：Releases 里有 linux/amd64 预编译二进制，下载即用
+#    不想编译的话：Releases 里有 Actions 自动构建的包（linux/amd64、linux/arm64、darwin/arm64），解压即用
 # 1) 编译主程序（Go 1.22+）
 go build -o okhuman .
 

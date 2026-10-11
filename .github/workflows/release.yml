@@ -1,0 +1,86 @@
+name: release
+
+# 打 tag（v*）或手动触发 → 交叉编译 → 打包成带 webui/prompts/config 的 tar.gz → 发 Release。
+# 注意：主程序从磁盘读 webui/index.html（无 go:embed），单二进制跑不起来，
+# 所以发布物必须是含目录的包，不能只上传裸二进制。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: arm64
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"   # go.mod 要求
+
+      - name: vet & test
+        # 测试跑在 runner 本机架构（GOOS/GOARCH 交叉时测试无意义，先清掉）
+        env: { GOOS: "", GOARCH: "" }
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: build
+        run: |
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          NAME="okhuman-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p dist/"$NAME"
+          go build -trimpath -ldflags "-s -w" -o dist/"$NAME"/okhuman .
+
+          # 运行期必需：webui（静态页）、prompts（系统提示词）、config（默认配置）
+          cp -r webui prompts config dist/"$NAME"/
+          # 实值配置不入库也不入包，只带模板
+          rm -f dist/"$NAME"/config/user.json
+          cp README.md LICENSE dist/"$NAME"/ 2>/dev/null || cp README.md dist/"$NAME"/
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "PKG=$NAME.tar.gz" >> "$GITHUB_ENV"
+
+      - name: pack
+        run: |
+          cd dist
+          # 归档带一层顶层目录（解压不散落）：okhuman-<ver>-<os>-<arch>/
+          tar czf "$PKG" "${PKG%.tar.gz}"
+          echo "归档内容："; tar tzf "$PKG" | head -8
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG }}
+          path: dist/${{ env.PKG }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          fail_on_unmatched_files: true

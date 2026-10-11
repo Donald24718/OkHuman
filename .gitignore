@@ -42,3 +42,7 @@ plugins/voice-chat/speaker/__pycache__/
 
 # 测试产物
 *.test
+
+# Actions 发布的包（版本号-os-arch.tar.gz），不再入库
+okhuman-v*-*.tar.gz
+/okhuman-*-*-*
