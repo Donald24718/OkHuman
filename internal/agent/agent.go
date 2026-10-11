@@ -62,7 +62,10 @@ type RunOptions struct {
 	// 工具转后台时回调（由 server.runOpt 实现：注册任务 + 挂 settle 回调；
 	// settle 时通知自动入消息队列，2026-09-14）
 	OnBackgroundStart func(types.BackgroundStartArgs)
-	OnEvent           func(types.AgentEvent)
+	// 未 settle 的后台任务数（2026-10-11，end_check 用）：>0 表示模型在等外部
+	// 结果、结果会自动通知 → 不追问直接收笔。nil = 无法判定，按原行为追问。
+	UnsettledBackground func() int
+	OnEvent             func(types.AgentEvent)
 	// 本轮消息来源（事件广播标记用，2026-08-31）：user = 单条用户消息；
 	// merged = 运行中积攒的多条合并消息。
 	Kind string
@@ -564,10 +567,11 @@ func (a *Agent) finishText(resp *types.Response, emit func(types.AgentEvent), to
 	return resp.Content, nil
 }
 
-// endCheckMsg 轮末校验提示文案（2026-09-26，用户定语义）：模型过早发出本轮
-// 停止信号（输出结束但无工具调用）→ 追问"目前有没有还未完成的事情"：
-// 没有就直接发停止信号（纯文本收笔），有就马上开始做（发工具调用继续执行）。
-const endCheckMsg = "（系统校验：你刚结束输出但没有工具调用——即已发出本轮停止信号。请检查目前有没有还未完成的事情：没有就直接发停止信号；有就马上开始做，发出工具调用继续执行。）"
+// endCheckMsg 轮末校验提示文案（2026-09-26 用户定语义；2026-10-11 简化）。
+// 判据从"有没有还未完成的事情"改为"此刻有没有必须你现在就做的动作"——
+// 前者会被读成"任务没全完=有"，导致等待后台结果时反复追问、白烧推理算力。
+// "在等外部结果"这一态已由机制层（UnsettledBackground 闸门）排除，故文案可最短。
+const endCheckMsg = "（系统校验：你刚结束输出且未调用工具。此刻有没有必须你现在就做的动作？有 → 发出工具调用；没有 → 不再调用工具，一句话收笔。）"
 
 // runLoop 工具循环：从一次 LLM 响应开始，带 tool_calls → 逐个执行工具并回填 →
 // 再 LLM；无工具调用（=本轮停止信号）→ 轮末校验分支。不设迭代上限：
@@ -585,6 +589,17 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 		calls := resp.ToolCalls
 		if len(calls) == 0 {
 			// 模型输出结束无工具调用 = 发出本轮停止信号（2026-09-26 轮末校验）
+			// 闸门（2026-10-11）：有未 settle 的后台任务 → 模型在等自动通知，
+			// 追问只会多烧一次 LLM 调用，直接收笔。
+			n := 0
+			if opt.UnsettledBackground != nil {
+				n = opt.UnsettledBackground()
+			}
+			if opt.EndCheck && n > 0 {
+				emit(types.AgentEvent{"type": "end_check_skipped",
+					"detail": fmt.Sprintf("有 %d 个后台任务未 settle，结果会自动通知 → 不追问，直接收笔", n)})
+				return a.finishText(resp, emit, totals)
+			}
 			if opt.EndCheck {
 				a.cm.AddMessage(&types.RawEntry{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent})
 				emit(types.AgentEvent{"type": "end_check", "detail": "输出结束无工具调用（=停止信号）→ 追问有无未完成事项"})
