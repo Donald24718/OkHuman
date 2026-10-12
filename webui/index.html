@@ -784,9 +784,6 @@ function handleChatEvent(type, data) {
     case "doom_stop":
       chatAddHtml(evCard("doom", "⛔", "死循环强停", data.detail));
       break;
-    case "trunc_warn":
-      chatAddHtml(evCard("doom", "✂️", "异常截断", data.detail));
-      break;
     case "end_check":
       streamEnd();
       chatAddHtml(evCard("doom", "🔍", "轮末校验", data.detail));
@@ -847,7 +844,6 @@ function eventsFor() {
   on("compress_delta", (d) => handleChatEvent("compress_delta", d));
   on("doom_warn", (d) => handleChatEvent("doom_warn", d));
   on("doom_stop", (d) => handleChatEvent("doom_stop", d));
-  on("trunc_warn", (d) => handleChatEvent("trunc_warn", d));
   on("end_check", (d) => handleChatEvent("end_check", d));
   on("error", (d) => {
     // EventSource 的 "error" 分两种——服务端广播的 run error 带 data，连接自身断开无 data（浏览器自动重连）。

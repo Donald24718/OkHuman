@@ -25,54 +25,45 @@ func newTestAgent(steps []llm.FakeStep) (*Agent, *llm.FakeLLM) {
 
 func t0TempDir() string { return "/tmp/okhuman-agent-test" }
 
-// TestTruncationRetry 异常截断检测（2026-09-15 移植自 TS bf7090b）：
-// 响应有 thinking 但无正文也无工具调用 → emit trunc_warn + 注入提示重试一次，
-// 重试正常 → 本轮正常结束（重试后的正文为回复）。
-func TestTruncationRetry(t *testing.T) {
+// TestThinkingOnlyStopLoop 有 thinking、正文空、无 tool_calls（旧"异常截断"独立分支
+// 的场景，2026-10-13 撤掉该分支）→ 由收笔判定接管：注入停止指令提示词重问，模型
+// 补出正文并带停止指令才收笔。断言：追问 1 次、共 2 次 LLM 请求、回复为补出的正文、
+// 且追问那次的上下文里已带着上一条的 reasoning_content（模型不必重想）。
+func TestThinkingOnlyStopLoop(t *testing.T) {
 	thinking := "思考了很久但忘了写正文……"
-	a, _ := newTestAgent([]llm.FakeStep{
-		{Type: "text", Text: "", Reasoning: &thinking}, // 第一次：异常截断
-		{Type: "text", Text: "重试成功"},                   // 重试：正常回复
+	a, fake := newTestAgent([]llm.FakeStep{
+		{Type: "text", Text: "", Reasoning: &thinking}, // 只有思考：无正文无工具调用
+		{Type: "text", Text: "补上正文 [[[[STOP]]]]"},
 	})
-	var warns []string
-	opt := testRunOpt(&warns)
-	reply, err := a.Run(context.Background(), "你好", opt)
+	var prompts int
+	reply, err := a.Run(context.Background(), "你好", testRunOptStop(&prompts))
 	if err != nil {
 		t.Fatalf("run 失败: %v", err)
 	}
-	if !strings.Contains(reply, "重试成功") {
-		t.Errorf("回复应为重试结果，实际: %q", reply)
+	if prompts != 1 {
+		t.Errorf("应由收笔判定追问 1 次，实际 %d 次", prompts)
 	}
-	if len(warns) != 1 {
-		t.Errorf("应恰好 1 条 trunc_warn，实际 %d 条: %v", len(warns), warns)
+	if len(fake.Requests) != 2 {
+		t.Errorf("应共 2 次 LLM 请求，实际 %d 次", len(fake.Requests))
 	}
-}
-
-// TestTruncationGiveUp 重试后仍截断 → 第 2 条 trunc_warn（放弃事件）后原样收尾（空正文）。
-func TestTruncationGiveUp(t *testing.T) {
-	thinking := "思考了很久但忘了写正文……"
-	a, _ := newTestAgent([]llm.FakeStep{
-		{Type: "text", Text: "", Reasoning: &thinking},
-		{Type: "text", Text: "", Reasoning: &thinking}, // 重试仍截断
-	})
-	var warns []string
-	opt := testRunOpt(&warns)
-	reply, err := a.Run(context.Background(), "你好", opt)
-	if err != nil {
-		t.Fatalf("run 失败: %v", err)
+	if reply != "补上正文 [[[[STOP]]]]" {
+		t.Errorf("回复应为补出的正文，实际: %q", reply)
 	}
-	if reply != "" {
-		t.Errorf("放弃轮回复应为空，实际: %q", reply)
+	var seen bool
+	for _, m := range fake.Requests[1] {
+		if m.Role == "assistant" && m.ReasoningContent != nil && *m.ReasoningContent == thinking {
+			seen = true
+		}
 	}
-	if len(warns) != 2 {
-		t.Errorf("应有 2 条 trunc_warn，实际 %d 条: %v", len(warns), warns)
+	if !seen {
+		t.Errorf("追问时上一条思考应已在上下文里（模型不必重想）")
 	}
 }
 
 // TestStopLoopContinue 收笔判定-继续干活（2026-10-12，替换旧 end_check）：模型无
-// 工具调用但正文末尾没有停止指令 → 注入提示词 → 模型改发工具调用 → 继续干活 →
-// 再结束时带上停止指令 → 正式收笔（回复剥掉指令）。断言：注入 1 次提示词、工具
-// 确实执行、共 3 次请求、第 2 次请求末条 = stopPromptMsg、回复不含停止指令。
+// 工具调用但正文没有停止指令 → 注入提示词 → 模型改发工具调用 → 继续干活 →
+// 再结束时带上停止指令 → 正式收笔（回复原样保留指令，不剥）。断言：注入 1 次
+// 提示词、工具确实执行、共 3 次请求、第 2 次请求末条 = stopPromptMsg、回复原样含指令。
 func TestStopLoopContinue(t *testing.T) {
 	a, fake := newTestAgent([]llm.FakeStep{
 		{Type: "text", Text: "我先说完这句话"}, // 无停止指令 → 被追问
@@ -127,7 +118,7 @@ func TestEndCheckOff(t *testing.T) {
 	}
 }
 
-func testRunOpt(warns *[]string) RunOptions {
+func testRunOpt() RunOptions {
 	return RunOptions{
 		DataDir:       "/tmp/okhuman-agent-test",
 		ResultLimit:   50000,
@@ -138,21 +129,13 @@ func testRunOpt(warns *[]string) RunOptions {
 		// 夹具步骤耗尽后 fake 会持续返回"步骤耗尽"文本 → 不显式开就会无限转。
 		// 收笔判定专项测试用 testRunOptStop 显式开。
 		EndCheck: false,
-		OnEvent: func(e types.AgentEvent) {
-			if e["type"] == "trunc_warn" {
-				if d, ok := e["detail"].(string); ok {
-					*warns = append(*warns, d)
-				}
-			}
-		},
 	}
 }
 
 // testRunOptStop 带 stop_prompt 事件计数的 RunOptions（收笔判定开）
 func testRunOptStop(prompts *int) RunOptions {
-	opt := testRunOpt(&[]string{})
+	opt := testRunOpt()
 	opt.EndCheck = true
-	orig := opt.OnEvent
 	opt.OnEvent = func(e types.AgentEvent) {
 		// end_check 事件追问与收笔都发 → 只数"重问"那类，断言才对应追问次数
 		if e["type"] == "end_check" {
@@ -160,7 +143,6 @@ func testRunOptStop(prompts *int) RunOptions {
 				*prompts++
 			}
 		}
-		orig(e)
 	}
 	return opt
 }
@@ -224,8 +206,7 @@ func TestInjectDemotePersist(t *testing.T) {
 	}})
 	a := New(&failOnceClient{inner: inner, fails: 1}, "系统提示", cm, injectDir)
 
-	var warns []string
-	reply, err := a.Run(context.Background(), "你好", testRunOpt(&warns))
+	reply, err := a.Run(context.Background(), "你好", testRunOpt())
 	if err != nil {
 		t.Fatalf("run 失败: %v", err)
 	}
@@ -251,7 +232,7 @@ func TestInjectDemotePersist(t *testing.T) {
 }
 
 // TestNoBackgroundGateStillAsks 闸门已撤（2026-10-12 用户定）：有未 settle 的
-// 后台任务时也不再直接收笔——正文末尾没有停止指令就照常追问。断言：追问 1 次、
+// 后台任务时也不再直接收笔——正文没有停止指令就照常追问。断言：追问 1 次、
 // 2 次请求、不再有 end_check_skipped 事件。
 func TestNoBackgroundGateStillAsks(t *testing.T) {
 	a, fake := newTestAgent([]llm.FakeStep{

@@ -246,47 +246,16 @@ func (a *Agent) runUserMessage(ctx context.Context, userText string, opt RunOpti
 	if err != nil {
 		return a.finishRunError(err, runCtx, emit, &totals)
 	}
-	// 异常截断（2026-09-15）：有 thinking 但无正文也无工具调用 → 不是"纯文本回复"：提示模型 + 重试一次
-	if isTruncated(resp) {
-		r2, err2 := a.retryTruncation(runCtx, emit, &totals)
-		if err2 != nil {
-			return a.finishRunError(err2, runCtx, emit, &totals)
-		}
-		resp = r2
-	}
 	// 收笔路径统一走 runLoop：纯文本回复（=本轮停止信号）进轮末校验分支
-	// （end_check 开 → 先追问"有无未完成事项"一次再收笔；关 → 直接收笔），
+	// （end_check 开 → 正文必须含停止指令 [[[[STOP]]]] 才算收笔，否则注入提示词重问、
+	//   无次数上限；关 → 直接收笔），
 	// 工具调用进工具循环。
+	// 有 thinking 但无正文也无工具调用（旧"异常截断"独立分支，2026-10-13 撤）同样落进
+	// 上面的轮末校验分支：那条响应连同 reasoning_content 一起进历史，追问后模型接着写
+	// 正文即可，不必重想；不给次数上限，模型要能一直跑。
 	// 注意：必须等 runLoop 完成后再 return（Go 无 JS 的 return-promise 陷阱，
 	// defer 顺序天然正确）
 	return a.runLoop(runCtx, resp, emit, &totals, opt)
-}
-
-// isTruncated 异常截断判定（2026-09-15）：响应有 thinking 但无正文也无工具调用。
-//
-//	服务端提前收笔（Q2 量化提前 stop token / MTP 投机解码异常）——OkHuman 请求不发
-//	max_tokens（纯协议层），客户端没有截断理由，流是干净结束的 HTTP 200。
-func isTruncated(resp *types.Response) bool {
-	return len(resp.ToolCalls) == 0 &&
-		strings.TrimSpace(resp.Content) == "" &&
-		resp.ReasoningContent != nil &&
-		strings.TrimSpace(*resp.ReasoningContent) != ""
-}
-
-// retryTruncation 异常截断处置：WebUI 事件 + 向模型注入提示 + 重试一次 llmCall。
-//
-//	只重试一次（防死循环）；重试仍截断 → emit 放弃事件后原样返回。
-func (a *Agent) retryTruncation(ctx context.Context, emit func(types.AgentEvent), totals *TokenTotals) (*types.Response, error) {
-	emit(types.AgentEvent{"type": "trunc_warn", "detail": "有 thinking 但无正文也无工具调用 → 异常截断，提示模型重发"})
-	a.cm.AddMessage(&types.RawEntry{Role: "user", Content: "（系统提示：你上一条响应有思考内容，但未输出正文或工具调用，判定为异常截断。请基于当前上下文重新输出完整正文或工具调用。）"})
-	resp, err := a.llmCall(ctx, emit, totals)
-	if err != nil {
-		return nil, err
-	}
-	if isTruncated(resp) {
-		emit(types.AgentEvent{"type": "trunc_warn", "detail": "重试后仍无正文或工具调用 → 本轮放弃（请查 LLM 服务端日志的 stop 原因）"})
-	}
-	return resp, nil
 }
 
 // finishRunError runUserMessage 顶层错误收尾：AgentStoppedError → partial 收尾；
@@ -566,11 +535,11 @@ func (a *Agent) finishText(resp *types.Response, emit func(types.AgentEvent), to
 }
 
 // stopToken 停止指令（2026-10-12 用户定，替换旧 end_check 的"追问一次"）：
-// 模型无工具调用结束时，必须在正文末尾原样输出该指令才算收笔；没输出 →
+// 模型无工具调用结束时，必须在正文中原样输出该指令才算收笔（位置不限）；没输出 →
 // 系统持续注入提示词重问，不设次数上限。
 const stopToken = "[[[[STOP]]]]"
 
-// stopPromptMsg 未给停止指令时注入的提示词（明确"只有正文末尾算数、思考里不算"）。
+// stopPromptMsg 未给停止指令时注入的提示词（明确"正文中出现即算、位置不限、思考里不算"）。
 const stopPromptMsg = "（系统提示：你本轮未调用工具，且正文里没有停止指令 " + stopToken +
 	"，系统不会结束本轮。若此刻还有必须你现在就做的动作 → 直接发出工具调用；" +
 	"若确无 → 输出正文并在其中原样带上 " + stopToken + "（正文中出现即可，位置不限）。" +
@@ -588,8 +557,8 @@ func isStopSignal(content string) bool {
 // 靠 §8 死循环检测兜底。
 //
 // 收笔判定（2026-10-12 用户定，替换旧 end_check 的"追问一次"）：无工具调用
-// 不再等于收笔——模型必须在正文末尾输出停止指令 [[[[STOP]]]] 才算：
-//   - 正文末尾有该指令 → 正式收笔（回复剥掉指令）；
+// 不再等于收笔——模型必须在正文中输出停止指令 [[[[STOP]]]] 才算：
+//   - 正文含该指令 → 正式收笔（回复原样保留指令，不剥；见 TestStopLoopContinue）；
 //   - 没有 → 注入提示词重问，无次数上限（模型若改为发工具调用 → 继续做）。
 //
 // 闸门已撤（2026-10-12 用户定）：有未 settle 的后台任务也不再直接收笔，
@@ -599,10 +568,10 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 	for {
 		calls := resp.ToolCalls
 		if len(calls) == 0 {
-			// 无工具调用 ≠ 收笔（2026-10-12）：正文末尾必须有停止指令才算。
+			// 无工具调用 ≠ 收笔（2026-10-12）：正文必须含停止指令才算。
 			// 闸门已撤（2026-10-12 用户定）：有未 settle 的后台任务也照常追问。
 			if opt.EndCheck {
-				// 收笔判定（2026-10-12 用户定）：无工具调用时正文末尾必须有停止指令
+				// 收笔判定（2026-10-12 用户定）：无工具调用时正文必须含停止指令
 				// [[[[STOP]]]] 才算收笔；没有 → 注入提示词重问，无次数上限。
 				// 事件名沿用 end_check（WebUI 卡片与流式切块逻辑不变）。
 				backToTools := false
