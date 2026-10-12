@@ -62,10 +62,7 @@ type RunOptions struct {
 	// 工具转后台时回调（由 server.runOpt 实现：注册任务 + 挂 settle 回调；
 	// settle 时通知自动入消息队列，2026-09-14）
 	OnBackgroundStart func(types.BackgroundStartArgs)
-	// 未 settle 的后台任务数（2026-10-11，end_check 用）：>0 表示模型在等外部
-	// 结果、结果会自动通知 → 不追问直接收笔。nil = 无法判定，按原行为追问。
-	UnsettledBackground func() int
-	OnEvent             func(types.AgentEvent)
+	OnEvent           func(types.AgentEvent)
 	// 本轮消息来源（事件广播标记用，2026-08-31）：user = 单条用户消息；
 	// merged = 运行中积攒的多条合并消息。
 	Kind string
@@ -245,7 +242,6 @@ func (a *Agent) runUserMessage(ctx context.Context, userText string, opt RunOpti
 	// 刷新/重开页面后"刷新瞬间在跑那轮"的 user 气泡不丢（前端按文本去重不重画）。
 	emit(types.AgentEvent{"type": "run_msg", "message": userText, "kind": kind})
 
-
 	resp, err := a.llmCall(runCtx, emit, &totals)
 	if err != nil {
 		return a.finishRunError(err, runCtx, emit, &totals)
@@ -267,8 +263,9 @@ func (a *Agent) runUserMessage(ctx context.Context, userText string, opt RunOpti
 }
 
 // isTruncated 异常截断判定（2026-09-15）：响应有 thinking 但无正文也无工具调用。
-//  服务端提前收笔（Q2 量化提前 stop token / MTP 投机解码异常）——OkHuman 请求不发
-//  max_tokens（纯协议层），客户端没有截断理由，流是干净结束的 HTTP 200。
+//
+//	服务端提前收笔（Q2 量化提前 stop token / MTP 投机解码异常）——OkHuman 请求不发
+//	max_tokens（纯协议层），客户端没有截断理由，流是干净结束的 HTTP 200。
 func isTruncated(resp *types.Response) bool {
 	return len(resp.ToolCalls) == 0 &&
 		strings.TrimSpace(resp.Content) == "" &&
@@ -277,7 +274,8 @@ func isTruncated(resp *types.Response) bool {
 }
 
 // retryTruncation 异常截断处置：WebUI 事件 + 向模型注入提示 + 重试一次 llmCall。
-//  只重试一次（防死循环）；重试仍截断 → emit 放弃事件后原样返回。
+//
+//	只重试一次（防死循环）；重试仍截断 → emit 放弃事件后原样返回。
 func (a *Agent) retryTruncation(ctx context.Context, emit func(types.AgentEvent), totals *TokenTotals) (*types.Response, error) {
 	emit(types.AgentEvent{"type": "trunc_warn", "detail": "有 thinking 但无正文也无工具调用 → 异常截断，提示模型重发"})
 	a.cm.AddMessage(&types.RawEntry{Role: "user", Content: "（系统提示：你上一条响应有思考内容，但未输出正文或工具调用，判定为异常截断。请基于当前上下文重新输出完整正文或工具调用。）"})
@@ -567,57 +565,83 @@ func (a *Agent) finishText(resp *types.Response, emit func(types.AgentEvent), to
 	return resp.Content, nil
 }
 
-// endCheckMsg 轮末校验提示文案（2026-09-26 用户定语义；2026-10-11 简化）。
-// 判据从"有没有还未完成的事情"改为"此刻有没有必须你现在就做的动作"——
-// 前者会被读成"任务没全完=有"，导致等待后台结果时反复追问、白烧推理算力。
-// "在等外部结果"这一态已由机制层（UnsettledBackground 闸门）排除，故文案可最短。
-const endCheckMsg = "（系统校验：你刚结束输出且未调用工具。此刻有没有必须你现在就做的动作？有 → 发出工具调用；没有 → 不再调用工具，一句话收笔。）"
+// stopToken 停止指令（2026-10-12 用户定，替换旧 end_check 的"追问一次"）：
+// 模型无工具调用结束时，必须在正文末尾原样输出该指令才算收笔；没输出 →
+// 系统持续注入提示词重问，不设次数上限。
+const stopToken = "[[[[STOP]]]]"
+
+// stopPromptMsg 未给停止指令时注入的提示词（明确"只有正文末尾算数、思考里不算"）。
+const stopPromptMsg = "（系统提示：你本轮未调用工具，且正文里没有停止指令 " + stopToken +
+	"，系统不会结束本轮。若此刻还有必须你现在就做的动作 → 直接发出工具调用；" +
+	"若确无 → 输出正文并在其中原样带上 " + stopToken + "（正文中出现即可，位置不限）。" +
+	"写在思考内容里不算。不输出它，本提示会持续重复。）"
+
+// isStopSignal 判定正文中是否出现停止指令：出现即算，位置不限（2026-10-12 用户
+// 改定，从"必须正文末尾"放宽）。判定只发生在轮末（本轮无工具调用时）——出现
+// 就停止注入提示词、正常收笔，不掐断正在生成的内容。只看正文，思考里出现不算。
+func isStopSignal(content string) bool {
+	return strings.Contains(content, stopToken)
+}
 
 // runLoop 工具循环：从一次 LLM 响应开始，带 tool_calls → 逐个执行工具并回填 →
-// 再 LLM；无工具调用（=本轮停止信号）→ 轮末校验分支。不设迭代上限：
+// 再 LLM；无工具调用 → 收笔判定（stopLoop）。工具循环本身不设迭代上限：
 // 靠 §8 死循环检测兜底。
 //
-// 轮末校验（end_check，2026-09-26 用户定）：模型过早发停止信号（如说了
-// "接下来做 X"却收笔）时，收笔前注入校验提示追问一次：
-//   - 模型发工具调用 → 有未完成事项，本循环马上继续做；
-//   - 模型仍无工具调用 → 确认真的做完了，正式收笔（本轮回复取校验前正文）。
+// 收笔判定（2026-10-12 用户定，替换旧 end_check 的"追问一次"）：无工具调用
+// 不再等于收笔——模型必须在正文末尾输出停止指令 [[[[STOP]]]] 才算：
+//   - 正文末尾有该指令 → 正式收笔（回复剥掉指令）；
+//   - 没有 → 注入提示词重问，无次数上限（模型若改为发工具调用 → 继续做）。
 //
-// 每次停止至多校验一次（校验后仍停 → 直接收笔，防追问乒乓）；
-// end_check 关（配置 agent.end_check=false）→ 无工具调用即收笔（旧行为）。
+// 闸门已撤（2026-10-12 用户定）：有未 settle 的后台任务也不再直接收笔，
+// 一律按停止指令判定。end_check 关（agent.end_check=false）→ 无工具调用即
+// 收笔（旧行为）。
 func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(types.AgentEvent), totals *TokenTotals, opt RunOptions) (string, error) {
 	for {
 		calls := resp.ToolCalls
 		if len(calls) == 0 {
-			// 模型输出结束无工具调用 = 发出本轮停止信号（2026-09-26 轮末校验）
-			// 闸门（2026-10-11）：有未 settle 的后台任务 → 模型在等自动通知，
-			// 追问只会多烧一次 LLM 调用，直接收笔。
-			n := 0
-			if opt.UnsettledBackground != nil {
-				n = opt.UnsettledBackground()
-			}
-			if opt.EndCheck && n > 0 {
-				emit(types.AgentEvent{"type": "end_check_skipped",
-					"detail": fmt.Sprintf("有 %d 个后台任务未 settle，结果会自动通知 → 不追问，直接收笔", n)})
-				return a.finishText(resp, emit, totals)
-			}
+			// 无工具调用 ≠ 收笔（2026-10-12）：正文末尾必须有停止指令才算。
+			// 闸门已撤（2026-10-12 用户定）：有未 settle 的后台任务也照常追问。
 			if opt.EndCheck {
-				a.cm.AddMessage(&types.RawEntry{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent})
-				emit(types.AgentEvent{"type": "end_check", "detail": "输出结束无工具调用（=停止信号）→ 追问有无未完成事项"})
-				a.cm.AddMessage(&types.RawEntry{Role: "user", Content: endCheckMsg})
-				r, err := a.llmCall(ctx, emit, totals)
-				if err != nil {
-					return a.finishRunError(err, ctx, emit, totals)
+				// 收笔判定（2026-10-12 用户定）：无工具调用时正文末尾必须有停止指令
+				// [[[[STOP]]]] 才算收笔；没有 → 注入提示词重问，无次数上限。
+				// 事件名沿用 end_check（WebUI 卡片与流式切块逻辑不变）。
+				backToTools := false
+				for {
+					if isStopSignal(resp.Content) {
+						a.cm.AddMessage(&types.RawEntry{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent})
+						emit(types.AgentEvent{"type": "end_check", "detail": "正文含停止指令 → 停止追问，正式收笔"})
+						emit(types.AgentEvent{"type": "done", "usage": totals})
+						return resp.Content, nil
+					}
+					a.cm.AddMessage(&types.RawEntry{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent})
+					emit(types.AgentEvent{"type": "end_check", "detail": "无工具调用且正文无停止指令 → 注入提示词重问"})
+					a.cm.AddMessage(&types.RawEntry{Role: "user", Content: stopPromptMsg})
+					// 搭车（2026-10-12 修）：追问轮同样取走运行期间入队的用户消息与后台
+					// settle 通知——旧实现只在工具循环里取，导致收笔判定期间用户插不进话。
+					if opt.TakePendingUsers != nil {
+						for _, m := range opt.TakePendingUsers() {
+							if strings.HasPrefix(m, bgNoticePrefix) {
+								a.cm.AddMessage(&types.RawEntry{Role: "user", Content: m})
+							} else {
+								a.cm.AddMessage(&types.RawEntry{Role: "user", Content: "【用户追加】" + m})
+							}
+							emit(types.AgentEvent{"type": "user_piggyback", "message": m})
+						}
+					}
+					r, err := a.llmCall(ctx, emit, totals)
+					if err != nil {
+						return a.finishRunError(err, ctx, emit, totals)
+					}
+					if len(r.ToolCalls) > 0 {
+						resp = r
+						backToTools = true
+						break // 有未完成事项 → 交回工具循环马上做
+					}
+					resp = r
 				}
-				if len(r.ToolCalls) == 0 {
-					// 校验确认：追问后仍无工具调用 → 确无未完成事项，正式收笔。
-					// 校验回复存 assistant 消息（与校验提示配对，协议完整），
-					// 但本轮回复文本取校验前的正文（真实答案，而非校验应答）。
-					a.cm.AddMessage(&types.RawEntry{Role: "assistant", Content: r.Content, ReasoningContent: r.ReasoningContent})
-					emit(types.AgentEvent{"type": "done", "usage": totals})
-					return resp.Content, nil
+				if backToTools {
+					continue
 				}
-				resp = r // 有未完成事项 → 马上开始做（继续工具循环）
-				continue
 			}
 			return a.finishText(resp, emit, totals) // 校验关：无工具调用即收笔（旧行为）
 		}

@@ -257,8 +257,6 @@ func runOpt(a *AgentState, state *AppState) agent.RunOptions {
 			state.MessageQueue = nil
 			return q
 		},
-		// 未 settle 后台任务数（2026-10-11）：end_check 闸门用，>0 则不追问。
-		UnsettledBackground: func() int { return a.BG().Unsettled() },
 		OnBackgroundStart: func(bg types.BackgroundStartArgs) {
 			// settle → 格式化通知 → push 进消息队列 + 唤醒 drain（2026-09-14：
 			// 与用户追加消息同一队列、同一逻辑）。闭包按引用捕获 a/state，

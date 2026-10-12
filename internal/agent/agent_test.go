@@ -69,40 +69,36 @@ func TestTruncationGiveUp(t *testing.T) {
 	}
 }
 
-// TestEndCheckContinue 轮末校验-继续干活（2026-09-26）：模型过早发停止信号
-// （无工具调用）→ 注入校验提示 → 模型发工具调用 → 继续干活 → 再停止 → 再校验 →
-// 模型仍停 → 正式收笔。断言：两次停止各校验一次、工具确实执行、回复取校验前正文
-// （而非校验应答）、校验提示确实注入进上下文（第 2/4 次请求末条消息）。
-func TestEndCheckContinue(t *testing.T) {
+// TestStopLoopContinue 收笔判定-继续干活（2026-10-12，替换旧 end_check）：模型无
+// 工具调用但正文末尾没有停止指令 → 注入提示词 → 模型改发工具调用 → 继续干活 →
+// 再结束时带上停止指令 → 正式收笔（回复剥掉指令）。断言：注入 1 次提示词、工具
+// 确实执行、共 3 次请求、第 2 次请求末条 = stopPromptMsg、回复不含停止指令。
+func TestStopLoopContinue(t *testing.T) {
 	a, fake := newTestAgent([]llm.FakeStep{
-		{Type: "text", Text: "我先说完这句话"}, // 第一次"停止"（过早）
+		{Type: "text", Text: "我先说完这句话"}, // 无停止指令 → 被追问
 		{Type: "tool", Name: "bash", Args: map[string]interface{}{"command": "echo hi"}},
-		{Type: "text", Text: "活干完了，这是最终答案"}, // 第二次"停止"（真做完）
-		{Type: "text", Text: "确认没有未完成事项"},   // 校验回复（收笔，不当回复）
+		{Type: "text", Text: "活干完了，这是最终答案 [[[[STOP]]]]"}, // 带指令 → 收笔
 	})
-	var checks int
-	opt := testRunOptEndCheck(&checks)
+	var prompts int
+	opt := testRunOptStop(&prompts)
 	reply, err := a.Run(context.Background(), "你好", opt)
 	if err != nil {
 		t.Fatalf("run 失败: %v", err)
 	}
-	if reply != "活干完了，这是最终答案" {
-		t.Errorf("回复应取校验前正文，实际: %q", reply)
+	if reply != "活干完了，这是最终答案 [[[[STOP]]]]" {
+		t.Errorf("回复应原样含停止指令（不剥），实际: %q", reply)
 	}
-	if checks != 2 {
-		t.Errorf("两次停止应各校验一次（2 条 end_check 事件），实际 %d 条", checks)
+	if prompts != 1 {
+		t.Errorf("应有 1 条 end_check 事件，实际 %d 条", prompts)
 	}
-	if len(fake.Requests) != 4 {
-		t.Errorf("应共 4 次 LLM 请求（2 停止 + 2 校验），实际 %d 次", len(fake.Requests))
+	if len(fake.Requests) != 3 {
+		t.Errorf("应共 3 次 LLM 请求（追问 + 工具后 + 收笔），实际 %d 次", len(fake.Requests))
 	}
-	// 校验提示注入断言：第 2 次（index 1）与第 4 次（index 3）请求末条消息 = endCheckMsg
-	for _, i := range []int{1, 3} {
-		req := fake.Requests[i]
-		last := req[len(req)-1]
-		s, ok := last.Content.(string)
-		if !ok || s != endCheckMsg {
-			t.Errorf("第 %d 次请求末条消息应为校验提示，实际 role=%s content=%q", i+1, last.Role, s)
-		}
+	req := fake.Requests[1]
+	last := req[len(req)-1]
+	s, ok := last.Content.(string)
+	if !ok || s != stopPromptMsg {
+		t.Errorf("第 2 次请求末条应为停止指令提示词，实际 role=%s content=%q", last.Role, s)
 	}
 }
 
@@ -114,7 +110,7 @@ func TestEndCheckOff(t *testing.T) {
 		{Type: "text", Text: "不应被消费"},
 	})
 	var checks int
-	opt := testRunOptEndCheck(&checks)
+	opt := testRunOptStop(&checks)
 	opt.EndCheck = false
 	reply, err := a.Run(context.Background(), "你好", opt)
 	if err != nil {
@@ -138,7 +134,10 @@ func testRunOpt(warns *[]string) RunOptions {
 		DoomWarnAfter: 3,
 		FgTimeoutMS:   30000,
 		Kind:          "user",
-		EndCheck:      true, // 默认开（与出厂配置一致）；个别测试显式关
+		// 收笔判定默认关：旧行为（无工具调用即收笔）。停止指令是无上限循环，
+		// 夹具步骤耗尽后 fake 会持续返回"步骤耗尽"文本 → 不显式开就会无限转。
+		// 收笔判定专项测试用 testRunOptStop 显式开。
+		EndCheck: false,
 		OnEvent: func(e types.AgentEvent) {
 			if e["type"] == "trunc_warn" {
 				if d, ok := e["detail"].(string); ok {
@@ -149,14 +148,17 @@ func testRunOpt(warns *[]string) RunOptions {
 	}
 }
 
-// testRunOptEndCheck 带 end_check 事件计数的 RunOptions（EndCheck 开）
-func testRunOptEndCheck(checks *int) RunOptions {
+// testRunOptStop 带 stop_prompt 事件计数的 RunOptions（收笔判定开）
+func testRunOptStop(prompts *int) RunOptions {
 	opt := testRunOpt(&[]string{})
 	opt.EndCheck = true
 	orig := opt.OnEvent
 	opt.OnEvent = func(e types.AgentEvent) {
+		// end_check 事件追问与收笔都发 → 只数"重问"那类，断言才对应追问次数
 		if e["type"] == "end_check" {
-			*checks++
+			if d, ok := e["detail"].(string); ok && strings.Contains(d, "重问") {
+				*prompts++
+			}
 		}
 		orig(e)
 	}
@@ -248,62 +250,143 @@ func TestInjectDemotePersist(t *testing.T) {
 	}
 }
 
-// TestEndCheckSkippedWhenBackgroundPending 闸门（2026-10-11）：有未 settle 的
-// 后台任务时，模型收笔不该被追问——追问只会多烧一次 LLM 调用，而结果本来会
-// 自动通知回来。断言：无 end_check 事件、有 end_check_skipped、只 1 次 LLM 请求、
-// 回复就是收笔正文。
-func TestEndCheckSkippedWhenBackgroundPending(t *testing.T) {
+// TestNoBackgroundGateStillAsks 闸门已撤（2026-10-12 用户定）：有未 settle 的
+// 后台任务时也不再直接收笔——正文末尾没有停止指令就照常追问。断言：追问 1 次、
+// 2 次请求、不再有 end_check_skipped 事件。
+func TestNoBackgroundGateStillAsks(t *testing.T) {
 	a, fake := newTestAgent([]llm.FakeStep{
 		{Type: "text", Text: "下载在后台跑，我收笔等通知"},
+		{Type: "text", Text: "那我补上停止指令 [[[[STOP]]]]"},
 		{Type: "text", Text: "不应被消费"},
 	})
-	var checks, skips int
-	opt := testRunOpt(&[]string{})
-	opt.EndCheck = true
-	opt.UnsettledBackground = func() int { return 2 }
+	var prompts, skips int
+	opt := testRunOptStop(&prompts)
+	orig := opt.OnEvent
 	opt.OnEvent = func(e types.AgentEvent) {
-		switch e["type"] {
-		case "end_check":
-			checks++
-		case "end_check_skipped":
+		if e["type"] == "end_check_skipped" {
 			skips++
 		}
+		orig(e)
 	}
+	if _, err := a.Run(context.Background(), "你好", opt); err != nil {
+		t.Fatalf("run 失败: %v", err)
+	}
+	if prompts != 1 {
+		t.Errorf("撤闸门后应照常追问，实际 end_check %d 条", prompts)
+	}
+	if skips != 0 {
+		t.Errorf("不该再有 end_check_skipped 事件，实际 %d 条", skips)
+	}
+	if len(fake.Requests) != 2 {
+		t.Errorf("应 2 次请求，实际 %d 次", len(fake.Requests))
+	}
+}
+
+// ---- 停止指令收笔协议（2026-10-12 用户定，替换旧 end_check）----
+
+func TestIsStopSignalTable(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"末尾带指令", "答案在此 [[[[STOP]]]]", true},
+		{"末尾带指令加尾随换行", "答案在此 [[[[STOP]]]]\n\n", true},
+		{"正文只有指令", "[[[[STOP]]]]", true},
+		{"指令在正文中间也算（2026-10-12 放宽）", "我先说 [[[[STOP]]]] 再讲别的", true},
+		{"指令在开头也算", "[[[[STOP]]]] 后面还有话", true},
+		{"无指令", "普通收笔", false},
+		{"近似串不算", "答案 [[[[STOP]]", false},
+		{"空正文不算", "", false},
+	}
+	for _, c := range cases {
+		if got := isStopSignal(c.content); got != c.want {
+			t.Errorf("%s: isStopSignal(%q)=%v，期望 %v", c.name, c.content, got, c.want)
+		}
+	}
+}
+
+// TestStopSignalInReasoningNotCounted 停止指令只认正文：思考内容里带指令、正文
+// 没有 → 不算收笔，照常追问（2026-10-12 用户定）。
+func TestStopSignalInReasoningNotCounted(t *testing.T) {
+	reason := "我想收笔了 [[[[STOP]]]]"
+	a, fake := newTestAgent([]llm.FakeStep{
+		{Type: "text", Text: "正文里没有指令", Reasoning: &reason},
+		{Type: "text", Text: "补上指令 [[[[STOP]]]]"},
+	})
+	var prompts int
+	opt := testRunOptStop(&prompts)
 	reply, err := a.Run(context.Background(), "你好", opt)
 	if err != nil {
 		t.Fatalf("run 失败: %v", err)
 	}
-	if reply != "下载在后台跑，我收笔等通知" {
-		t.Errorf("回复应为收笔正文，实际: %q", reply)
+	if prompts != 1 {
+		t.Errorf("思考里的指令不该算收笔，实际 end_check %d 条", prompts)
 	}
-	if checks != 0 {
-		t.Errorf("有在飞后台任务时不该追问，实际 end_check %d 条", checks)
+	if reply != "补上指令 [[[[STOP]]]]" {
+		t.Errorf("回复应取补指令那轮正文，实际 %q", reply)
 	}
-	if skips != 1 {
-		t.Errorf("应有 1 条 end_check_skipped 事件，实际 %d 条", skips)
-	}
-	if len(fake.Requests) != 1 {
-		t.Errorf("应只有 1 次 LLM 请求（无追问），实际 %d 次", len(fake.Requests))
+	if len(fake.Requests) != 2 {
+		t.Errorf("应 2 次请求，实际 %d 次", len(fake.Requests))
 	}
 }
 
-// TestEndCheckUnsettledZeroFallsThrough 闸门反向保护（2026-10-11）：
-// UnsettledBackground 返回 0 → 原追问行为不变（防闸门把正常校验也吃掉）。
-func TestEndCheckUnsettledZeroFallsThrough(t *testing.T) {
+// TestStopLoopNoLimitKeepsAsking 无上限（2026-10-12 用户定）：连续多轮不给停止
+// 指令 → 每轮都注入提示词重问，直到给出为止。
+func TestStopLoopNoLimitKeepsAsking(t *testing.T) {
 	a, fake := newTestAgent([]llm.FakeStep{
-		{Type: "text", Text: "我收笔"},
-		{Type: "text", Text: "确认没有未完成事项"},
+		{Type: "text", Text: "第一次不给指令"},
+		{Type: "text", Text: "第二次还不给"},
+		{Type: "text", Text: "第三次仍不给"},
+		{Type: "text", Text: "第四次给 [[[[STOP]]]]"},
 	})
-	var checks int
-	opt := testRunOptEndCheck(&checks)
-	opt.UnsettledBackground = func() int { return 0 }
+	var prompts int
+	opt := testRunOptStop(&prompts)
+	reply, err := a.Run(context.Background(), "你好", opt)
+	if err != nil {
+		t.Fatalf("run 失败: %v", err)
+	}
+	if prompts != 3 {
+		t.Errorf("前三轮应各追问一次（共 3 次），实际 %d 次", prompts)
+	}
+	if len(fake.Requests) != 4 {
+		t.Errorf("应 4 次请求，实际 %d 次", len(fake.Requests))
+	}
+	if reply != "第四次给 [[[[STOP]]]]" {
+		t.Errorf("回复应取收笔轮正文（原样），实际 %q", reply)
+	}
+}
+
+// TestStopLoopPiggyback 搭车（2026-10-12 修）：收笔判定追问期间入队的用户消息
+// 必须在下一次 LLM 调用前注入进上下文——旧实现只在工具循环里取队列，导致
+// 收笔判定期间用户插不进话。断言：追问后那次请求里出现【用户追加】消息。
+func TestStopLoopPiggyback(t *testing.T) {
+	a, fake := newTestAgent([]llm.FakeStep{
+		{Type: "text", Text: "我要收笔"}, // 无指令 → 追问
+		{Type: "text", Text: "收到追加，收笔 [[[[STOP]]]]"},
+	})
+	queue := []string{"再补一句：注意保留日志"}
+	var prompts int
+	opt := testRunOptStop(&prompts)
+	opt.TakePendingUsers = func() []string {
+		q := queue
+		queue = nil
+		return q
+	}
 	if _, err := a.Run(context.Background(), "你好", opt); err != nil {
 		t.Fatalf("run 失败: %v", err)
 	}
-	if checks != 1 {
-		t.Errorf("无在飞后台任务时应照常追问一次，实际 end_check %d 条", checks)
+	if prompts != 1 {
+		t.Errorf("应追问 1 次，实际 %d 条 end_check", prompts)
 	}
-	if len(fake.Requests) != 2 {
-		t.Errorf("应 2 次 LLM 请求（停止+校验），实际 %d 次", len(fake.Requests))
+	req := fake.Requests[1]
+	found := false
+	for _, m := range req {
+		if str, ok := m.Content.(string); ok && strings.Contains(str, "【用户追加】再补一句") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("追问后的请求里应含搭车的用户追加消息，实际末三条: %v", len(req))
 	}
 }
