@@ -97,6 +97,10 @@
   .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th { text-align: left; color: var(--dim); font-weight: 400; font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  /* 进行中后台任务多时：内容区高度封顶、内部滚动，不拉伸卡片（2026-10-14）。
+     表头吸顶，滚动时列名不跟着跑走；背景用卡片同色，避免半透明穿帮。 */
+  #stBgRun { max-height: 260px; overflow-y: auto; }
+  #stBgRun th { position: sticky; top: 0; background: var(--bg2); z-index: 1; }
   td { padding: 7px 8px; border-bottom: 1px solid rgba(42,52,68,.5); vertical-align: middle; }
   tr:last-child td { border-bottom: none; }
   .kv { display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid rgba(42,52,68,.5); font-size: 13px; }
@@ -289,8 +293,12 @@
     </div>
     <div class="grid2">
       <div class="card">
-        <h2>后台任务</h2>
-        <div id="stBg"></div>
+        <h2>后台任务 · 进行中 <span class="right" id="stBgRunN"></span></h2>
+        <div id="stBgRun"></div>
+      </div>
+      <div class="card">
+        <h2>后台任务 · 已完成 <span class="right">最近 5 个</span></h2>
+        <div id="stBgDone"></div>
       </div>
     </div>
     <div class="card">
@@ -306,9 +314,6 @@
         <h2>死循环 / 后台告警 <span class="right">最近 10 条</span></h2>
         <div id="stDoom"></div>
       </div>
-    </div>
-    <div class="card" style="font-size:12.5px;color:var(--dim)">
-      ⏰ 定时任务已拆为独立插件仓（/media/xhy/docker/OkHuman_p/cron，默认 :8601），请到其管理页维护——本控制台只负责 LLM 执行。
     </div>
   </section>
 
@@ -934,12 +939,24 @@ async function loadStatus() {
   $("stPrompt").innerHTML = `
     <div class="kv"><b>来源</b><span>${s.system_prompt.fallback ? '<span class="tag pause">内置默认（目录缺失）</span>' : esc(s.system_prompt.files.map((f) => f.name).join(", "))}</span></div>
     <div class="kv"><b>总长度</b><span>${fmtBytes(s.system_prompt.chars)}</span></div>`;
-  $("stBg").innerHTML = s.backgrounds.length
-    ? `<table><tr><th>工具</th><th>开始</th><th>状态</th><th>耗时</th></tr>${s.backgrounds.map((t) => `<tr>
+  // 后台任务拆两框（2026-10-14）：进行中全部，已完成按完成时间（started_at+duration_ms）倒序取最近 5 个。
+  // 后端 Snapshot() 遍历 map，返回顺序随机，所以两个列表都必须自己排序。
+  const bgRow = (t) => `<tr>
         <td class="mono">${esc(t.tool)}</td><td>${timeAgo(t.started_at)}</td>
         <td>${t.settled ? (t.ok ? '<span class="tag ok">成功</span>' : '<span class="tag fail">失败</span>') : '<span class="tag run">执行中</span>'}</td>
-        <td>${t.duration_ms != null ? fmtDur(t.duration_ms) : "-"}</td></tr>`).join("")}</table>`
-    : '<div class="empty">无后台任务</div>';
+        <td>${t.duration_ms != null ? fmtDur(t.duration_ms) : "-"}</td></tr>`;
+  const bgTable = (arr) => `<table><tr><th>工具</th><th>开始</th><th>状态</th><th>耗时</th></tr>${arr.map(bgRow).join("")}</table>`;
+  const bgAll = s.backgrounds || [];
+  const bgRun = bgAll.filter((t) => !t.settled).sort((a, b) => (b.started_at || 0) - (a.started_at || 0));
+  const bgDone = bgAll.filter((t) => t.settled)
+    .sort((a, b) => ((b.started_at || 0) + (b.duration_ms || 0)) - ((a.started_at || 0) + (a.duration_ms || 0)))
+    .slice(0, 5);
+  $("stBgRun").innerHTML = bgRun.length ? bgTable(bgRun) : '<div class="empty">无进行中的后台任务</div>';
+  $("stBgRunN").textContent = bgRun.length ? bgRun.length + " 个" : "";
+  $("stBgDone").innerHTML = bgDone.length
+    ? bgTable(bgDone) + (bgAll.filter((t) => t.settled).length > 5
+        ? `<div class="dim" style="font-size:12px;margin-top:6px">共 ${bgAll.filter((t) => t.settled).length} 个已完成，只显示最近 5 个</div>` : "")
+    : '<div class="empty">无已完成的后台任务</div>';
   $("stRaw").innerHTML = s.raw_tail.length
     ? s.raw_tail.map((e) => `<div style="padding:5px 0;border-bottom:1px solid rgba(42,52,68,.5);font-size:12.5px">
         <span class="tag">${esc(e.role)}</span> <span class="dim">${e.chars} 字符</span>
