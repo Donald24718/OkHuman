@@ -47,7 +47,7 @@ cd "<本目录>" && go build -o okhuman-qq-bridge okhuman-qq-bridge.go
 - `channels/qq/msg_seq`：c2c 消息序号持久化（QQ 要求单调递增，重启从盘恢复，归 1 可能被拒）
 - `channels/qq/bridge.lock`：单实例锁（O_EXCL，防双桥双份转发/双份入队；内容 = 持锁 pid）
 
-⚠️ **data_dir 在启动时算定**：移动本目录后，存活进程仍写旧绝对路径（2026-09-21 重排插件目录后数据落回 OkHuman_p 根目录就是它）。挪目录必做三件事：杀旧桥 → 迁移 data（token/msg_seq 取新的）→ 新路径重拉。
+⚠️ **data_dir 在启动时算定**：移动本目录后，存活进程仍写旧绝对路径（2026-09-21 重排插件目录后数据落回插件仓根目录就是它）。挪目录必做三件事：杀旧桥 → 迁移 data（token/msg_seq 取新的）→ 新路径重拉。
 
 ## 目录
 

@@ -2,7 +2,7 @@
 
 两块能力：
 1. **显卡使用**：nvidia-smi 每卡利用率/显存/温度/功耗 + 显存占用进程（自动标注对应 OkHuman 服务）。
-2. **OkHuman 系 Go 常驻进程**：okhuman 实例（8451/8452）+ Go 插件（qq-channel/browser/cron…），状态/内存/CPU/运行时长，**webui 里一键启动/停止**。
+2. **OkHuman 系 Go 常驻进程**：okhuman 实例（默认 8451，多实例各自端口）+ Go 插件（qq-channel/browser/cron…），状态/内存/CPU/运行时长，**webui 里一键启动/停止**。
 3. **自动追踪一切 Go 版 okhuman 进程**：配置表之外出现的 okhuman 进程（如一次性实例，comm 精确 `okhuman`）自动出现在进程表（标注"自动追踪"，带 pid/端口/内存/CPU），**可停止、无启动按钮**；进程退出后自动消失。
 
 Go 单二进制（`main.go`），无外部依赖（标准库），挂掉不影响主进程。
@@ -22,7 +22,7 @@ setsid ./okmon </dev/null > /tmp/okmon.log 2>&1 &
 ```json
 { "port": 8496,
   "services": [
-    { "name": "okhuman-8451", "label": "小K·生产", "port": 8451, "start": "./okhuman", "workdir": "<副本目录>/OkHuman" },
+    { "name": "okhuman-8451", "label": "主实例", "port": 8451, "start": "./okhuman", "workdir": "<副本目录>/OkHuman" },
     { "name": "attach", "label": "图片/视频注入", "cli": true }
   ] }
 ```
@@ -38,8 +38,8 @@ setsid ./okmon </dev/null > /tmp/okmon.log 2>&1 &
 
 | name | 说明 | 定位 |
 |---|---|---|
-| okhuman-8451 | 小K·生产 | 端口 8451 |
-| okhuman-8452 | 副本实例·副本 | 端口 8452 |
+| okhuman-8451 | 主实例 | 端口 8451 |
+| okhuman-8452 | 第二实例 | 端口 8452 |
 | （自动）其他 okhuman | 一切 Go 版 okhuman 进程（一次性实例等） | comm `okhuman` 全量扫描，自动追踪 |
 | qq-channel | QQ 频道 | comm `okhuman-qq-brid`（无监听端口） |
 | attach | 图片/视频注入 | CLI |

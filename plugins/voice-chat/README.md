@@ -13,7 +13,7 @@
 - **音频源（主）：`events_listener`**——每实例一条 `GET /events` SSE 连接，实时收 run 事件：`run_start` 建轮次状态 → `delta.text` 累积、一到完整句就入该消息的句队列 → `tool_call / stopped / done` 为消息边界（冲刷尾句、全文打标、发结束哨兵）→ `run_end` 清轮次。语音唤醒发起的轮次用 `voice_tag` 时间戳判定（2s 窗）。
   - **重放保护**：连接时若 hello 报 `running=true`（run 进行中），跳过整轮重放、等 run 结束后重连——否则重放会把已完成的整轮重新入队（双播）。该 run 的消息由轮询兜底在 run 结束后补播。
 - **音频源（兜底）：`backstop_poller`**——每 8s 轮询各实例 `GET /history`，**仅在实例空闲时**（`/status` 无活跃 run、无未结算后台任务——run 中 /history 可能被 WebUI 刷新截断致条目数失真）数新条目。流式路径已在消息边界打标（`mark_broadcast()`，30 分钟窗口）的跳过；未打标的挂起 1.5s 复核（防"条目已落库、流式打标未落地"的毫秒级竞态）仍无标才补播为一条消息（句子预载）。
-- **播报员：`player` + `play_message`**——串行播队列项；每项先按 "小K说：/副本实例说：" 前缀（只加第一个非空句）→ `clean_for_speech` → ≤50 字分段 → Kokoro 合成 → aplay 播放；**播第 N 段时后台预取合成第 N+1 段**。消息队列饿死 60s 且该轮次已死（`RUN_LIVE` 表超 5 分钟）→ 弃尾，防实例宕机把播报员卡死。
+- **播报员：`player` + `play_message`**——串行播队列项；每项先按 "<实例名>说：" 前缀（只加第一个非空句）→ `clean_for_speech` → ≤50 字分段 → Kokoro 合成 → aplay 播放；**播第 N 段时后台预取合成第 N+1 段**。消息队列饿死 60s 且该轮次已死（`RUN_LIVE` 表超 5 分钟）→ 弃尾，防实例宕机把播报员卡死。
 - 超长保护：单消息累计 `max_reply_chars`（默认 5000）字后停止入队后续句子（全文仍打标，防轮询重播）。
 - **全渠道广播开关**：WebUI "🔊 全量播报"（状态文件 `data/broadcast_off`，**默认开**）。开 → 所有渠道（QQ / WebUI 打字 / 定时任务 / 语音）的消息都播；关 → 只播语音唤醒发起的消息（非语音发起的第一句即门控丢弃）。"暂停服务"（`data/paused`）期间丢弃麦克风输入，agent/TTS 保持热备。
 
@@ -48,7 +48,7 @@ SpEx+ 声纹分离（129M 模型 + serve + 代码）已于 2026-09-16 清理：�
   --> 声纹门控 (CAM++, :8091)        非本人声音直接丢弃
   --> ASR (Qwen3-ASR-0.6B CPU, :8090)
   --> 唤醒词路由 (config.json instances: 唤醒词→实例, 模糊匹配)
-  --> OkHuman POST /enqueue 按唤醒词路由 (示例：小K→8451 / 小B→8452)
+  --> OkHuman POST /enqueue 按唤醒词路由 (示例：小A→8451 / 小B→8452)
   <-- 各实例 GET /events (SSE 实时流) 收回复音频 + /history 轮询兜底
   --> TTS (Kokoro-82M serve, stdin 管道, 模型常驻, 段间预取)
   --> 喇叭 (aplay, 串行不叠音)
@@ -87,7 +87,7 @@ SpEx+ 声纹分离（129M 模型 + serve + 代码）已于 2026-09-16 清理：�
 | `mic` / `speaker` | `default` / `0,0` | ffmpeg alsa 输入设备 / aplay 输出设备 |
 | `max_reply_chars` | `500` | 回复超此字数截断朗读（防喇叭念到天荒地老；想听全改大） |
 | `kokoro_voice` | `zf_xiaoyi` | TTS 音色（见上文音色列表）；改后重启 voice_loop 生效 |
-| `instances` | 示例：小K→8451, 小B→8452 | 路由实例，每个实例绑一个唤醒词（也是它的“名字”）。喊哪个唤醒词 → 这句话只发给**对应**实例，回复加固定前缀逐个 TTS 播放（“小K说：…”）。用法：①一句话内说完（“小K 帮我看看…”）②先只说唤醒词 → 提示音 → 15 秒内说内容（发给该实例）。只配一个实例时唤醒门控自动关闭（你的语音直达，无前缀）。唤醒词要选 ASR 能稳定转写的短词（避免易被误识的音） |
+| `instances` | 示例：小A→8451, 小B→8452 | 路由实例，每个实例绑一个唤醒词（也是它的“名字”）。喊哪个唤醒词 → 这句话只发给**对应**实例，回复加固定前缀逐个 TTS 播放（“<实例名>说：…”）。用法：①一句话内说完（“小A 帮我看看…”）②先只说唤醒词 → 提示音 → 15 秒内说内容（发给该实例）。只配一个实例时唤醒门控自动关闭（你的语音直达，无前缀）。唤醒词要选 ASR 能稳定转写的短词（避免易被误识的音） |
 
 追加你的声纹样本：`curl "http://127.0.0.1:8091/enroll?wav=/path/新录音.wav"`
 （门控运行中；样本存 `speaker/enrollments/`，请注册你自己的声纹样本（可多条））。
@@ -111,7 +111,7 @@ SpEx+ 声纹分离（129M 模型 + serve + 代码）已于 2026-09-16 清理：�
   import 阶段的崩溃 traceback 会落在这个文件（例：phonemizer 版本 API 差异、espeak 数据缺失）。
   正常日志形如 `[kokoro] wrote out_NNNN.wav (X.Xs 音频, 合成用时 X.Xs, RTF=X.XX)`。
 - **总被声纹拦**：调低 `gate_threshold`（0.5 起试），或补 enroll 几段安静环境的录音。
-- **唤醒词老不命中**：看 `/tmp/voice_loop.log` 里 `[wake] 未含唤醒词` 的原文——ASR 把唤醒词识别成什么了；换成 ASR 能稳定转写的词（“小K”/“副本实例” 实测稳；“救生艇实例” 会被听成 “小小”）。
+- **唤醒词老不命中**：看 `/tmp/voice_loop.log` 里 `[wake] 未含唤醒词` 的原文——ASR 把唤醒词识别成什么了；换成 ASR 能稳定转写的常用词（两字常见词实测稳；生僻或多音节词容易被听成别的词）。
 - **第一次用先看门控分数**：`/tmp/voice_loop.log` 里 `[gate] 本人声音 (score=...)`——score 应 ≥ 0.6；若你自己的声音都过不了，重新 enroll 一段安静环境的录音或调低阈值。
 - **别人也能驱动**：调高 `gate_threshold`（0.7+）。
 - **ASR 慢**：CPU 跑 0.6B 模型，单句通常 2~10s；机器满载（两个 27B 服务在跑）时会更慢。
@@ -123,4 +123,4 @@ SpEx+ 声纹分离（129M 模型 + serve + 代码）已于 2026-09-16 清理：�
 - [x] 不 import OkHuman 任何模块（纯 Python，OkHuman 只在运行时作为 HTTP 服务存在）
 - [x] 独立进程（门控 / ASR / TTS / 主循环各是独立进程），生命周期由 start/stop.sh 管
 - [x] 配置自管（本目录 config.json），数据自管（临时 wav 落 /tmp/voice_loop_tts，声纹 enrollments 在本目录）
-- [x] 独立可跑：`cd OkHuman_p/voice-chat && ./start.sh`，不需要 OkHuman 源码树任何文件
+- [x] 独立可跑：`cd plugins/voice-chat && ./start.sh`，不需要 OkHuman 源码树任何文件

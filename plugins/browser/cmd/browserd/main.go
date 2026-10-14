@@ -1,4 +1,4 @@
-// OkHuman_p/browser — 浏览器实例守护（browserd）
+// browser — 浏览器实例守护（browserd）
 //
 // 起一个 headless chromium（CDP 监听指定端口）并管理其生命周期：
 //   - 默认：600s 内无任何 browserctl 动作命令 → 自动杀 chromium 退出

@@ -1,4 +1,4 @@
-// xusectl —— 桌面 computer-use 插件（Go 移植自 OkHuman_p/computer/xusectl.ts，2026-09-14）
+// xusectl —— 桌面 computer-use 插件（Go 移植自早期 TS 版 computer/xusectl.ts，2026-09-14）
 //
 // 给 agent 装"手"：整屏截图 + X11 鼠标键盘事件。微内核设计：内核零改动，
 // 视觉走现有 okattach（截图注入上下文），动作走 xdotool(XTest)/ffmpeg(x11grab)。

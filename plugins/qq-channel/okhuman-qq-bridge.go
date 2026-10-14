@@ -1,4 +1,4 @@
-// OkHuman_p/qq-channel：OkHuman 的 QQ 官方渠道桥（独立进程）——TS 版 bridge.ts + qq.ts 的 1:1 Go 移植。
+// qq-channel：OkHuman 的 QQ 官方渠道桥（独立进程）——TS 版 bridge.ts + qq.ts 的 1:1 Go 移植。
 //
 // 链路（常驻转发管道）：
 //   上行：QQ 消息 → POST {实例}/enqueue { message }（入队即返，不等回合结束）

@@ -1,6 +1,6 @@
 # scout（Go 版）
 
-插件目录语义检索服务。移植自 TS 版（机械硬盘 `OkHuman_ts_2026_9_20/OkHuman_p/scout/`），行为 1:1 对齐：
+插件目录语义检索服务。移植自早期 TS 版实现，行为 1:1 对齐：
 语料 = 统一根目录（`plugin_root`，技能与插件同目录）每个顶层子目录，
 条目三件套（名字/简介/路径）全部读自**模型自写的 `meta.json`**（`summary` 必填，`name` 可选、缺省用目录名）；
 无 meta.json 或 summary 空则跳过——简介一律 agent 自写，scout 不抓任何文件内容。
@@ -46,7 +46,7 @@
 # 探活
 curl -s http://127.0.0.1:8480/health
 # 停止（embed 后端保持存活，下次复用）
-pkill -f 'OkHuman_p/scout/scout'
+pkill -f 'plugins/scout/scout'
 ```
 
 ## 配置（config.json）

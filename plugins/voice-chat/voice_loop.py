@@ -6,7 +6,7 @@ voice_loop.py — 语音闭环 (OkHuman 插件 voice-chat)
   [麦克风] --16k mono--> [VAD 端点检测]
         --> [声纹]  speaker_server (CAM++) :8091（只认你的声音）
         --> [ASR]   llama-server (CPU build) + Qwen3-ASR-0.6B :8090
-        --> [唤醒词] 多唤醒词路由（小K→8451 / 副本实例→8452；或唤醒后 15s 窗内下一句）
+        --> [唤醒词] 多唤醒词路由（小A→8451 / 小B→8452；或唤醒后 15s 窗内下一句）
         --> [Agent]  OkHuman POST /enqueue 按唤醒词路由（解耦：只走 HTTP）
         --> [音频源] 各实例 /events SSE 实时流（全渠道）+ /history 轮询兜底
         --> [播放]  消息按条排队（跨实例 FIFO）+ 消息内句子级流式：Kokoro-82M (stdin 管道) → aplay
@@ -46,8 +46,8 @@ OKHUMAN_URL  = CFG.get("okhuman_url", "http://127.0.0.1:8451")   # OkHuman 实�
 MIC          = CFG.get("mic", "default")      # 麦克风 (ffmpeg alsa 设备名: default / hw:3,0 ...)
 SPEAKER      = CFG.get("speaker", "0,0")      # 播放设备 (aplay -D)
 MAX_REPLY_CHARS = int(CFG.get("max_reply_chars", 500))
-# 路由实例：每个实例绑一个唤醒词（= 它的"名字"，播报前缀 "小K说：" 由此生成）。
-# 喊哪个唤醒词 → 这句话只发给对应实例（小K→8451 / 副本实例→8452）。
+# 路由实例：每个实例绑一个唤醒词（= 它的"名字"，播报前缀 "<实例名>说：" 由此生成）。
+# 喊哪个唤醒词 → 这句话只发给对应实例（小A→8451 / 小B→8452）。
 INSTANCES = [(it["wake_word"], it["url"]) for it in CFG.get("instances", [])]
 if not INSTANCES:                        # 未配置 instances → 单实例直连（旧行为）
     INSTANCES = [("agent", OKHUMAN_URL)]
@@ -502,7 +502,7 @@ def mark_broadcast(text) -> bool:
 
 
 # ─────────────────────── 按条广播队列（2026-09-21 架构，用户指定语义）───────────────────────
-#   * 队列粒度 = 一条 assistant 消息（MsgItem）；小K/副本实例 的消息按产出顺序进同一个全局 FIFO，
+#   * 队列粒度 = 一条 assistant 消息（MsgItem）；各实例的消息按产出顺序进同一个全局 FIFO，
 #     一条播完取下一条（不区分实例）——谁先产出谁先播。
 #   * 消息内：agent 流式吐出一个完整句（句末标点）就送 TTS 开播，不等整条/整轮结束。
 #   * 音频来源：各实例 /events SSE 实时流（全渠道：语音唤醒 / QQ / WebUI / 定时任务）。

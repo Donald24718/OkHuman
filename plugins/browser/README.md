@@ -1,4 +1,4 @@
-# OkHuman_p/browser — 浏览器插件
+# browser — 浏览器插件
 
 OkHuman 的**能力型插件**：给只有 bash 一个工具的 agent 提供真实浏览器操作能力。
 遵守[插件解耦契约](../README.md)——主程序零改动，agent 经 bash 调本插件的 CLI。

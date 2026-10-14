@@ -1,4 +1,4 @@
-// OkHuman_p/browser — 浏览器动作 CLI（browserctl）
+// browser — 浏览器动作 CLI（browserctl）
 //
 // agent 经 bash 调用，每次是一个短连接（连 CDP → 执行动作 → 退出）。
 // 每个动作都会刷新 browserd 的心跳文件（让守护进程知道实例还在被使用）。

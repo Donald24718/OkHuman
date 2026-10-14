@@ -1,4 +1,4 @@
-// okhuman-cron：OkHuman 定时任务插件（独立进程，Go 移植自 OkHuman_p/cron，2026-09-14）
+// okhuman-cron：OkHuman 定时任务插件（独立进程，Go 移植自早期 TS 版 cron，2026-09-14）
 //
 // 职责：管理并触发一个或多个 OkHuman 实例的定时任务。
 //   - 每个实例独立维护自己的 CronStore（落 <插件>/data/<inst-id>/cron.json，实时原子写）
@@ -28,7 +28,7 @@ import (
 	"time"
 )
 
-// ---------- 类型（同 OkHuman_p/cron/types.ts） ----------
+// ---------- 类型（同早期 TS 版 cron/types.ts） ----------
 
 type CronJob struct {
 	ID         string `json:"id"`
