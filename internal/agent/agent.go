@@ -62,6 +62,10 @@ type RunOptions struct {
 	// 工具转后台时回调（由 server.runOpt 实现：注册任务 + 挂 settle 回调；
 	// settle 时通知自动入消息队列，2026-09-14）
 	OnBackgroundStart func(types.BackgroundStartArgs)
+	// 未 settle 的后台任务数（2026-10-16，由 server.runOpt 注入 BG().PendingCount）：
+	// 收笔追问时若 >0，提示词追加一句"有 N 个转后台任务在跑、完成会自动通知、不必
+	// 守着"。未接线或返回 0 → 提示词与旧版逐字一致，不提后台任务。
+	PendingBackgroundCount func() int
 	OnEvent           func(types.AgentEvent)
 	// 本轮消息来源（事件广播标记用，2026-08-31）：user = 单条用户消息；
 	// merged = 运行中积攒的多条合并消息。
@@ -539,11 +543,36 @@ func (a *Agent) finishText(resp *types.Response, emit func(types.AgentEvent), to
 // 系统持续注入提示词重问，不设次数上限。
 const stopToken = "[[[[STOP]]]]"
 
-// stopPromptMsg 未给停止指令时注入的提示词（明确"正文中出现即算、位置不限、思考里不算"）。
-const stopPromptMsg = "（系统提示：你本轮未调用工具，且正文里没有停止指令 " + stopToken +
-	"，系统不会结束本轮。若此刻还有必须你现在就做的动作 → 直接发出工具调用；" +
-	"若确无 → 输出正文并在其中原样带上 " + stopToken + "（正文中出现即可，位置不限）。" +
-	"写在思考内容里不算。不输出它，本提示会持续重复。）"
+// stopPrompt 未给停止指令时注入的提示词（明确"正文中出现即算、位置不限、思考里不算"）。
+// 两版（2026-10-16 用户定）：
+//   - pending == 0：与旧 stopPromptMsg 逐字一致，完全不提后台任务（无端提反而误导）；
+//   - pending > 0：在"不输出它"之前插入一句——告知有 N 个前台超时已转后台的任务仍在
+//     跑、出结果会自动通知（通知到达会自动开新一轮），没别的事就输出停止指令收笔。
+func stopPrompt(pending int) string {
+	tail := ""
+	if pending > 0 {
+		tail = fmt.Sprintf("当前有 %d 个前台等待超时已转后台的任务仍在执行：出结果后系统会自动通知你（作为一条 user 消息搭车送进来，通知到达会自动开启新一轮），你不必守着它们。若此刻没有别的必须立刻做的事，直接在正文输出 %s 收笔即可。", pending, stopToken)
+	}
+	return "（系统提示：你本轮未调用工具，且正文里没有停止指令 " + stopToken +
+		"，系统不会结束本轮。若此刻还有必须你现在就做的动作 → 直接发出工具调用；" +
+		"若确无 → 输出正文并在其中原样带上 " + stopToken + "（正文中出现即可，位置不限）。" +
+		"写在思考内容里不算。" + tail + "不输出它，本提示会持续重复。）"
+}
+
+// pendingCount 取当前未 settle 的后台任务数；未接线（测试/误用）→ 0，提示词退回旧版。
+func pendingCount(opt RunOptions) int {
+	if opt.PendingBackgroundCount == nil {
+		return 0
+	}
+	return opt.PendingBackgroundCount()
+}
+
+// bgStartedNotice 前台超时转后台时回填给模型的 tool 消息。
+// 2026-10-16 补停止指令指引：让模型第一次看到"转后台"就知道可以收笔、通知会自动来，
+// 通常因此走不到追问轮，省掉一次 LLM 调用及其 KV 代价。
+func bgStartedNotice(fgSec int) string {
+	return fmt.Sprintf("（系统：此调用前台等待超过 %d 秒未完成，已自动转入后台继续执行。无需等待，可继续其他工作或直接基于已有信息回复；任务完成后系统会自动通知结果——通知到达会自动开启新一轮，你不必守着。若此刻没有别的必须立刻做的事，直接在正文输出 %s 收笔即可。）", fgSec, stopToken)
+}
 
 // isStopSignal 判定正文中是否出现停止指令：出现即算，位置不限（2026-10-12 用户
 // 改定，从"必须正文末尾"放宽）。判定只发生在轮末（本轮无工具调用时）——出现
@@ -584,7 +613,7 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 					}
 					a.cm.AddMessage(&types.RawEntry{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent})
 					emit(types.AgentEvent{"type": "end_check", "detail": "无工具调用且正文无停止指令 → 注入提示词重问"})
-					a.cm.AddMessage(&types.RawEntry{Role: "user", Content: stopPromptMsg})
+					a.cm.AddMessage(&types.RawEntry{Role: "user", Content: stopPrompt(pendingCount(opt))})
 					// 搭车（2026-10-12 修）：追问轮同样取走运行期间入队的用户消息与后台
 					// settle 通知——旧实现只在工具循环里取，导致收笔判定期间用户插不进话。
 					if opt.TakePendingUsers != nil {
@@ -671,7 +700,7 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 			case <-time.After(time.Duration(opt.FgTimeoutMS) * time.Millisecond):
 				// 转后台（不取消）：立即回填通知，模型不必傻等
 				startedAt := time.Now().UnixMilli()
-				bgNotice := fmt.Sprintf("（系统：此调用前台等待超过 %d 秒未完成，已自动转入后台继续执行。无需等待，可继续其他工作或直接基于已有信息回复；任务完成后系统会自动通知结果。）", roundMS(opt.FgTimeoutMS/1000))
+				bgNotice := bgStartedNotice(roundMS(opt.FgTimeoutMS / 1000))
 				a.cm.AddMessage(&types.RawEntry{Role: "tool", ToolCallID: &tc.ID, Content: bgNotice})
 				emit(types.AgentEvent{"type": "tool_result", "name": tc.Function.Name, "call_id": tc.ID, "truncated": false, "total_chars": 0, "backgrounded": true, "content": bgNotice})
 				emit(types.AgentEvent{"type": "bg_start", "call_id": tc.ID, "tool_name": tc.Function.Name, "timeout_ms": opt.FgTimeoutMS})

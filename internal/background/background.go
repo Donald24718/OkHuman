@@ -94,6 +94,21 @@ func NewOrchestrator() *BackgroundOrchestrator {
 	return &BackgroundOrchestrator{tasks: map[string]*types.PendingBackgroundTask{}}
 }
 
+// PendingCount 未 settle 的后台任务数（2026-10-16）：供收笔追问的提示词告知模型
+// "有 N 个转后台任务在跑、出结果会自动通知"，免得它守着不放反复空转。
+// 已 settle 但未取走通知的不计——那些结果已在消息队列里，模型马上会在搭车时看到。
+func (o *BackgroundOrchestrator) PendingCount() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	n := 0
+	for _, t := range o.tasks {
+		if !t.Settled {
+			n++
+		}
+	}
+	return n
+}
+
 // maxStoredResultBytes 任务表内 Result 的存储上限（256KB）：通知入队用的是
 // 完整结果（由 server 格式化），表里只留截断副本供 /backgrounds 查看。
 const maxStoredResultBytes = 256 * 1024

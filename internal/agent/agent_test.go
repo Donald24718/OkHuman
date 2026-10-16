@@ -63,7 +63,7 @@ func TestThinkingOnlyStopLoop(t *testing.T) {
 // TestStopLoopContinue 收笔判定-继续干活（2026-10-12，替换旧 end_check）：模型无
 // 工具调用但正文没有停止指令 → 注入提示词 → 模型改发工具调用 → 继续干活 →
 // 再结束时带上停止指令 → 正式收笔（回复原样保留指令，不剥）。断言：注入 1 次
-// 提示词、工具确实执行、共 3 次请求、第 2 次请求末条 = stopPromptMsg、回复原样含指令。
+// 提示词、工具确实执行、共 3 次请求、第 2 次请求末条 = stopPrompt(0)（无转后台任务那版）、回复原样含指令。
 func TestStopLoopContinue(t *testing.T) {
 	a, fake := newTestAgent([]llm.FakeStep{
 		{Type: "text", Text: "我先说完这句话"}, // 无停止指令 → 被追问
@@ -88,7 +88,7 @@ func TestStopLoopContinue(t *testing.T) {
 	req := fake.Requests[1]
 	last := req[len(req)-1]
 	s, ok := last.Content.(string)
-	if !ok || s != stopPromptMsg {
+	if !ok || s != stopPrompt(0) {
 		t.Errorf("第 2 次请求末条应为停止指令提示词，实际 role=%s content=%q", last.Role, s)
 	}
 }
@@ -369,5 +369,41 @@ func TestStopLoopPiggyback(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("追问后的请求里应含搭车的用户追加消息，实际末三条: %v", len(req))
+	}
+}
+
+// TestStopPromptTwoVersions 两版提示词（2026-10-16 用户定）：无转后台任务时逐字
+// 不提后台任务；有则追加告知句，且仍以旧提示词开头、仍含停止指令。
+func TestStopPromptTwoVersions(t *testing.T) {
+	noBg := stopPrompt(0)
+	if strings.Contains(noBg, "后台") {
+		t.Fatalf("pending=0 不应提后台任务：%s", noBg)
+	}
+	if !strings.Contains(noBg, stopToken) || !strings.Contains(noBg, "写在思考内容里不算。不输出它，本提示会持续重复。）") {
+		t.Fatalf("pending=0 应保留旧提示词全文：%s", noBg)
+	}
+	withBg := stopPrompt(2)
+	if !strings.HasPrefix(withBg, "（系统提示：你本轮未调用工具") {
+		t.Fatalf("pending>0 应以旧提示词开头：%s", withBg)
+	}
+	for _, want := range []string{"当前有 2 个", "自动通知", "不必守着", stopToken} {
+		if !strings.Contains(withBg, want) {
+			t.Fatalf("pending=2 缺片段 %q：%s", want, withBg)
+		}
+	}
+	if !strings.Contains(withBg, "不输出它，本提示会持续重复。）") {
+		t.Fatalf("pending>0 丢了重复警告：%s", withBg)
+	}
+}
+
+// TestBgStartedNoticeMentionsStopToken 转后台回填的 tool 消息必须带停止指令（B）：
+// 模型第一次看到"转后台"就该知道可以收笔，不必等到被追问。
+func TestBgStartedNoticeMentionsStopToken(t *testing.T) {
+	s := bgStartedNotice(30)
+	if !strings.Contains(s, stopToken) {
+		t.Fatalf("转后台通知未含停止指令：%s", s)
+	}
+	if !strings.Contains(s, "30 秒") || !strings.Contains(s, "自动通知") {
+		t.Fatalf("转后台通知缺关键信息：%s", s)
 	}
 }

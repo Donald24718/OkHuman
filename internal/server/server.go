@@ -271,6 +271,9 @@ func runOpt(a *AgentState, state *AppState) agent.RunOptions {
 			}
 			a.BG().OnBackgroundStart(bg)
 		},
+		// 未 settle 后台任务数（2026-10-16）：收笔追问的提示词据此告知模型"有任务在跑、
+		// 完成会自动通知"。追问每轮现取——任务可能正好在这期间 settle。
+		PendingBackgroundCount: func() int { return a.BG().PendingCount() },
 	}
 }
 
