@@ -213,6 +213,12 @@ func main() {
 		},
 	})
 
+	// 空闲心跳（2026-10-17 用户定）：agent 持续无 run 到点 → 把心跳提示词入队并
+	// 主动开启一轮。开关/间隔/提示词在 config 的 heartbeat 段（WebUI 配置页可改，
+	// 每 tick 现取配置 → 无需重启）。计时口径：只有 run 结束才重置，正在 run 不计时。
+	stopHeartbeat := server.StartHeartbeat(appState, a)
+	defer stopHeartbeat()
+
 	llmLabel := cfg.LLM.BaseURL
 	if useFake {
 		llmLabel = "FakeLLM"
@@ -300,7 +306,7 @@ func saveGlobalConfigPatch(root string, patch map[string]interface{}) {
 	// 基线 = 不含 user.json 的生效值（DEFAULTS+default.json），不是裸 DEFAULTS（2026-09-15 修）：
 	// default.json 覆盖过的键，user 里"等于出厂默认"的值正是把它掰回来的覆盖，删掉即静默
 	// 改变生效配置（8451 事故：user.json 的 server.port:8451 被删，实例身份被 default.json
-	// 偷成 8452，下次重启撞端口崩死）。
+	// 偷成别的实例的端口，下次重启撞端口崩死）。
 	var base map[string]interface{}
 	if b, err := json.Marshal(config.Default()); err == nil {
 		_ = json.Unmarshal(b, &base)

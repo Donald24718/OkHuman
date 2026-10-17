@@ -19,7 +19,7 @@ type Config struct {
 	Context      ContextCfg      `json:"context"`
 	Tools        ToolsCfg        `json:"tools"`
 	Doom         DoomCfg         `json:"doom"`
-	Agent        AgentCfg        `json:"agent"`
+	Heartbeat    HeartbeatCfg    `json:"heartbeat"`
 }
 
 type ServerCfg struct {
@@ -62,13 +62,24 @@ type DoomCfg struct {
 	WarnAfter int `json:"warn_after"`
 }
 
-// AgentCfg agent 主循环行为参数
-type AgentCfg struct {
-	// EndCheck 轮末校验（2026-09-26 用户定）：模型无工具调用结束输出（=发出本轮
-	// 停止信号）时，追问一次"目前有没有还未完成的事情"——有则马上开始做，
-	// 没有才正式收笔（每次停止至多校验一次）
-	EndCheck bool `json:"end_check"`
+// HeartbeatCfg 空闲心跳（2026-10-17 用户定）：agent 持续一段时间没有 run → 系统
+// 主动把 Prompt 作为一条消息入队并开启一轮 run。
+//
+// 计时口径（用户明确）：**只有 run 结束才重置计时**——正在 run 期间不计时，run
+// 一结束重新开始计；期间任何 run 结束都会把计时器归零。默认 Enabled=false
+// （不擅自改变现有行为，WebUI 配置页可开）。
+type HeartbeatCfg struct {
+	Enabled     bool   `json:"enabled"`
+	IntervalMin int    `json:"interval_min"` // 空闲多少分钟后触发（<=0 按默认）
+	Prompt      string `json:"prompt"`       // 触发时发给模型的提示词
 }
+
+// DefaultHeartbeatPrompt 心跳提示词出厂默认（WebUI 里可改，存 config/user.json）。
+// 措辞要点：① 明确"这是系统主动开启、不是主人发的消息"——防止模型把心跳当指令
+// 来源误判；② 先自查有无该继续/收尾的事，没有就停下；③ 禁止为找事做而做无关
+// 操作、禁止主动对外联系（空闲时最容易出越权动作）。
+const DefaultHeartbeatPrompt = "（心跳：系统检测到你已空闲——最后一次 run 结束至今没有新的 run，现在由系统主动开启一轮。这不是主人发的消息，不构成新任务授权。请自查：挂起的后台任务是否出了结果、之前接下的活是否收尾、有没有明显该推进的下一步、有没有需要验证的结果。有就继续做；没有就一句话说明当前状态然后停下。不要为了找事做而执行无关操作，不要重复已完成的事，不要主动对外联系任何人。）"
+
 
 // Default 出厂默认（2026-09-14 易迁移：data 目录默认 $HOME/.okhuman；
 // 部署可用 config/default.json 或 OKHUMAN_DATA_DIR 环境变量覆盖）
@@ -85,7 +96,7 @@ func Default() *Config {
 		Context:      ContextCfg{MaxTokens: 150000, KeepRecentChars: 60000, HardTruncChars: 150000, StreamIdleMS: 90000, CharsPerToken: 1.5},
 		Tools:        ToolsCfg{FgTimeoutMS: 30000, ResultLimit: 10000, TimeoutMS: 600000},
 		Doom:         DoomCfg{WarnAfter: 3},
-		Agent:        AgentCfg{EndCheck: true},
+		Heartbeat:    HeartbeatCfg{Enabled: false, IntervalMin: 30, Prompt: DefaultHeartbeatPrompt},
 	}
 }
 

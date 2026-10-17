@@ -50,6 +50,10 @@
   textarea { resize: vertical; font-family: var(--mono); font-size: 13px; }
   label.f { display: block; margin-bottom: 10px; }
   label.f span { display: block; color: var(--dim); font-size: 12px; margin-bottom: 4px; }
+  .hb-bar { margin: 10px 0 14px; padding: 10px 14px; border: 1px solid var(--border);
+    border-radius: 8px; background: var(--bg2); font-size: 14px; }
+  .hb-bar b { font-variant-numeric: tabular-nums; font-size: 18px; letter-spacing: .5px; }
+  .hb-bar .dim { color: var(--dim); font-size: 12px; }
 
   /* ---------- 侧栏 ---------- */
   aside {
@@ -344,10 +348,11 @@
 
   <!-- ================= 配置 ================= -->
   <section class="page" id="page-config">
-    <h1>⚙️ 配置 <span class="sub">保存即生效：llm/context/tools/doom/agent 即时热更新；带 ⚠重启 标记的段需重启进程</span></h1>
+    <h1>⚙️ 配置 <span class="sub">保存即生效：llm/context/tools/doom 即时热更新；带 ⚠重启 标记的段需重启进程</span></h1>
     <div class="cfg-scope">
       <span class="dim" id="cfgPatchFile" style="font-size:12px">落盘 config/user.json（重启恢复）</span>
     </div>
+    <div id="hbBar" class="hb-bar" style="display:none"></div>
     <div id="cfgBody"></div>
     <div class="row" style="margin-top:6px">
       <button class="primary" style="padding:9px 30px;font-size:15px" onclick="saveConfig()">💾 保存并生效</button>
@@ -516,6 +521,8 @@ function showPage(p) {
   if (L) L();
   stopAuto();
   if (p === "status") startAuto();
+  stopHb();
+  if (p === "config") startHb();
 }
 /* 页面可见时自动刷新（状态页每 3s） */
 let autoTimer = null;
@@ -528,6 +535,58 @@ function startAuto() {
   }, 3000);
 }
 function stopAuto() { if (autoTimer) { clearInterval(autoTimer); autoTimer = null; } }
+
+/* ================= 心跳倒计时（配置页，2026-10-17 用户定） ================= */
+/* 数据源是 /status 的 heartbeat 段：next_due_ms 由服务端算，与浏览器同机同时钟，
+   直接 Date.now() 相减。每秒本地重算（不累积误差），每 5s 回源校准——run 结束、
+   改开关/间隔都会改变下次时刻。只在配置页可见时跑，切页即停（见 showPage）。 */
+let hbState = null, hbTick = null, hbPull = null;
+function fmtCountdown(ms) {
+  if (ms == null || ms < 0) ms = 0;
+  const t = Math.floor(ms / 1000);
+  const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), sec = t % 60;
+  const p = (x) => String(x).padStart(2, "0");
+  return h > 0 ? `${h}:${p(m)}:${p(sec)}` : `${p(m)}:${p(sec)}`;
+}
+async function pullHeartbeat() {
+  try {
+    const j = await api("/status");
+    hbState = { hb: j.heartbeat || null, running: !!j.running };
+    renderHbBar();
+  } catch (e) { /* 静默：下一轮校准再试 */ }
+}
+function renderHbBar() {
+  const bar = $("hbBar");
+  if (!bar) return;
+  if (!hbState || !hbState.hb) { bar.style.display = "none"; return; }
+  const hb = hbState.hb;
+  if (!hb.enabled) {
+    bar.innerHTML = `💤 心跳已关闭 <span class="dim">（下面把 enabled 设为「开」并保存即启用）</span>`;
+    bar.style.display = "block";
+    return;
+  }
+  if (hbState.running) {
+    bar.innerHTML = `⏳ 正在 run —— <span class="dim">心跳计时暂停（run 结束才重新计时；间隔 ${hb.interval_min} 分钟）</span>`;
+  } else if (hb.next_due_ms == null) {
+    bar.innerHTML = `⏸ 心跳计时未开始 <span class="dim">（间隔 ${hb.interval_min} 分钟）</span>`;
+  } else {
+    const left = hb.next_due_ms - Date.now();
+    bar.innerHTML = left <= 0
+      ? `🔔 心跳到点，本轮巡检内即将触发`
+      : `⏱ 下次心跳 <b>${fmtCountdown(left)}</b> 后 <span class="dim">｜ 间隔 ${hb.interval_min} 分钟 ｜ 已空闲 ${fmtDur(hb.idle_ms)}</span>`;
+  }
+  bar.style.display = "block";
+}
+function startHb() {
+  stopHb();
+  pullHeartbeat();
+  hbTick = setInterval(renderHbBar, 1000);
+  hbPull = setInterval(pullHeartbeat, 5000);
+}
+function stopHb() {
+  if (hbTick) { clearInterval(hbTick); hbTick = null; }
+  if (hbPull) { clearInterval(hbPull); hbPull = null; }
+}
 
 /* ================= 健康检测 ================= */
 async function health() {
@@ -789,10 +848,6 @@ function handleChatEvent(type, data) {
     case "doom_stop":
       chatAddHtml(evCard("doom", "⛔", "死循环强停", data.detail));
       break;
-    case "end_check":
-      streamEnd();
-      chatAddHtml(evCard("doom", "🔍", "轮末校验", data.detail));
-      break;
     case "error":
       streamEnd();
       chatAddHtml(evCard("doom", "❌", "运行出错", data.message));
@@ -849,7 +904,6 @@ function eventsFor() {
   on("compress_delta", (d) => handleChatEvent("compress_delta", d));
   on("doom_warn", (d) => handleChatEvent("doom_warn", d));
   on("doom_stop", (d) => handleChatEvent("doom_stop", d));
-  on("end_check", (d) => handleChatEvent("end_check", d));
   on("error", (d) => {
     // EventSource 的 "error" 分两种——服务端广播的 run error 带 data，连接自身断开无 data（浏览器自动重连）。
     if (d && d.message) handleChatEvent("error", d);
@@ -1074,8 +1128,10 @@ const CFG_SCHEMA = [
   { section: "doom", title: "死循环保护", fields: [
     { key: "warn_after", label: "warn_after：连续 N 次相同调用后警告（≥2）", type: "number" },
   ]},
-  { section: "agent", title: "轮末校验（停止信号防过早）", fields: [
-    { key: "end_check", label: "end_check：模型无工具调用结束输出（=发出本轮停止信号）时，追问一次『目前有没有还未完成的事情』——有就马上开始做，没有才正式收笔（每次停止至多校验一次）", type: "select", bool: true, options: [{v:"true",l:"开"},{v:"false",l:"关"}] },
+  { section: "heartbeat", title: "空闲心跳（持续无 run 到点 → 主动发提示词开启一轮）", fields: [
+    { key: "enabled", label: "enabled：空闲到点自动开启一轮 run", type: "select", bool: true, options: [{v:"true",l:"开"},{v:"false",l:"关"}] },
+    { key: "interval_min", label: "interval_min：空闲多少分钟后触发（run 结束才重置计时，正在 run 期间不计时）", type: "number", step: 1, note: "1–1440" },
+    { key: "prompt", label: "prompt：触发时发给模型的心跳提示词", type: "textarea", rows: 6 },
   ]},
   { section: "data", title: "落盘", fields: [
     { key: "dir", label: "data.dir：落盘根目录（运行时自动追加 -<port> 后缀，多实例互不干扰）", type: "text", restart: true },
@@ -1104,7 +1160,9 @@ async function loadConfig(opts) {
         const v = node?.[f.key] ?? "";
         const control = f.type === "select"
           ? `<select data-sec="${sec.section}" data-key="${f.key}" data-orig="${esc(v)}"${f.bool ? ' data-bool="1"' : ""}>${(f.options || []).map((o) => `<option value="${esc(o.v)}" ${String(v) === o.v ? "selected" : ""}>${esc(o.l)}</option>`).join("")}</select>`
-          : `<input data-sec="${sec.section}" data-key="${f.key}" data-orig="${esc(v)}" type="${f.type}" value="${esc(v)}" ${f.type === "number" ? `step="${f.step ?? 1}"` : ""}>`;
+          : f.type === "textarea"
+            ? `<textarea data-sec="${sec.section}" data-key="${f.key}" data-orig="${esc(v)}" rows="${f.rows ?? 5}" style="width:100%;min-width:320px;font:inherit;vertical-align:top">${esc(v)}</textarea>`
+            : `<input data-sec="${sec.section}" data-key="${f.key}" data-orig="${esc(v)}" type="${f.type}" value="${esc(v)}" ${f.type === "number" ? `step="${f.step ?? 1}"` : ""}>`;
         return `<div style="min-width:200px">
           <label class="f">
             <span>${esc(f.label)}${f.restart ? '<span class="restart-flag">⚠ 改后需重启进程</span>' : ""}${f.note && !f.restart ? `<span class="note gray">（${esc(f.note)}）</span>` : ""}</span>
@@ -1143,6 +1201,7 @@ async function saveConfig() {
       (j.restart || []).map((x) => `<div class="rs-line">⚠ ${esc(x)}</div>`).join("");
     toast("配置已保存" + (j.restart?.length ? "（部分项需重启进程生效）" : "（全部即时生效）"));
     await loadConfig({ keepResult: true });
+    pullHeartbeat(); // 改了开关/间隔 → 倒计时立即反映新值
   } catch (e) {
     toast(e.message, true);
     $("cfgResult").innerHTML = `<span style="color:var(--red)">✘ ${esc(e.message)}</span>`;

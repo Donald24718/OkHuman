@@ -94,7 +94,7 @@ func deepCopyMessages(ms []types.Message) []types.Message {
 // 带指令 → 耗尽即收笔：少写步骤的测试由请求数/事件数断言明确报错，而不是挂死。
 func (f *FakeLLM) nextStep() FakeStep {
 	if len(f.steps) == 0 {
-		return FakeStep{Type: "text", Text: "（FakeLLM 步骤耗尽）" + types.StopToken}
+		return FakeStep{Type: "text", Text: "（FakeLLM 步骤耗尽）"}
 	}
 	s := f.steps[0]
 	f.steps = f.steps[1:]

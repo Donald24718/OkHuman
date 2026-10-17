@@ -153,6 +153,10 @@ type AppState struct {
 	ActiveDrain   *drainHandle
 	RoundBuf      *roundBuf
 	RunSeq        int
+	// LastRunEnd 最近一次 run 结束的时刻（Unix 毫秒）——空闲心跳的计时基准
+	// （2026-10-17）。口径由用户定：**只有 run 结束才重置**，正在 run 期间不计时。
+	// 用 atomic 而非 state.mu：心跳只读它，避免与 RunLock→state.mu 锁序纠缠。
+	LastRunEnd    atomic.Int64
 	InjectSeq     int
 	Injects       []InjectInfo
 }
@@ -160,13 +164,16 @@ type AppState struct {
 // NewAppState AppState 工厂（2026-08-31）：统一初始化事件广播集 + 消息队列 + 活动 drain + 轮次缓冲。
 // cfg 参数保留兼容（配置统一存于 AgentState.CfgRef）。
 func NewAppState(cfg *config.Config, root string, agent *AgentState) *AppState {
-	return &AppState{
+	st := &AppState{
 		Root:          root,
 		Agent:         agent,
 		BroadcastSubs: []subEntry{},
 		MessageQueue:  []string{},
 		Injects:       []InjectInfo{},
 	}
+	// 启动即视为"刚 run 完"：空闲计时从此刻开始，不会一启动就发心跳
+	st.LastRunEnd.Store(time.Now().UnixMilli())
+	return st
 }
 
 // ---------- agent 运行时构建（对应 TS createAgentState / makeCm） ----------
@@ -244,7 +251,6 @@ func runOpt(a *AgentState, state *AppState) agent.RunOptions {
 		DataDir:       cfg.Data.Dir,
 		ResultLimit:   cfg.Tools.ResultLimit,
 		DoomWarnAfter: cfg.Doom.WarnAfter,
-		EndCheck:      cfg.Agent.EndCheck,
 		FgTimeoutMS:   cfg.Tools.FgTimeoutMS,
 		// 轮内搭车（2026-09-14 统一）：与 drain（runDrain）共享同一队列、splice 原子取走，
 		// 携带用户追加消息 + 已 settle 后台任务的通知（同一队列、同一逻辑）。
@@ -271,9 +277,6 @@ func runOpt(a *AgentState, state *AppState) agent.RunOptions {
 			}
 			a.BG().OnBackgroundStart(bg)
 		},
-		// 未 settle 后台任务数（2026-10-16）：收笔追问的提示词据此告知模型"有任务在跑、
-		// 完成会自动通知"。追问每轮现取——任务可能正好在这期间 settle。
-		PendingBackgroundCount: func() int { return a.BG().PendingCount() },
 	}
 }
 
@@ -474,6 +477,9 @@ func runDrain(state *AppState, a *AgentState, h *drainHandle, onEvent func(types
 			batchErr = err
 			return err
 		})
+		// 心跳计时（2026-10-17）：一批 run 结束（无论成功/出错）即归零空闲计时——
+		// 用户口径"只有 run 结束才重置"。放在 Lock.Run 之后：此刻本轮真的结束了。
+		state.LastRunEnd.Store(time.Now().UnixMilli())
 		if len(msgs) == 0 {
 			break // 空队列（ActiveDrain 已在锁内摘除）→ 本 drain 完成
 		}
@@ -489,9 +495,93 @@ func runDrain(state *AppState, a *AgentState, h *drainHandle, onEvent func(types
 	return reply, time.Since(started).Milliseconds(), nil
 }
 
+// ---------- 空闲心跳（2026-10-17 用户定） ----------
+
+// heartbeatStatus /status 里的心跳可观测字段：开关、阈值、上次 run 结束时刻、
+// 当前已空闲多久、下次预计触发时刻（running 时 next_due 按"正在 run 不计时"
+// 语义给 null——真实下次取决于本轮何时结束）。
+func heartbeatStatus(cfg config.HeartbeatCfg, lastRunEndMs int64, running bool) map[string]interface{} {
+	mins := cfg.IntervalMin
+	if mins <= 0 {
+		mins = config.Default().Heartbeat.IntervalMin
+	}
+	out := map[string]interface{}{
+		"enabled":         cfg.Enabled,
+		"interval_min":    mins,
+		"last_run_end_ms": lastRunEndMs,
+		"idle_ms":         time.Now().UnixMilli() - lastRunEndMs,
+	}
+	if running || !cfg.Enabled {
+		out["next_due_ms"] = nil
+	} else {
+		out["next_due_ms"] = lastRunEndMs + int64(mins)*60000
+	}
+	return out
+}
+
+// heartbeatTickMS 心跳巡检粒度：30s 一次。间隔本身以分钟配置，30s 粒度足够，
+// 且空转成本可忽略（一次配置读 + 两次原子读）。
+const heartbeatTickMS = 30000
+
+// heartbeatDue 触发判定（纯函数，可测）：开关关或正在 run → 不触发；
+// 距上次 run 结束 ≥ interval → 触发。interval <=0 退回默认值。
+func heartbeatDue(nowMs, lastRunEndMs int64, cfg config.HeartbeatCfg, running bool) bool {
+	if !cfg.Enabled || running {
+		return false
+	}
+	mins := cfg.IntervalMin
+	if mins <= 0 {
+		mins = config.Default().Heartbeat.IntervalMin
+	}
+	if lastRunEndMs <= 0 {
+		return false // 计时基准未初始化（防御）
+	}
+	return nowMs-lastRunEndMs >= int64(mins)*60000
+}
+
+// StartHeartbeat 起空闲心跳巡检：每 heartbeatTickMS 检查一次，满足 heartbeatDue
+// → 把心跳提示词经 enqueueAndWake 入队并唤醒 drain——与后台完成通知、/enqueue
+// 完全同一条路径（串行锁 / 事件广播 / 落盘 / 压缩全部复用，不另起 run 通道）。
+//
+// 触发即把 LastRunEnd 归零：同一空闲期不会反复入队；随后本轮 run 结束时
+// runDrain 还会再归零一次。配置每 tick 现取（COW）→ WebUI 改开关/间隔/提示词
+// 无需重启进程。返回 stop 停表（进程常驻，一般不调用）。
+func StartHeartbeat(state *AppState, a *AgentState) func() {
+	return startHeartbeat(state, a, heartbeatTickMS)
+}
+
+// startHeartbeat 实现体（tickMS 可注入：生产 30000，测试用毫秒级以便断言）。
+func startHeartbeat(state *AppState, a *AgentState, tickMS int) func() {
+	if tickMS <= 0 {
+		tickMS = heartbeatTickMS
+	}
+	t := time.NewTicker(time.Duration(tickMS) * time.Millisecond)
+	go func() {
+		for range t.C {
+			hb := a.Cfg().Heartbeat
+			if !hb.Enabled {
+				continue
+			}
+			now := time.Now().UnixMilli()
+			state.mu.Lock()
+			running := a.Lock.Running() || state.ActiveDrain != nil
+			last := state.LastRunEnd.Load()
+			state.mu.Unlock()
+			if !heartbeatDue(now, last, hb, running) {
+				continue
+			}
+			state.LastRunEnd.Store(now)
+			fmt.Fprintf(os.Stderr, "[heartbeat] 空闲 %d 分钟无 run → 主动开启一轮（阈值 %d 分钟）\n",
+				(now-last)/60000, hb.IntervalMin)
+			enqueueAndWake(state, a, hb.Prompt, makeOnEvent(state, a))
+		}
+	}()
+	return t.Stop
+}
+
 // ---------- 运行时配置热更新（WebUI 配置页，2026-08-29，2026-09-09 单实例化） ----------
 
-var hotSections = []string{"llm", "context", "tools", "doom", "agent"}
+var hotSections = []string{"llm", "context", "tools", "doom", "heartbeat"}
 var restartSections = []string{"server", "data", "system_prompt"} // 改后需重启进程
 
 type PatchResult struct {
@@ -531,9 +621,6 @@ func applyConfigPatch(a *AgentState, patch map[string]interface{}) PatchResult {
 	}
 	if has("doom") {
 		applied = append(applied, "doom（死循环告警阈值，下轮运行生效）")
-	}
-	if has("agent") {
-		applied = append(applied, "agent（轮末校验开关，下轮运行生效）")
 	}
 
 	// COW 热更新（2026-09-14 审计修：旧实现 ApplyPatchInPlace 原地改共享
@@ -829,6 +916,7 @@ func (ap *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{
 		"session": int(a.SessionNo.Load()),
 		"running": running,
+		"heartbeat": heartbeatStatus(cfg.Heartbeat, ap.state.LastRunEnd.Load(), running),
 		"system_prompt": map[string]interface{}{
 			"fallback": fallback,
 			"files":    files,
@@ -1427,6 +1515,9 @@ var numChecks = map[string]func(interface{}) bool{
 	"result_limit":    func(v interface{}) bool { n, ok := v.(float64); return ok && n > 1000 },
 	"fg_timeout_ms":   func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 },
 	"warn_after":      func(v interface{}) bool { n, ok := v.(float64); return ok && n >= 2 },
+	// interval_min：0/负 → 每 30s 巡检都会触发（等于把 agent 变成自循环）；上限
+	// 1440 分钟（24h）防手滑写成天级。
+	"interval_min": func(v interface{}) bool { n, ok := v.(float64); return ok && n >= 1 && n <= 1440 },
 }
 
 func (ap *App) handleConfigPost(w http.ResponseWriter, r *http.Request) {
@@ -1446,7 +1537,7 @@ func (ap *App) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 	}
 	for k := range patch {
 		if !known[k] {
-			writeJSON(w, 400, map[string]interface{}{"error": fmt.Sprintf("未知配置段：%s（允许：llm / context / tools / doom / agent / server / data / system_prompt）", k)})
+			writeJSON(w, 400, map[string]interface{}{"error": fmt.Sprintf("未知配置段：%s（允许：llm / context / tools / doom / heartbeat / server / data / system_prompt）", k)})
 			return
 		}
 	}
