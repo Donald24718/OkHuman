@@ -87,10 +87,14 @@ func deepCopyMessages(ms []types.Message) []types.Message {
 	return out
 }
 
-// nextStep 消费一个主循环步骤（耗尽 → 占位文本步）
+// nextStep 消费一个主循环步骤（耗尽 → 占位文本步）。
+// 占位文本必须带停止指令（2026-10-17）：收笔判定无次数上限，模型不给停止指令就
+// 一直追问——夹具若返回不含指令的文本，步骤耗尽后就是无限追问 + 上下文无限增长，
+// 一路吃到 OOM（实测 TestThinkingOnlyStopLoop 少给一步，60s 超时才炸在 deepCopyMessages）。
+// 带指令 → 耗尽即收笔：少写步骤的测试由请求数/事件数断言明确报错，而不是挂死。
 func (f *FakeLLM) nextStep() FakeStep {
 	if len(f.steps) == 0 {
-		return FakeStep{Type: "text", Text: "（FakeLLM 步骤耗尽）"}
+		return FakeStep{Type: "text", Text: "（FakeLLM 步骤耗尽）" + types.StopToken}
 	}
 	s := f.steps[0]
 	f.steps = f.steps[1:]

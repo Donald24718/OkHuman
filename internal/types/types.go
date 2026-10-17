@@ -9,6 +9,11 @@ import (
 	"fmt"
 )
 
+// StopToken 收笔停止指令（2026-10-17 提到 types 供 agent 与 context 共用：
+// agent 用它判定收笔，context 在发给 LLM 的出口把它剥掉，让模型对它无感知。
+// 存储与前端显示仍保留原文，只有回传给 LLM 的那份被剥。）
+const StopToken = "[[[[STOP]]]]"
+
 // ---------- LLM wire 格式（OpenAI 兼容 / llama.cpp /v1/chat/completions） ----------
 
 // ToolCall 工具调用（arguments 双向 JSON 字符串）

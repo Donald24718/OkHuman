@@ -262,6 +262,34 @@ func (m *Manager) AddMessage(e *types.RawEntry) {
 	m.emitPersist()
 }
 
+// MessageCount 当前消息条数（收笔判定记录追问起点用，2026-10-17）。
+func (m *Manager) MessageCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.session.Messages)
+}
+
+// RemoveTail 删掉尾部 n 条消息（2026-10-17：收笔/转工具时清掉 STOP 追问痕迹，
+// 让模型对停止指令无感知——它既不会在历史里看到自己写过 [[[[STOP]]]]，也就不会
+// 条件反射地提前发）。只删尾部，更早的历史一个字节不动 → 已缓存的 KV 前缀继续
+// 有效，只有被删的尾部那一小段作废。seq 只增不回退（避免与持久化标识纠缠）。
+// 删完 emitPersist 落盘；token 变少无需触发压缩。
+func (m *Manager) RemoveTail(n int) {
+	if n <= 0 {
+		return
+	}
+	m.changeMu.Lock()
+	defer m.changeMu.Unlock()
+	m.mu.Lock()
+	l := len(m.session.Messages)
+	if n > l {
+		n = l
+	}
+	m.session.Messages = m.session.Messages[:l-n]
+	m.mu.Unlock()
+	m.emitPersist()
+}
+
 // maybeCompress 压缩触发：总 token（含 system + summary）> max_tokens → 压最旧一批。
 // 保留集 = 最近 keep_recent_chars 字符预算内的原文（至少保留最新 1 条）；
 // 保留集外全在预算内且无 summary → 无可压（return）。
@@ -369,7 +397,11 @@ func (m *Manager) doCompress(batch []types.RawEntry) {
 		if len(batch) > 0 && len(batch) <= len(m.session.Messages) {
 			m.session.Messages = m.session.Messages[len(batch):]
 		}
-		ref := res.Text
+		// 摘要进上下文前剥掉停止指令（2026-10-17）：summary 是前缀的第 2 条消息，
+		// 位置极靠前，一旦把 [[[[STOP]]]] 抄进来就会长期暴露给模型、且每次改写都
+		// 掀掉整条 KV 前缀。写入时剥一次、之后不再变 → 前缀稳定。落盘的总结文本
+		// 仍存原文（writeSummaryFileLocked 用 res.Text），只有这份回传副本被剥。
+		ref := stripStopText(res.Text)
 		// 2026-09-25：总结文本落盘 session-summaries/（与 records 存档同名基座配对）；
 		// 写失败不阻断压缩，指针降级为只有存档行
 		var summaryPath string

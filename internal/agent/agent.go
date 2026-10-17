@@ -66,7 +66,7 @@ type RunOptions struct {
 	// 收笔追问时若 >0，提示词追加一句"有 N 个转后台任务在跑、完成会自动通知、不必
 	// 守着"。未接线或返回 0 → 提示词与旧版逐字一致，不提后台任务。
 	PendingBackgroundCount func() int
-	OnEvent           func(types.AgentEvent)
+	OnEvent                func(types.AgentEvent)
 	// 本轮消息来源（事件广播标记用，2026-08-31）：user = 单条用户消息；
 	// merged = 运行中积攒的多条合并消息。
 	Kind string
@@ -541,21 +541,53 @@ func (a *Agent) finishText(resp *types.Response, emit func(types.AgentEvent), to
 // stopToken 停止指令（2026-10-12 用户定，替换旧 end_check 的"追问一次"）：
 // 模型无工具调用结束时，必须在正文中原样输出该指令才算收笔（位置不限）；没输出 →
 // 系统持续注入提示词重问，不设次数上限。
-const stopToken = "[[[[STOP]]]]"
+const stopToken = types.StopToken
 
-// stopPrompt 未给停止指令时注入的提示词（明确"正文中出现即算、位置不限、思考里不算"）。
-// 两版（2026-10-16 用户定）：
-//   - pending == 0：与旧 stopPromptMsg 逐字一致，完全不提后台任务（无端提反而误导）；
-//   - pending > 0：在"不输出它"之前插入一句——告知有 N 个前台超时已转后台的任务仍在
-//     跑、出结果会自动通知（通知到达会自动开新一轮），没别的事就输出停止指令收笔。
+// stopPrompt 未给停止指令时注入的提示词。
+//
+// 设计意图（2026-10-17 用户定）：**注入本身就是教学**——不在 system prompt 里
+// 预先声明协议，而是每轮需要时注入一次、当场教；痕迹由 removeStopTrace 清掉，
+// 下一轮便重新注入、重新教。教是逐轮发生的，不是一次性的。
+//
+// 文案必须把**机制**讲透，否则多疑的模型会犯病（实测：模型发现"我明明写了标记
+// 却不在历史里""这段是谁塞的"，会当成矛盾去调查、长篇分析、甚至停下来等确认，
+// 白烧一轮又一轮）。故三段各司其职：
+//
+//	【机制】本轮靠什么结束、为什么无工具调用不等于做完、标记是给谁看的；
+//	【为什么你可能没见过它】出口剥标记 + 清追问痕迹 → 这不是失忆/矛盾/测试/bug；
+//	【怎么做】只有两条路，不要第三条，不必琢磨复述解释。
+//
+// 两版（按转后台任务数）：
+//   - pending == 0：追加"收笔前先自问要不要挂轮询"（不声称有任务在跑）；
+//   - pending > 0：追加"有 N 个转后台任务、完成会自动通知"告知句。
+//
+// 开头 "（系统提示：你本轮未调用工具" 是 removeStopTrace 识别追问痕迹的前缀，
+// 改文案时不得动它。
 func stopPrompt(pending int) string {
 	tail := ""
 	if pending > 0 {
 		tail = fmt.Sprintf("当前有 %d 个前台等待超时已转后台的任务仍在执行：出结果后系统会自动通知你（作为一条 user 消息搭车送进来，通知到达会自动开启新一轮），你不必守着它们。若此刻没有别的必须立刻做的事，直接在正文输出 %s 收笔即可。", pending, stopToken)
+	} else {
+		tail = "当前没有任何前台等待超时转后台的任务在跑，也就没有任何结果会自动唤醒你：" +
+			"你一旦收笔，就只有主人下次发消息才能把你叫醒。所以收笔前先自问一句——" +
+			"有没有还没出结果、需要你盯的事？若有，先起一个 bash 调用去轮询它" +
+			"（例如 while pgrep -f xxx >/dev/null; do sleep 5; done; 然后接着打印结果），" +
+			"这种调用前台等满 30 秒会自动转后台，完成时系统会自动通知你，你才睡得着。" +
+			"注意：用 setsid 之类脱离出去的监视进程只会把结果写进文件，不会唤醒你，等于白挂。"
 	}
 	return "（系统提示：你本轮未调用工具，且正文里没有停止指令 " + stopToken +
-		"，系统不会结束本轮。若此刻还有必须你现在就做的动作 → 直接发出工具调用；" +
-		"若确无 → 输出正文并在其中原样带上 " + stopToken + "（正文中出现即可，位置不限）。" +
+		"，系统不会结束本轮。" +
+		"【机制】本轮怎么结束，系统只看一个信号：你的正文里有没有出现 " + stopToken +
+		"。出现即收笔，位置不限，写在思考内容里不算。没出现，系统就认为你可能半途停下，" +
+		"于是注入本提示重问一次——无工具调用本身不等于事情做完，系统没法替你判断，" +
+		"所以要你明确给一个信号。这个标记是给系统的收笔信号，不是工具、不是新任务，" +
+		"也不需要你向谁解释它。" +
+		"【为什么你可能没见过它】回传给你的历史里，这个标记会被系统剥掉，" +
+		"注入过的追问痕迹也会被删掉，所以你常常觉得自己从没发过它、或奇怪它是哪来的。" +
+		"这是设计如此：让你每轮都干净地重新收到本说明，而不是靠历史残留去猜。" +
+		"不是失忆，不是自相矛盾，不是有人在测试你，也不是故障——不必为此调查、提问或等确认。" +
+		"【怎么做】只有两条路，别选第三条：还有没做完、需要你盯的事 → 直接发出工具调用继续做；" +
+		"确实做完了 → 输出正文并在其中原样带上 " + stopToken + "（正文中出现即可，位置不限）。" +
 		"写在思考内容里不算。" + tail + "不输出它，本提示会持续重复。）"
 }
 
@@ -574,6 +606,31 @@ func bgStartedNotice(fgSec int) string {
 	return fmt.Sprintf("（系统：此调用前台等待超过 %d 秒未完成，已自动转入后台继续执行。无需等待，可继续其他工作或直接基于已有信息回复；任务完成后系统会自动通知结果——通知到达会自动开启新一轮，你不必守着。若此刻没有别的必须立刻做的事，直接在正文输出 %s 收笔即可。）", fgSec, stopToken)
 }
 
+// removeStopTrace 清掉收笔判定期间注入的系统追问痕迹（2026-10-17）：从尾部往前删，
+// 保留 base 之后第一条（那是模型自己的收笔正文）。遇到"不是 stopPrompt 的 user 消息"
+// 立即停手——追问轮里会搭车用户消息与后台 settle 通知，它们已被 TakePendingUsers
+// 取走、不会重来，删掉等于丢消息。只删尾部连续段，更早历史不动 → KV 前缀有效。
+func (a *Agent) removeStopTrace(base int) {
+	for {
+		n := a.cm.MessageCount()
+		if n <= base+1 {
+			return // 只剩第一次正文，无可删
+		}
+		snap := a.cm.Session()
+		msgs := snap.Messages
+		last := msgs[n-1]
+		if last.Role == "user" {
+			s := types.AsString(last.Content)
+			if !strings.HasPrefix(s, "（系统提示：你本轮未调用工具") {
+				return // 搭车的用户消息/后台通知，停
+			}
+		} else if last.Role != "assistant" {
+			return // tool 等其它角色，保守停手
+		}
+		a.cm.RemoveTail(1)
+	}
+}
+
 // isStopSignal 判定正文中是否出现停止指令：出现即算，位置不限（2026-10-12 用户
 // 改定，从"必须正文末尾"放宽）。判定只发生在轮末（本轮无工具调用时）——出现
 // 就停止注入提示词、正常收笔，不掐断正在生成的内容。只看正文，思考里出现不算。
@@ -587,7 +644,8 @@ func isStopSignal(content string) bool {
 //
 // 收笔判定（2026-10-12 用户定，替换旧 end_check 的"追问一次"）：无工具调用
 // 不再等于收笔——模型必须在正文中输出停止指令 [[[[STOP]]]] 才算：
-//   - 正文含该指令 → 正式收笔（回复原样保留指令，不剥；见 TestStopLoopContinue）；
+//   - 正文含该指令 → 正式收笔，一次 LLM 调用即结束（回复原样保留指令，不剥；
+//     见 TestStopLoopContinue / TestStopTokenFirstTryNoNag）；
 //   - 没有 → 注入提示词重问，无次数上限（模型若改为发工具调用 → 继续做）。
 //
 // 闸门已撤（2026-10-12 用户定）：有未 settle 的后台任务也不再直接收笔，
@@ -604,10 +662,22 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 				// [[[[STOP]]]] 才算收笔；没有 → 注入提示词重问，无次数上限。
 				// 事件名沿用 end_check（WebUI 卡片与流式切块逻辑不变）。
 				backToTools := false
+				// STOP 对模型无感知（2026-10-17）：nagBase = 进入收笔判定时的条数。
+				// 第一次那份无工具调用的正文就是模型自己的收笔内容 → 保留；
+				// 之后注入的 stopPrompt 与被追问产生的思考/正文都是系统痕迹 → 收笔或
+				// 转工具时删掉（只删尾部，KV 前缀不受影响）。
+				//
+				// 已带停止指令 = 立刻收笔，不再追问（2026-10-17 用户定，撤掉此前的
+				// "pending==0 也强制追问一次轮询提醒"）：那条提醒会让模型明明已经
+				// 按协议发了停止指令，仍白多发一轮 LLM。"要不要挂轮询"的自问句已经
+				// 合并进 stopPrompt（pending==0 那版）——只在模型没给停止指令时随同
+				// 一次注入出现，不再单独多开一轮。
+				nagBase := a.cm.MessageCount()
 				for {
 					if isStopSignal(resp.Content) {
 						a.cm.AddMessage(&types.RawEntry{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent})
-						emit(types.AgentEvent{"type": "end_check", "detail": "正文含停止指令 → 停止追问，正式收笔"})
+						a.removeStopTrace(nagBase)
+						emit(types.AgentEvent{"type": "end_check", "detail": "正文含停止指令 → 停止追问，正式收笔（已清系统追问痕迹）"})
 						emit(types.AgentEvent{"type": "done", "usage": totals})
 						return resp.Content, nil
 					}
@@ -638,6 +708,10 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 					resp = r
 				}
 				if backToTools {
+					// 转工具：删掉第一个工具调用之前的全部追问痕迹（保留第一次正文）。
+					// 带 tool_calls 的 assistant 消息尚未写入（在工具循环里才存），
+					// 此刻删不会破坏 assistant↔tool 配对。
+					a.removeStopTrace(nagBase)
 					continue
 				}
 			}

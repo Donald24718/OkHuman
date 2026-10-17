@@ -16,6 +16,7 @@ package context
 import (
 	"fmt"
 	"math"
+	"strings"
 	"sync/atomic"
 
 	"okhuman/internal/inject"
@@ -100,6 +101,17 @@ func ComposeMessages(session *types.SessionState, systemPrompt string, opts *Com
 			if e.Role == "assistant" && e.ReasoningContent != nil {
 				m.ReasoningContent = e.ReasoningContent
 			}
+			// 停止指令对模型无感知（2026-10-17）：存储与前端保留原文，只有这份
+			// 回传给 LLM 的副本剥掉 [[[[STOP]]]]。纯函数、无条件、只作用于
+			// assistant → 主循环与压缩轮（composeLocked）拿到的是同一份剥后结果，
+			// 逐 token 一致 → KV 前缀不受影响。历史遗留的旧 STOP 也一并解决。
+			if e.Role == "assistant" {
+				m.Content = stripStopToken(m.Content)
+				if m.ReasoningContent != nil {
+					s := stripStopText(*m.ReasoningContent)
+					m.ReasoningContent = &s
+				}
+			}
 			out = append(out, m)
 		}
 	}
@@ -128,6 +140,33 @@ func resolveContentParts(parts []types.ContentPart, demote bool) []types.Content
 		}
 	}
 	return out
+}
+
+// stripStopText 剥掉文本里的停止指令及其残留空白（纯函数，确定性 → KV 稳定）
+func stripStopText(s string) string {
+	if !strings.Contains(s, types.StopToken) {
+		return s
+	}
+	s = strings.ReplaceAll(s, types.StopToken, "")
+	return strings.TrimRight(s, " \t\n\r")
+}
+
+// stripStopToken 剥 Content（string 或 parts 两种形态）里的停止指令
+func stripStopToken(c types.Content) types.Content {
+	if s, ok := c.(string); ok {
+		return stripStopText(s)
+	}
+	if parts := types.AsParts(c); parts != nil {
+		out := make([]types.ContentPart, 0, len(parts))
+		for _, p := range parts {
+			if p.Type == "text" {
+				p.Text = stripStopText(p.Text)
+			}
+			out = append(out, p)
+		}
+		return out
+	}
+	return c
 }
 
 // utf16Len 字符数（UTF-16 code units，对齐 TS text.length 口径——所有预算/

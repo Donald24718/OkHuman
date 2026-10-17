@@ -93,6 +93,48 @@ func TestStopLoopContinue(t *testing.T) {
 	}
 }
 
+// TestStopTokenFirstTryNoNag（2026-10-17 用户定）：模型第一次无工具调用的正文就带
+// 停止指令 → 一次 LLM 调用即正式收笔，不得再注入任何停止指令提示词。此前
+// "pending==0 也强制追问一次轮询提醒"的实现，让已经按协议发过停止指令的回复仍
+// 白多发一轮（用户报的"发两轮"）。断言：1 次请求、0 条追问、上下文无追问痕迹。
+func TestStopTokenFirstTryNoNag(t *testing.T) {
+	a, fake := newTestAgent([]llm.FakeStep{
+		{Type: "text", Text: "活干完了，收笔 [[[[STOP]]]]"},
+		{Type: "text", Text: "不应被消费"},
+	})
+	var prompts, nags int
+	opt := testRunOptStop(&prompts)
+	opt.PendingBackgroundCount = func() int { return 0 }
+	orig := opt.OnEvent
+	opt.OnEvent = func(e types.AgentEvent) {
+		if d, ok := e["detail"].(string); ok && strings.Contains(d, "轮询提醒") {
+			nags++
+		}
+		orig(e)
+	}
+	reply, err := a.Run(context.Background(), "你好", opt)
+	if err != nil {
+		t.Fatalf("run 失败: %v", err)
+	}
+	if len(fake.Requests) != 1 {
+		t.Errorf("已带停止指令应 1 次 LLM 调用收笔，实际 %d 次", len(fake.Requests))
+	}
+	if prompts != 0 {
+		t.Errorf("不该有追问事件，实际 %d 条", prompts)
+	}
+	if nags != 0 {
+		t.Errorf("不该注入轮询提醒，实际 %d 次", nags)
+	}
+	if reply != "活干完了，收笔 [[[[STOP]]]]" {
+		t.Errorf("回复应原样含停止指令，实际 %q", reply)
+	}
+	for _, m := range a.cm.Session().Messages {
+		if m.Role == "user" && strings.Contains(types.AsString(m.Content), "你本轮未调用工具") {
+			t.Errorf("上下文残留停止指令追问：%s", types.AsString(m.Content))
+		}
+	}
+}
+
 // TestEndCheckOff 轮末校验关（end_check=false）→ 旧行为：无工具调用立即收笔，
 // 不注入校验提示、不多发 LLM 请求（回归保护）。
 func TestEndCheckOff(t *testing.T) {
@@ -125,9 +167,10 @@ func testRunOpt() RunOptions {
 		DoomWarnAfter: 3,
 		FgTimeoutMS:   30000,
 		Kind:          "user",
-		// 收笔判定默认关：旧行为（无工具调用即收笔）。停止指令是无上限循环，
-		// 夹具步骤耗尽后 fake 会持续返回"步骤耗尽"文本 → 不显式开就会无限转。
-		// 收笔判定专项测试用 testRunOptStop 显式开。
+		// 收笔判定默认关：旧行为（无工具调用即收笔）。开启后正文必须含停止指令，
+		// 多数既有夹具的第一步不带指令 → 会多一轮追问，请求数断言全得重算。
+		// 收笔判定专项测试用 testRunOptStop 显式开（fake 步骤耗尽会带停止指令收笔，
+		// 不会无限追问，见 llm/fake.go nextStep）。
 		EndCheck: false,
 	}
 }
@@ -372,15 +415,27 @@ func TestStopLoopPiggyback(t *testing.T) {
 	}
 }
 
-// TestStopPromptTwoVersions 两版提示词（2026-10-16 用户定）：无转后台任务时逐字
-// 不提后台任务；有则追加告知句，且仍以旧提示词开头、仍含停止指令。
+// TestStopPromptTwoVersions 两版提示词：
+//   - pending == 0（2026-10-16 + 2026-10-17 用户定）：不得声称"当前有任务在跑"
+//     （无端声称才是 10-16 反对的误导），但要带"收笔前自问要不要挂轮询"那段，
+//     且与停止指令要求合并为同一次注入；
+//   - pending > 0：追加"有 N 个转后台任务、完成会自动通知"告知句。
 func TestStopPromptTwoVersions(t *testing.T) {
 	noBg := stopPrompt(0)
-	if strings.Contains(noBg, "后台") {
-		t.Fatalf("pending=0 不应提后台任务：%s", noBg)
+	if strings.Contains(noBg, "当前有 ") {
+		t.Fatalf("pending=0 不该声称有任务在跑：%s", noBg)
 	}
-	if !strings.Contains(noBg, stopToken) || !strings.Contains(noBg, "写在思考内容里不算。不输出它，本提示会持续重复。）") {
-		t.Fatalf("pending=0 应保留旧提示词全文：%s", noBg)
+	for _, want := range []string{"自问一句", "轮询", "不会唤醒你"} {
+		if !strings.Contains(noBg, want) {
+			t.Fatalf("pending=0 缺轮询自问片段 %q：%s", want, noBg)
+		}
+	}
+	// 旧提示词全文仍在，只是中段被轮询自问句插入 → 首尾两段分别断言（2026-10-17）
+	if !strings.Contains(noBg, stopToken) ||
+		!strings.Contains(noBg, "（系统提示：你本轮未调用工具") ||
+		!strings.Contains(noBg, "写在思考内容里不算。") ||
+		!strings.Contains(noBg, "不输出它，本提示会持续重复。）") {
+		t.Fatalf("pending=0 应保留旧提示词全文（首尾两段）：%s", noBg)
 	}
 	withBg := stopPrompt(2)
 	if !strings.HasPrefix(withBg, "（系统提示：你本轮未调用工具") {
