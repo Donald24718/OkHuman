@@ -1,0 +1,9 @@
+{
+  "port": 8090,
+  "host": "127.0.0.1",
+  "model": "models/Qwen3-ASR-0.6B-bf16.gguf",
+  "mmproj": "models/mmproj-Qwen3-ASR-0.6B-bf16.gguf",
+  "threads": 16,
+  "ctx": 8192,
+  "model_name": "qwen3-asr-0.6b"
+}

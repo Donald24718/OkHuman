@@ -1,0 +1,6 @@
+{
+  "name": "tts",
+  "summary": "独立 TTS 服务（从 voice-chat 拆出）：朗读文本 / 念文本 / 文本转语音，Kokoro-82M 本地合成，晓依音色，中英混读（engine.py 用 espeak IPA 补拉丁段，否则英文静音）。HTTP :8092 零依赖——POST /tts {text,voice,format} 出 wav 路径或直接回音频字节，GET /tts?text=&format=wav 直接拿音频，say.sh \"文本\" 一句话直接合成（服务没起会自动拉起）。voice-chat 仍走 serve.py 的 stdin→wav 旧协议，两者共用 engine.py。CPU RTF≈0.35。本目录文件不得命名 http.py（遮蔽标准库 http 包）。",
+  "updated": "2026-10-16",
+  "note": "agent 自写简介，scout 扫描时优先于 README 首段"
+}

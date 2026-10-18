@@ -39,7 +39,7 @@ setsid ./okmon </dev/null > /tmp/okmon.log 2>&1 &
 | name | 说明 | 定位 |
 |---|---|---|
 | okhuman-8451 | 主实例 | 端口 8451 |
-| okhuman-8452 | 第二实例 | 端口 8452 |
+| okhuman-8455 | 第二实例 | 端口 8455 |
 | （自动）其他 okhuman | 一切 Go 版 okhuman 进程（一次性实例等） | comm `okhuman` 全量扫描，自动追踪 |
 | qq-channel | QQ 频道 | comm `okhuman-qq-brid`（无监听端口） |
 | attach | 图片/视频注入 | CLI |

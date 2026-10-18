@@ -6,7 +6,7 @@ voice_loop.py — 语音闭环 (OkHuman 插件 voice-chat)
   [麦克风] --16k mono--> [VAD 端点检测]
         --> [声纹]  speaker_server (CAM++) :8091（只认你的声音）
         --> [ASR]   llama-server (CPU build) + Qwen3-ASR-0.6B :8090
-        --> [唤醒词] 多唤醒词路由（小A→8451 / 小B→8452；或唤醒后 15s 窗内下一句）
+        --> [唤醒词] 多唤醒词路由（小A→8451 / 小B→8455；或唤醒后 15s 窗内下一句）
         --> [Agent]  OkHuman POST /enqueue 按唤醒词路由（解耦：只走 HTTP）
         --> [音频源] 各实例 /events SSE 实时流（全渠道）+ /history 轮询兜底
         --> [播放]  消息按条排队（跨实例 FIFO）+ 消息内句子级流式：Kokoro-82M (stdin 管道) → aplay
@@ -34,6 +34,22 @@ import urllib.request
 
 # ══════════════════════════════ CONFIG ══════════════════════════════
 _HERE      = os.path.dirname(os.path.abspath(__file__))
+
+def _find_plugin(name):
+    """定位同级插件（asr / tts）。本插件可能和它们平级，也可能已被挪进
+    Rarely Used Plugins/year_x/month_x/day_x/ 这种深层日期目录——此时"同级 ../name"
+    不成立，必须从本目录逐级向上找 <祖先>/Frequently Used Plugins/<name>。
+    可用 config.json 的 tts_dir / asr_dir 直接写死绝对路径覆盖。"""
+    d = _HERE
+    for _ in range(8):
+        cand = os.path.join(d, "Frequently Used Plugins", name)
+        if os.path.isdir(cand):
+            return cand
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return os.path.join(os.path.dirname(_HERE), name)
 try:
     with open(os.path.join(_HERE, "config.json"), encoding="utf-8") as _f:
         CFG = json.load(_f)
@@ -46,8 +62,8 @@ OKHUMAN_URL  = CFG.get("okhuman_url", "http://127.0.0.1:8451")   # OkHuman 实�
 MIC          = CFG.get("mic", "default")      # 麦克风 (ffmpeg alsa 设备名: default / hw:3,0 ...)
 SPEAKER      = CFG.get("speaker", "0,0")      # 播放设备 (aplay -D)
 MAX_REPLY_CHARS = int(CFG.get("max_reply_chars", 500))
-# 路由实例：每个实例绑一个唤醒词（= 它的"名字"，播报前缀 "<实例名>说：" 由此生成）。
-# 喊哪个唤醒词 → 这句话只发给对应实例（小A→8451 / 小B→8452）。
+# 路由实例：每个实例绑一个唤醒词（= 它的"名字"，播报前缀 "小A说：" 由此生成）。
+# 喊哪个唤醒词 → 这句话只发给对应实例（小A→8451 / 小B→8455）。
 INSTANCES = [(it["wake_word"], it["url"]) for it in CFG.get("instances", [])]
 if not INSTANCES:                        # 未配置 instances → 单实例直连（旧行为）
     INSTANCES = [("agent", OKHUMAN_URL)]
@@ -95,9 +111,10 @@ class KokoroTTSServer:
         self.log_path = log_path
         self.proc = None
         os.makedirs(outdir, exist_ok=True)
-        base = os.path.dirname(os.path.abspath(__file__))
-        self.py = os.path.join(base, "kokoro_venv", "bin", "python")
-        self.serve = os.path.join(base, "kokoro_serve.py")
+        # TTS 已拆成独立插件（同级 tts/）：可用 config.json 的 tts_dir 覆盖
+        base = CFG.get("tts_dir") or _find_plugin("tts")
+        self.py = os.path.join(base, "venv", "bin", "python")
+        self.serve = os.path.join(base, "serve.py")
 
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
@@ -502,7 +519,7 @@ def mark_broadcast(text) -> bool:
 
 
 # ─────────────────────── 按条广播队列（2026-09-21 架构，用户指定语义）───────────────────────
-#   * 队列粒度 = 一条 assistant 消息（MsgItem）；各实例的消息按产出顺序进同一个全局 FIFO，
+#   * 队列粒度 = 一条 assistant 消息（MsgItem）；小A/小B 的消息按产出顺序进同一个全局 FIFO，
 #     一条播完取下一条（不区分实例）——谁先产出谁先播。
 #   * 消息内：agent 流式吐出一个完整句（句末标点）就送 TTS 开播，不等整条/整轮结束。
 #   * 音频来源：各实例 /events SSE 实时流（全渠道：语音唤醒 / QQ / WebUI / 定时任务）。

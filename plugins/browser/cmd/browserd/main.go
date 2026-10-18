@@ -222,6 +222,11 @@ func main() {
 	}
 
 	startedAt := time.Now().UnixMilli()
+	// 测试支持：CDP 一起来就挂上事件监听，把页面 JS 异常/console 报错
+	// 持续记到 /tmp/okhuman-browser-<port>.errors。
+	defer os.Remove(errorsFile(a.port))
+	go watchErrors(a.port)
+
 	// 等 CDP 起来（≤8s）
 	deadline := time.Now().Add(8 * time.Second)
 	for {

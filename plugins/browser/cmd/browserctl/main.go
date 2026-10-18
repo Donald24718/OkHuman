@@ -19,6 +19,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -88,11 +89,11 @@ func jsQuote(s string) string { return jsString(s) }
 // ---------- page target 管理 ----------
 
 type pageInfo struct {
-	ID      string `json:"id"`
-	Type    string `json:"type"`
-	URL     string `json:"url"`
-	Title   string `json:"title"`
-	WsURL   string `json:"webSocketDebuggerUrl"`
+	ID    string `json:"id"`
+	Type  string `json:"type"`
+	URL   string `json:"url"`
+	Title string `json:"title"`
+	WsURL string `json:"webSocketDebuggerUrl"`
 }
 
 func getJSON(url string, v interface{}) error {
@@ -811,8 +812,8 @@ func doClick(c *cdpClient, port int, selector string) error {
 	}
 	var box struct {
 		Found bool    `json:"found"`
-		X float64 `json:"x"`
-		Y float64 `json:"y"`
+		X     float64 `json:"x"`
+		Y     float64 `json:"y"`
 		Tag   string  `json:"tag"`
 	}
 	if s, ok := v.(string); ok {
@@ -892,8 +893,8 @@ func doType(c *cdpClient, selector, text string, clear bool) error {
 	}
 	var box struct {
 		Found bool    `json:"found"`
-		X float64 `json:"x"`
-		Y float64 `json:"y"`
+		X     float64 `json:"x"`
+		Y     float64 `json:"y"`
 		Tag   string  `json:"tag"`
 	}
 	if s, ok := v.(string); ok {
@@ -1267,8 +1268,8 @@ func doHover(c *cdpClient, selector string) error {
 	}
 	var box struct {
 		Found bool    `json:"found"`
-		X float64 `json:"x"`
-		Y float64 `json:"y"`
+		X     float64 `json:"x"`
+		Y     float64 `json:"y"`
 		Tag   string  `json:"tag"`
 	}
 	if s, ok := v.(string); ok {
@@ -1703,6 +1704,16 @@ func main() {
 			ctlFail("press 需要 <key>")
 		}
 		withInstance(a.port, a.action, func(c *cdpClient) error { return doPress(c, a.args[0]) }, true)
+	case "errors":
+		printJSErrors(a.port, contains(a.args, "--clear"), contains(a.args, "--all"))
+	case "count":
+		if len(a.args) < 1 || a.args[0] == "" {
+			ctlFail("count 需要 <css 选择器>")
+		}
+		q, _ := json.Marshal(a.args[0])
+		withInstance(a.port, a.action, func(c *cdpClient) error {
+			return doEval(c, "String(document.querySelectorAll("+string(q)+").length)")
+		}, true)
 	case "eval":
 		if len(a.args) < 1 || a.args[0] == "" {
 			ctlFail("eval 需要 <js>")
@@ -1936,4 +1947,61 @@ func nonNegInt(s string) (int, bool) {
 		return 0, false
 	}
 	return int(f), true
+}
+
+// printJSErrors 读 daemon 记下的页面 JS 异常/console 报错。
+// 有报错就以退出码 1 结束——网页测试要的是"不对就叫"，
+// 不是让 agent 自己去肉眼比对输出。
+func printJSErrors(port int, clear, all bool) {
+	path := filepath.Join(os.TempDir(), fmt.Sprintf("okhuman-browser-%d.errors", port))
+	b, err := os.ReadFile(path)
+	if err != nil || len(strings.TrimSpace(string(b))) == 0 {
+		fmt.Println("无 JS 报错")
+		return
+	}
+	n := 0
+	seen := map[string]bool{}
+	for _, ln := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		var rec map[string]string
+		if json.Unmarshal([]byte(ln), &rec) != nil {
+			continue
+		}
+		// 同一个异常会被重放（切 tab、重新 enable 都会再来一遍），
+		// 记一次就够，否则测试报告里全是重复条目。
+		key := rec["kind"] + "|" + rec["text"]
+		if seen[key] {
+			continue
+		}
+		// 资源 404（favicon 之类）默认不算前端报错：它会把真异常埋掉。
+		// 要看全部：errors --all。
+		if !all && strings.Contains(rec["text"], "Failed to load resource") {
+			continue
+		}
+		seen[key] = true
+		n++
+		line := fmt.Sprintf("%s  %s", rec["kind"], strings.TrimSpace(rec["text"]))
+		if w := strings.TrimSpace(rec["where"]); w != "" && w != " :" {
+			line += "  @" + w
+		}
+		fmt.Println(line)
+	}
+	if n == 0 {
+		// 文件里有东西但全被过滤掉（重复/资源 404）：这不算失败。
+		fmt.Println("无 JS 报错")
+		return
+	}
+	fmt.Printf("共 %d 条\n", n)
+	if clear {
+		os.WriteFile(path, nil, 0644)
+	}
+	os.Exit(1)
+}
+
+func contains(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
 }

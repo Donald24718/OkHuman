@@ -5,7 +5,7 @@ speaker_server.py — 声纹门控服务 (CAM++, 3D-Speaker, CPU)
 
   POST /verify   body=wav 字节(任意采样率/声道, 服务端转 16k mono)
                  -> {"score": 0.83, "pass": true, "ms": 412}
-  GET  /status   -> {"ready": true, "threshold": 0.6, "enrolled": "sample.wav", "n_enroll": 1}
+  GET  /status   -> {"ready": true, "threshold": 0.6, "enrolled": "厄运.wav", "n_enroll": 1}
   GET  /enroll?wav=/path/to/ref.wav   追加一段参考音频(可选, 默认用启动时 --enroll)
 
 模型: iic/speech_campplus_sv_zh_en_16k-common_advanced (CAM++, 192-dim, 200k speakers)
@@ -138,7 +138,7 @@ class H(BaseHTTPRequestHandler):
         elif self.path.startswith("/enroll"):
             from urllib.parse import urlparse, parse_qs
             # 请求行被 BaseHTTPRequestHandler 按 iso-8859-1 解码过：还原 UTF-8，
-            # 否则中文路径（如 /home/$USER/语音样本.wav）在 ffmpeg 侧变成乱码找不到文件
+            # 否则中文路径（如 ~/音乐/mine.wav）在 ffmpeg 侧变成乱码找不到文件
             try:
                 path = self.path.encode("latin-1").decode("utf-8")
             except (UnicodeEncodeError, UnicodeDecodeError):

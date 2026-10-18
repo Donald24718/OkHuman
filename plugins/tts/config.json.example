@@ -1,0 +1,6 @@
+{
+  "port": 8092,
+  "host": "127.0.0.1",
+  "voice": "zf_xiaoyi",
+  "outdir": "/tmp/tts_http_out"
+}

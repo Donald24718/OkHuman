@@ -1,0 +1,3 @@
+{
+  "summary": "关系性知识库 v0（独立 CLI，无守护进程）：补 LLM 缺少的本机/项目/主人裁定的接地专业知识。代码强制三条不变式——ID 永不改指（revise 走新 ID+supersedes）、无出处即不存在（master|import|verified|proposed）、proposed 不得参与硬约束。命令：find/get(-expand 展开预算)/neighbors/isa/add/revise/link/dedup(规范形同构只提议)/stats(-budget-mib 超预算列降级候选)/load。数据自管 data/*.jsonl + audit.log。用途：回答本机事实、硬件、模型实测数字、服务端口、主人裁定前先查它，别凭记忆。"
+}

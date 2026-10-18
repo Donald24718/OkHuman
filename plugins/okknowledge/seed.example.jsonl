@@ -1,0 +1,13 @@
+# okknowledge 种子示例：仅演示格式（真实数据在 data/，不入库）。ID = 载入顺序（空库时 = 行序）
+# --- 类别骨架 ---
+{"node":{"kind":"类别.工具","label":"工具","prov":{"source":"import","note":"本体骨架"}}}
+{"node":{"kind":"类别.约定","label":"约定","prov":{"source":"import","note":"本体骨架"}}}
+{"node":{"kind":"类别.测量","label":"测量","prov":{"source":"import","note":"本体骨架"}}}
+# --- 实体 ---
+{"node":{"kind":"实体.工具","label":"example-server :9090","prov":{"source":"verified","note":"curl /health → 200"}}}
+{"node":{"kind":"实体.测量","label":"吞吐 42 tok/s","prov":{"source":"verified","note":"2026-01-01 实测，batch=1，ctx=8192"}}}
+# --- 约定（主人的裁定 = 最高权威）---
+{"node":{"kind":"实体.约定","label":"回答硬件/端口/实测数字前先查本库","prov":{"source":"master","note":"约束来源是主人，不是惯例"}}}
+# --- 边 ---
+{"edge":{"src":5,"dst":4,"role":"measured_on","prov":{"source":"verified","note":"同一台机器上测的"}}}
+{"edge":{"src":4,"dst":1,"role":"is_a","prov":{"source":"import","note":"归类"}}}

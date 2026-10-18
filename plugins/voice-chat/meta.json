@@ -1,4 +1,6 @@
 {
   "name": "voice-chat",
-  "summary": "语音对话插件：对着麦克风说话→VAD→声纹验证（只认你的声音）→ASR→唤醒词路由到 OkHuman 实例→Kokoro 本地 TTS 朗读回复。回复按条排队+消息内句子级流式播报，输入输出解耦。全自包含（Python 环境与模型经 setup.sh 安装）。"
+  "summary": "语音对话插件（2026-10-16 起位于 Rarely Used Plugins，ASR/TTS 已拆成独立插件）：对着麦克风说话→声纹验证（只认你的声音，5 条参考声纹）→ASR→唤醒词路由到 OkHuman 双实例（小A→8451/小B→8455）→TTS 朗读回复。回复按条排队（跨实例 FIFO）+ 消息内句子级流式播报：音频源为各实例 /events SSE 实时流，/history 轮询兜底。输入输出解耦：播报中麦克风持续监听。依赖同级 asr 插件（OpenAI 兼容 :8090）与 tts 插件（serve.py 的 stdin→wav 协议，tts_dir 可覆盖）；本目录只留编排层 + 声纹门控 + WebUI。",
+  "updated": "2026-10-16",
+  "note": "agent 自写简介，scout 扫描时优先于 README 首段"
 }

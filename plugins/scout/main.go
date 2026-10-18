@@ -330,7 +330,12 @@ func scanCorpus(cfg Config) []corpusDoc {
 		if path != cfg.PluginRoot {
 			switch name {
 			case "venv", "kokoro_venv", "asr", "speaker", "data", "MiniMax-H3-Skills":
-				return filepath.SkipDir
+				// 目录自己带 meta.json = 它就是插件本体，不能当资产跳过
+				// （插件从旧插件拆出来时，名字可能与旧资产目录撞车，
+				//   撞车的后果是它整个进不了索引：search 搜不到它）。
+				if _, e := os.Stat(filepath.Join(path, "meta.json")); e != nil {
+					return filepath.SkipDir
+				}
 			}
 		}
 		b, e2 := os.ReadFile(filepath.Join(path, "meta.json"))

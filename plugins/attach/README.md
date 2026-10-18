@@ -14,7 +14,7 @@ okattach frame <video> <t> [--w W]   视频抽 t 秒单帧，压宽 W（默认 1
 以上均可加 --note "说明"（/attachments 里可见，不进 LLM 上下文）
 ```
 
-目标端口自动识别：沿**进程父链**找所属 okhuman 主进程，取其 LISTEN 端口（插件由 agent 的 bash 工具启动，父链 okattach←bash←okhuman，端口随实例天然隔离：如 8451 / 8452）；脱离 agent 会话跑（父链无 okhuman）时回退 8451 并告警，此时用 `--okhuman-port` 显式指定。
+目标端口自动识别：沿**进程父链**找所属 okhuman 主进程，取其 LISTEN 端口（插件由 agent 的 bash 工具启动，父链 okattach←bash←okhuman，端口随实例天然隔离：如 8451 / 8455）；脱离 agent 会话跑（父链无 okhuman）时回退 8451 并告警，此时用 `--okhuman-port` 显式指定。
 
 ## 视频注入策略（2026-09-20 用户定版）
 

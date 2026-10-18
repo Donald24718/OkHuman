@@ -392,6 +392,14 @@ func collectState() State {
 
 var actMu sync.Mutex
 
+// shellQuote 用单引号安全包裹路径。插件目录名含空格（"Frequently Used Plugins"），
+// 不引号会让 "cd <workdir> && ..." 报 "cd: 参数太多"，&& 短路 → 服务根本没被拉起，
+// 且报错落在 okmon 自己的 stderr 而非服务日志，排障时看不到。2026-09-21 插件目录
+// 重排进带空格目录后，webui 的启动按钮对这批服务全部失效。
+func shellQuote(v string) string {
+	return "'" + strings.ReplaceAll(v, "'", `'\''`) + "'"
+}
+
 func startService(name string) (map[string]any, int) {
 	actMu.Lock()
 	defer actMu.Unlock()
@@ -412,7 +420,7 @@ func startService(name string) (map[string]any, int) {
 		return map[string]any{"ok": false, "msg": fmt.Sprintf("已在跑（pid %d）", pid), "pid": pid}, http.StatusConflict
 	}
 	logf := fmt.Sprintf("/tmp/okmon-%s.log", name)
-	script := fmt.Sprintf("cd %s && setsid %s </dev/null >> %s 2>&1 &", s.Workdir, s.Start, logf)
+	script := fmt.Sprintf("cd %s && setsid %s </dev/null >> %s 2>&1 &", shellQuote(s.Workdir), s.Start, shellQuote(logf))
 	if err := exec.Command("bash", "-c", script).Start(); err != nil {
 		return map[string]any{"ok": false, "msg": "启动命令执行失败: " + err.Error()}, http.StatusInternalServerError
 	}

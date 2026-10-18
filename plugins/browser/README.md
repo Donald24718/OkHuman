@@ -60,6 +60,32 @@ plugins/browser/browserctl "$SHARED_PORT" open https://example.com
 agent 分文件，互不串；也建议各 agent 用 `new` 拿自己的 tab、用
 `tab <index>` / `close_tab <index>` 显式操作。
 
+## 登录态放哪儿：`--shared` vs `--data-dir`（2026-10-04 补，README 原先没写 `--data-dir`）
+
+| 需求 | 用什么 | 登录态活多久 |
+|---|---|---|
+| 多个 agent 共用一份、当次开机内复用 | `--shared` | 活在**运行的进程**里；杀进程 / 重启机器即灭 |
+| 扫码登录一次，**跨重启 / 重开机**长期复用 | `--data-dir <dir>` | 画像落盘到该目录；cleanup 只删临时目录，**持久目录保留** |
+| 一次性抓取，不想留痕 | 都不带 | 每次起独立 /tmp 临时画像，退出即删 |
+
+两者可叠加（`--shared --data-dir <dir>`）。`--data-dir` 的目录里就是账号凭据：
+**放在插件目录之外**（否则会被插件索引/镜像一起带走），
+权限 600，不进 git。
+
+扫码登录一次、之后长期用：
+
+```bash
+PROF=$HOME/browser-profiles/example-site; mkdir -p "$PROF"; chmod 700 "$PROF"
+(setsid plugins/browser/browserd 8751 --data-dir "$PROF" --idle 3600 </dev/null >/tmp/browser-8751.log 2>&1 &)
+sleep 3
+plugins/browser/browserctl 8751 open https://example.com/login
+plugins/browser/browserctl 8751 screenshot --out /tmp/qr.png   # 把截图交给用户扫码
+plugins/browser/browserctl 8751 cookies example.com                   # 扫完导出含会话 cookie 的 Cookie 头
+```
+
+⚠ 路径含空格（`Frequently Used Plugins`）——**示例里一律带引号**。不加引号的 `cd %s && setsid %s`
+这类拼接脚本会在含空格目录上短路（okmon 起服务 2026-09-21 起就一直失效即此因，已修）。
+
 ## 用法（agent 经 bash）
 
 ```bash
@@ -144,6 +170,12 @@ plugins/browser/browserctl 8701 screenshot --full --out /tmp/full.png
 # 或不指定 --out，默认存 /tmp/browser-8701-<ts>.png（stdout 打印实际路径）
 plugins/browser/browserctl 8701 screenshot
 
+# 导出浏览器 cookie（含 httpOnly，如 B 站 SESSDATA——document.cookie 拿不到，只能走 CDP
+# Network.getAllCookies）。默认输出一行 Cookie 头格式 name=value; ...；--json 出完整字段
+plugins/browser/browserctl 8701 cookies example.com
+plugins/browser/browserctl 8701 cookies example.com --json
+# ⚠ 这些值是账号凭据：落文件要 chmod 600、用完 rm，别进日志/仓库/skill 目录
+
 # 查状态
 plugins/browser/browserctl 8701 status
 
@@ -203,3 +235,38 @@ v1 只做**副作用分级 + 日志**，不上审批链（个人单机场景）�
 
 - Go（`cmd/browserctl`、`cmd/browserd` 两个独立二进制；依赖仅 gorilla/websocket）
 - 系统 chromium（默认 `/usr/bin/chromium`，`OKH_BROWSER_CHROME` 环境变量可覆盖）
+
+## 网页测试（2026-10-07 加）
+
+给"我自己写完前端，自己开浏览器验"这条链用。三条命令：
+
+```bash
+browserctl <port> count  "#stage .l"        # 数元素个数
+browserctl <port> errors [--clear] [--all]  # 页面 JS 异常 / console 报错
+browserctl <port> eval   "<js>"             # 任意求值（可模拟输入并提交）
+```
+
+`errors` 由 **daemon 侧**持续记录（`/tmp/okhuman-browser-<port>.errors`，JSONL）：
+browserctl 是短连接，命令之间没人接事件，异常只能由常驻的 browserd 收。
+**有报错 → 退出码 1**，测试脚本可以直接 `&&`/`if` 判，不用肉眼比对输出。
+
+一条完整的自检（实测跑通）：
+
+```bash
+browserctl 8732 open http://127.0.0.1:8460/
+browserctl 8732 eval '(()=>{const i=document.getElementById("in");
+  i.value="来杯麦酒";document.getElementById("f").requestSubmit();})()'
+sleep 6
+browserctl 8732 count "#stage .l"   # 行数变多 = 玩家那句话真落地了
+browserctl 8732 errors              # 干净页退出码 0；有 JS 异常退出码 1
+```
+
+实测：干净页 `errors` 退出码 0；故意放一个 `undefined_fn()` 的页面退出码 1，
+并把 `Uncaught ReferenceError: undefined_fn is not defined @file:1:39` 连行号打出来。
+
+去噪两条（都是实测踩出来的）：
+- 同一个异常 chromium 会重放（重新 enable、切 tab 都会再来一遍）→ **写入侧按 kind+text 去重**；
+- 资源 404（favicon 之类）默认不计入，否则真异常被埋 → 要看全部用 `--all`。
+
+已知边界（不装全）：`console.error` 只有在 daemon 挂上之后**新产生**的才收得到——
+页面加载瞬间打的那条可能漏（异常不会漏，Runtime.enable 会补发）。

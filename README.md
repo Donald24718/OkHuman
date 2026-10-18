@@ -69,17 +69,22 @@ open http://127.0.0.1:8451/
 
 | 插件 | 干什么 |
 |---|---|
+| asr | 独立 ASR 服务：llama.cpp CPU build 的 llama-server + ASR 模型，OpenAI 兼容 `/v1/audio/transcriptions`（:8090）；`transcribe.sh` 单文件转写 |
 | attach | 素材注入上下文：图片原图/压缩，视频按策略直通 input_video（自动压 360p/分段） |
-| browser | browserctl 轻 CLI 驱动本地 Firefox：导航、定位、填表、点击、取文本 |
+| browser | browserctl 轻 CLI 驱动本地 chromium（CDP）：导航、定位、填表、点击、取文本、截图；`errors` / `count` / `eval` 让 agent 写完前端自己开浏览器验 |
 | computer | 给 agent 装"手"：整屏截图注入 + X11 鼠标键盘事件 |
 | cron | 定时任务（:8601），到点把 prompt 作为 user 消息 POST 到对应实例 /chat |
+| okknowledge | 关系性知识库（独立 CLI，无守护进程）：接地事实 + 出处 + ID 永不改指；答本机事实前先查它 |
 | okmon | 进程监控 + 启停管理（webui :8496） |
 | qq-channel | QQ 官方渠道桥：QQ 消息 ↔ agent 双向转发（独立常驻进程，无监听端口） |
 | scout | 插件/技能语义索引（:8480）：关键词 + Qwen3-Embedding 语义向量打分 |
-| voice-chat | 语音全闭环：麦克风 → VAD → 声纹门控 → ASR → 唤醒词路由 → Kokoro TTS 朗读 |
+| tts | 独立 TTS 服务（Kokoro-82M，HTTP :8092）：`say.sh` 出一句，`serve.py` 常驻复用 |
+| voice-chat | 语音全闭环：麦克风 → VAD → 声纹门控 → ASR → 唤醒词路由 → TTS 朗读（ASR/TTS 已拆成上面两个独立插件） |
 
-布局与管理规范见 [plugins/RULE.md](plugins/RULE.md)。每个插件都是独立 Go 模块
-（独立 git 仓、自带 config.json 与 data/），改完源码必须重编 + 真实启动验证。
+布局与管理规范见 [plugins/RULE.md](plugins/RULE.md)。每个插件自带 `config.json.example`
+与 `data/`（Go 插件是独立模块，`cd plugins/<名字> && go build`；Python 插件自带 venv，
+模型权重与运行数据一律不入库）。改完源码必须重编 + 真实启动验证。
+
 
 **技能库**（`plugins/skills/`）：skill = 本机实测验证过的操作经验（SKILL.md），
 日期层级存放，同样进 scout 索引。本仓不预置技能——技能是环境相关的，

@@ -7,13 +7,6 @@ HERE="$(pwd)"
 
 PY="$HERE/venv/bin/python"
 
-# 资产检查（开源版：先跑 setup.sh）
-if [ ! -x "$PY" ] || [ ! -f "$HERE/asr/bin/llama-server" ] || [ ! -f "$HERE/asr/models/Qwen3-ASR-0.6B-bf16.gguf" ]; then
-  echo "[start] ⚠ 环境资产不全（venv / asr/bin/llama-server / asr/models/*.gguf 之一缺失）"
-  echo "[start]   先运行: ./setup.sh"
-  exit 1
-fi
-
 # ── OkHuman 实例（agent 腿，解耦契约：只走 HTTP）──
 OKHUMAN_URL="$( "$PY" -c 'import json;print(json.load(open("config.json")).get("okhuman_url","http://127.0.0.1:8451"))' 2>/dev/null || echo http://127.0.0.1:8451 )"
 if curl -s --max-time 2 "$OKHUMAN_URL/health" >/dev/null 2>&1; then
@@ -37,27 +30,25 @@ else
   echo "[start] 声纹门控已在运行"
 fi
 
-# ── ASR 服务器 (Qwen3-ASR-0.6B, CPU) ──
+# ── ASR：已拆成独立插件 asr/，这里只做探活 + 复用它的 start.sh ──
 PORT=8090
-BIN="$HERE/asr/bin"
-MODEL_DIR="$HERE/asr/models"
-if ! curl -s --max-time 2 http://127.0.0.1:$PORT/v1/models >/dev/null 2>&1; then
-  echo "[start] 启动 ASR 服务器 (Qwen3-ASR-0.6B, CPU) ..."
-  # RUNPATH 指向旧编译目录, 用 LD_LIBRARY_PATH 指向本插件 asr/bin
-  nohup env LD_LIBRARY_PATH="$BIN" "$BIN/llama-server" \
-    -m "$MODEL_DIR/Qwen3-ASR-0.6B-bf16.gguf" \
-    --mmproj "$MODEL_DIR/mmproj-Qwen3-ASR-0.6B-bf16.gguf" \
-    --host 127.0.0.1 --port $PORT -t 16 -c 8192 \
-    > /tmp/voice_loop_asr.log 2>&1 &
-  for i in $(seq 1 90); do
-    curl -s --max-time 2 http://127.0.0.1:$PORT/v1/models >/dev/null 2>&1 && break
-    sleep 1
-  done
-  echo "[start] ASR 服务器就绪 (pid $(pgrep -f "llama-server.*Qwen3-ASR" | head -1))"
+# 本插件可能被挪进日期层级目录，逐级向上找 Frequently Used Plugins/asr
+ASR_DIR=""
+_d="$HERE"
+for _i in 1 2 3 4 5 6 7 8; do
+  _c="$_d/Frequently Used Plugins/asr"
+  [ -d "$_c" ] && { ASR_DIR="$_c"; break; }
+  _d="$(dirname "$_d")"
+done
+[ -n "$ASR_DIR" ] || ASR_DIR="$HERE/../asr"
+if curl -s --max-time 2 http://127.0.0.1:$PORT/v1/models >/dev/null 2>&1; then
+  echo "[start] ASR 已在运行 (:$PORT，由 asr 插件提供)"
+elif [ -x "$ASR_DIR/start.sh" ]; then
+  echo "[start] ASR 未运行，调用 asr 插件启动：$ASR_DIR/start.sh"
+  "$ASR_DIR/start.sh" || echo "[start] ⚠ ASR 启动失败——语音识别会逐次报错重试"
 else
-  echo "[start] ASR 服务器已在运行"
+  echo "[start] ⚠ 找不到 asr 插件（$ASR_DIR），且 :$PORT 无服务——ASR 不可用"
 fi
-
 
 # ── 控制台 WebUI (:8495) ──
 if curl -s --max-time 2 http://127.0.0.1:8495/ >/dev/null 2>&1; then
