@@ -37,6 +37,7 @@ import (
 
 	ctxmgr "okhuman/internal/context"
 	"okhuman/internal/llm"
+	"okhuman/internal/persist"
 	"okhuman/internal/tools"
 	"okhuman/internal/types"
 )
@@ -145,8 +146,8 @@ func (a *Agent) Stop() {
 // CompressNowWithEvents 手动压缩（WebUI「手动压缩上下文」按钮 / POST /compress，
 // 2026-10-18）。与 run 内自动压缩的差别只在"谁触发"：压缩事件走与 run 同一条 emit
 // 通道（compress_delta / compress）→ 前端聊天区能看到压缩思考与正文的流式活卡。
-// 此前只有 run 注册了压缩监听（run 结束即注销），手动压缩时没人订阅 → 点完按钮
-// 界面全程无输出，只能等 HTTP 响应。
+// 此前只有 run 注册了压缩监听（run 结束即注销），手动压缩时没人订阅 → 主人点完按钮
+// 界面全程无输出，只能等 HTTP 响应（主人 2026-10-18 指出）。
 // 压缩流挂新建的 runCtx 并登记 a.runCancel → /stop 能中断它（与 run 内压缩同一条中止
 // 路径；中断后 session 不变）。调用方须持 RunLock（server 侧 a.Lock.Run），否则新 run
 // 会与压缩并发改会话结构。
@@ -382,7 +383,8 @@ func (a *Agent) writeToolLog(opt RunOptions, full string) string {
 	ts := time.Now().UTC().Format("2006-01-02_15-04-05")
 	path := filepath.Join(dir, fmt.Sprintf("tool-%s-%d.log", ts, toolLogSeq.Add(1)))
 	if err := os.MkdirAll(dir, 0o755); err == nil {
-		if err := os.WriteFile(path, []byte(full), 0o644); err == nil {
+		// 原子写（C2）：半截的工具全文 = 事后 cat 读到断的，正是排查时最需要完整的时候
+		if err := persist.AtomicWriteFile(path, full); err == nil {
 			return path
 		}
 	}
@@ -394,8 +396,8 @@ func (a *Agent) writeToolLog(opt RunOptions, full string) string {
 // AgentStoppedError 抛出（由 runUserMessage 收尾）。
 //
 // 2026-10-18：删掉"LLM 4xx 三级回退阶梯"（4xx→降级最近附件→全部附件→硬截断）。
-// 理由：触发条件写死 400/413/415，是按 llama.cpp 的响应行为定的；换推理后端时
-// 同一件事可能报别的码（503/500/别的），阶梯既不触发也拦不住，等于把猜测固化进控制流。
+// 理由：触发条件写死 400/413/415，是按 llama.cpp 的行为定的；换后端（现 strata）
+// 同一件事可能报 503/500/别的码，阶梯既不触发也拦不住，等于把猜测固化进控制流。
 // 现在 LLM 报错就原样抛出、本轮终止。附件出问题的处置改由人显式做：
 // WebUI「剥离全部注入附件」按钮（POST /strip-injects，永久回写侧车）+
 // 「手动压缩上下文」按钮（POST /compress）。

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"okhuman/internal/persist"
 	"okhuman/internal/types"
 )
 
@@ -123,7 +124,8 @@ func StripSidecar(dir, id string) bool {
 	if err != nil {
 		return false
 	}
-	return os.WriteFile(p, b, 0o644) == nil
+	// 原子写（C2）：侧车是"下次 compose 才读"的文件，半截 JSON = 附件静默消失或加载失败
+	return persist.AtomicWriteFile(p, string(b)) == nil
 }
 
 // DropInjectFile 删侧车文件 + 清缓存；返回是否真删了文件

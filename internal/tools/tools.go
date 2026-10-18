@@ -35,7 +35,67 @@ var (
 	toolTimeoutMS atomic.Int64 // 命令总时长上限（毫秒）
 	toolFgMS      atomic.Int64 // 前台等待（毫秒）——仅用于生成描述文本
 	toolsSpec     atomic.Pointer[[]types.ToolSpec]
+	// scriptDir 命令脚本落点（C5，2026-10-18）：启动时灌 <data>/bash-jobs，
+	// 未接线（测试/误用）回退 os.TempDir()。
+	scriptDir atomic.Value // string
+	// procStartMS 本次进程启动时刻：CleanupStaleScripts 用它区分"上次遗留"与"本次在用"。
+	procStartMS = time.Now().UnixMilli()
 )
+
+// SetScriptDir 指定命令脚本目录（<data>/bash-jobs）。建目录失败则保持回退态。
+//
+// 为什么从 /tmp 挪进数据目录：/tmp 是共享目录，8451/8452 的脚本混在一起，"清遗留"
+// 得判断归属、同名还可能撞；数据目录里的东西全是本实例的，清理策略可以简单粗暴。
+// 脚本内容是每条 bash 命令的明文全文，挪进来也顺带把这条跨进程存活的尾巴管起来。
+func SetScriptDir(dir string) {
+	if dir == "" {
+		return
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	// 已存在的目录也收紧到 0700：里面躺的是每条命令的明文全文，不该比数据目录更松
+	if st, err := os.Stat(dir); err == nil && st.Mode().Perm() != 0o700 {
+		_ = os.Chmod(dir, 0o700)
+	}
+	scriptDir.Store(dir)
+}
+
+func scriptDirNow() string {
+	if v, ok := scriptDir.Load().(string); ok && v != "" {
+		return v
+	}
+	return os.TempDir()
+}
+
+func scriptDirExplicit() bool {
+	v, ok := scriptDir.Load().(string)
+	return ok && v != ""
+}
+
+// CleanupStaleScripts 清掉上次进程被强杀留下的脚本（mtime 早于本次进程启动）。
+// defer os.Remove 在 SIGKILL 下不跑，信号处理也拦不住 SIGKILL——所以兜底放在启动时，
+// 不依赖优雅退出。只在显式配置过目录时动手：回退到 /tmp 时不碰共享目录
+// （那里可能有别的实例的脚本正在用）。返回清理个数。
+func CleanupStaleScripts() int {
+	if !scriptDirExplicit() {
+		return 0
+	}
+	ms, _ := filepath.Glob(filepath.Join(scriptDirNow(), "okhuman-bash-*"))
+	n := 0
+	for _, m := range ms {
+		st, err := os.Stat(m)
+		if err != nil || !st.Mode().IsRegular() {
+			continue
+		}
+		if st.ModTime().UnixMilli() < procStartMS {
+			if os.Remove(m) == nil {
+				n++
+			}
+		}
+	}
+	return n
+}
 
 // Configure 设置工具超时并重建工具表：启动时一次，tools 段热更新时再调。
 // 新上限对"下一条命令"生效；已在跑的命令沿用其启动时的上限。
@@ -143,13 +203,17 @@ func toolBash(args map[string]interface{}) (string, error) {
 		timeoutSec = limitSec
 	}
 
-	// 方案 B（2026-09-15）：命令文本进 /tmp 临时脚本，不进 argv。pkill/pgrep -f 按完整
+	// 方案 B（2026-09-15）：命令文本进临时脚本，不进 argv（落点见 SetScriptDir：
+	// 实例自己的 <data>/bash-jobs，未接线回退 /tmp）。pkill/pgrep -f 按完整
 	// 命令行（argv）匹配——旧 `bash -c <全文>` 把命令文本挂在包装壳 argv 上，任何命中
 	// 命令文本的 -f 模式必然匹配到包装壳自己（自杀 exit 143 / 自匹配假 pid，2026-09-15
 	// 实测事故）。执行脚本文件是 bash 原生形态：命令文本既不在 argv 也不在 environ。
 	// 文件在进程退出后删除（绑退出，不绑 30s 前台超时——届时命令可能已转后台仍在跑；
 	// 提前 unlink 也不会中断执行，绑退出是保留取证价值）。
-	scriptPath := filepath.Join(os.TempDir(), fmt.Sprintf("okhuman-bash-%d-%s.sh", time.Now().UnixMilli(), randHex(4)))
+	scriptPath := filepath.Join(scriptDirNow(), fmt.Sprintf("okhuman-bash-%d-%s.sh", time.Now().UnixMilli(), randHex(4)))
+	if err := os.MkdirAll(filepath.Dir(scriptPath), 0o700); err != nil {
+		return "", fmt.Errorf("创建脚本目录失败: %w", err)
+	}
 	if err := os.WriteFile(scriptPath, []byte(command), 0o700); err != nil {
 		return "", fmt.Errorf("写临时脚本失败: %w", err)
 	}

@@ -33,6 +33,7 @@ import (
 	ctxmgr "okhuman/internal/context"
 	"okhuman/internal/inject"
 	"okhuman/internal/llm"
+	"okhuman/internal/persist"
 	"okhuman/internal/prompt"
 	"okhuman/internal/tools"
 	"okhuman/internal/types"
@@ -1281,7 +1282,7 @@ func (ap *App) handleInject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	payload, _ := json.Marshal(parts)
-	if err := os.WriteFile(filepath.Join(dir, id+".json"), payload, 0o644); err != nil {
+	if err := persist.AtomicWriteFile(filepath.Join(dir, id+".json"), string(payload)); err != nil {
 		writeJSON(w, 500, map[string]interface{}{"error": "侧车写入失败：" + err.Error()})
 		return
 	}
@@ -1534,7 +1535,7 @@ func (ap *App) handlePromptsFilePost(w http.ResponseWriter, r *http.Request) {
 	file := filepath.Join(a.PromptDir, name)
 	if strings.HasSuffix(strings.ToLower(name), ".md") {
 		// 新增 .md → 立即重载生效
-		if err := os.WriteFile(file, []byte(content), 0o644); err != nil {
+		if err := persist.AtomicWriteFile(file, content); err != nil {
 			writeJSON(w, 500, map[string]interface{}{"error": "写入失败：" + err.Error()})
 			return
 		}
@@ -1548,7 +1549,7 @@ func (ap *App) handlePromptsFilePost(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]interface{}{"ok": true, "name": name, "reloaded": true, "files": names})
 		return
 	}
-	if err := os.WriteFile(file, []byte(content), 0o644); err != nil {
+	if err := persist.AtomicWriteFile(file, content); err != nil {
 		writeJSON(w, 500, map[string]interface{}{"error": "写入失败：" + err.Error()})
 		return
 	}

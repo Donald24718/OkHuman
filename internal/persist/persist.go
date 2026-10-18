@@ -37,12 +37,31 @@ type Snapshot struct {
 // ——/inject 与在飞 run 各自触发落盘——互相覆盖，rename 失败会把 session.json
 // 留在陈旧内容上，进程恰在此窗口被杀则丢最近消息）
 func AtomicWriteFile(file string, data string) error {
-	f, err := os.CreateTemp(filepath.Dir(file), filepath.Base(file)+".tmp-*")
+	dir := filepath.Dir(file)
+	// 权限沿用目标文件原有 mode（不存在则 0644）：CreateTemp 建的是 0600，
+	// 不显式 Chmod 的话 rename 会把原文件权限悄悄收紧（session.json 曾因此变 0600）。
+	mode := os.FileMode(0o644)
+	if st, err := os.Stat(file); err == nil {
+		mode = st.Mode().Perm()
+	}
+	f, err := os.CreateTemp(dir, filepath.Base(file)+".tmp-*")
 	if err != nil {
 		return err
 	}
 	tmp := f.Name()
 	if _, err := f.WriteString(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Chmod(mode); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	// 数据先落盘再 rename：只 rename 不 fsync，进程崩溃安全但掉电时可能
+	// "rename 成功、内容不全"（元数据与数据页顺序不保证）。
+	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return err
@@ -54,6 +73,11 @@ func AtomicWriteFile(file string, data string) error {
 	if err := os.Rename(tmp, file); err != nil {
 		os.Remove(tmp)
 		return err
+	}
+	// rename 本身也尽力落盘（失败不影响本次写入的正确性，只影响掉电后的可见性）
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 	return nil
 }

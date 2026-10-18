@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"okhuman/internal/llm"
+	"okhuman/internal/persist"
 	"okhuman/internal/types"
 )
 
@@ -543,7 +544,7 @@ func (m *Manager) writeSummaryFileLocked(ts, text string, rounds, beforeChars in
 	dir := filepath.Join(m.recordDir, "session-summaries")
 	path := filepath.Join(dir, fmt.Sprintf("ctx-%d-%s-seq%d.summary.txt", m.sessionNo, ts, m.seq))
 	if err := os.MkdirAll(dir, 0o755); err == nil {
-		if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644); err == nil {
+		if err := persist.AtomicWriteFile(path, strings.Join(lines, "\n")); err == nil {
 			return path
 		}
 	}
@@ -606,7 +607,7 @@ func (m *Manager) writeSessionRecordLocked(ts, reason string) string {
 	dir := filepath.Join(m.recordDir, "session-records")
 	path := filepath.Join(dir, fmt.Sprintf("ctx-%d-%s-seq%d.txt", m.sessionNo, ts, m.seq))
 	if err := os.MkdirAll(dir, 0o755); err == nil {
-		if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644); err == nil {
+		if err := persist.AtomicWriteFile(path, strings.Join(lines, "\n")); err == nil {
 			return path
 		}
 	}

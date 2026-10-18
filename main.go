@@ -123,6 +123,14 @@ func main() {
 	}
 	log := func(msg string) { p.Log(msg) }
 
+	// 工具命令脚本落点（C5，2026-10-18）：实例自己的 <data>/bash-jobs，不再混进共享
+	// /tmp；并在启动时清掉上次被强杀留下的残留——defer os.Remove 在 SIGKILL 下不跑，
+	// 信号处理也拦不住 SIGKILL，所以兜底必须放在启动时，不依赖优雅退出。
+	tools.SetScriptDir(filepath.Join(dataDir, "bash-jobs"))
+	if n := tools.CleanupStaleScripts(); n > 0 {
+		log(fmt.Sprintf("[tools] 已清理上次遗留的命令脚本 %d 个（%s）", n, filepath.Join(dataDir, "bash-jobs")))
+	}
+
 	useFake := os.Getenv("OKHUMAN_FAKE") == "1"
 
 	// ---------- 建 agent 运行时（单实例） ----------
@@ -173,9 +181,8 @@ func main() {
 		a.CM().SetSessionNo(int(sessSnap.No))
 	}
 	// 会话变更 → 实时同步落盘
-	a.CM().AddPersistListener(func(s *types.SessionState, seq int) {
-		_ = p.SaveSession(&persist.Snapshot{No: int(a.SessionNo.Load()), Seq: seq, State: s})
-	})
+	a.CM().AddPersistListener(newPersistSave(p,
+		func() int { return int(a.SessionNo.Load()) }, int(a.SessionNo.Load()), log))
 
 	fileNames := make([]string, 0, len(loaded.Files))
 	for _, f := range loaded.Files {
@@ -205,9 +212,8 @@ func main() {
 			// /reset 重建 cm 后重挂落盘监听，并立即落盘空会话（2026-08-30 修）：
 			// 监听器只在 addMessage 时触发，若不立即写，重启会载入旧快照
 			// （会话号回退 + 旧消息"复活"）。
-			a.CM().AddPersistListener(func(s *types.SessionState, seq int) {
-				_ = p.SaveSession(&persist.Snapshot{No: int(a.SessionNo.Load()), Seq: seq, State: s})
-			})
+			a.CM().AddPersistListener(newPersistSave(p,
+				func() int { return int(a.SessionNo.Load()) }, int(a.SessionNo.Load()), log))
 			_ = p.SaveSession(&persist.Snapshot{No: int(a.SessionNo.Load()), Seq: a.CM().GetSeq(), State: a.CM().Session()})
 			log(fmt.Sprintf("[OkHuman] 会话已重置 #%d，落盘监听已重挂（空会话已落盘）", int(a.SessionNo.Load())))
 		},
@@ -294,6 +300,26 @@ func jsonEqual(a, b interface{}) bool {
 // cfgSaveMu 串行化读改写（2026-09-14 审计修：并发 /config POST 的读-改-写
 // 互相覆盖 → 丢失更新）
 var cfgSaveMu sync.Mutex
+
+// newPersistSave 落盘监听回调（C4，2026-10-18）：会话号在**注册时**快照，写盘前比对。
+//
+// 监听器挂在具体某个 cm 上；/reset 会重建 cm 并重挂监听（见 Hooks.OnSessionRebuilt）。
+// 旧实现写时才读全局 a.SessionNo：万一旧 run 的尾巴事件在 reset 之后才到达，就会把
+// 旧会话的状态按**新会话号**写进 session.json（会话号回退 + 旧消息"复活"）。
+// 现在：出生会话号 ≠ 当前会话号 → 本监听器属于已被取代的会话，丢弃并记一行日志。
+//
+// 前提不变：/reset 持 RunLock（H1）保证正常路径没有在飞 run 越界。本守卫是把
+// "靠调用方守规矩"变成"违反就丢并留证据"——不改事件/回调契约（这种错配概率极低，
+// 改契约要动 emit 与前端，性价比不划算）。
+func newPersistSave(p *persist.Persistence, currentNo func() int, bornNo int, logf func(string)) func(*types.SessionState, int) {
+	return func(s *types.SessionState, seq int) {
+		if cur := currentNo(); cur != bornNo {
+			logf(fmt.Sprintf("[persist] 丢弃迟到的会话写入：监听器属于会话 #%d，当前会话 #%d（seq=%d）", bornNo, cur, seq))
+			return
+		}
+		_ = p.SaveSession(&persist.Snapshot{No: bornNo, Seq: seq, State: s})
+	}
+}
 
 func saveGlobalConfigPatch(root string, patch map[string]interface{}) {
 	cfgSaveMu.Lock()
