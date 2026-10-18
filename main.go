@@ -64,10 +64,11 @@ func main() {
 		fatalf("配置加载失败：%v", err)
 	}
 
-	// 工具超时接线（2026-10-02）：tools.timeout_ms / fg_timeout_ms 灌进 tools 包。
+	// 工具超时接线（2026-10-02）：tools.timeout_sec / fg_timeout_sec 灌进 tools 包。
 	// 执行上限与注入给模型的描述文本同源生成——改配置即改模型看到的数字，
 	// 不再出现"配置可改、描述写死"的不一致。
-	tools.Configure(cfg.Tools.FgTimeoutMS, cfg.Tools.TimeoutMS)
+	// 配置以秒为单位（2026-10-18 单位统一）→ 内部仍按毫秒计时，这里换算一次
+	tools.Configure(cfg.Tools.FgTimeoutSec*1000, cfg.Tools.TimeoutSec*1000)
 
 	// ---------- 可选提示词目录（命令行第一个非 flag 参数） ----------
 	// 指定则覆盖 cfg.system_prompt.dir（解析为绝对路径）；缺省用 config 里的相对目录。
@@ -139,7 +140,7 @@ func main() {
 			}},
 		})
 	} else {
-		client = llm.NewOpenAiClient(llm.ClientConfig{BaseURL: cfg.LLM.BaseURL, Model: cfg.LLM.Model, APIKey: cfg.LLM.APIKey, TimeoutMS: cfg.LLM.TimeoutMS})
+		client = llm.NewOpenAiClient(llm.ClientConfig{BaseURL: cfg.LLM.BaseURL, Model: cfg.LLM.Model, APIKey: cfg.LLM.APIKey, TimeoutMS: cfg.LLM.TimeoutSec * 1000, StreamIdleMS: cfg.LLM.StreamIdleSec * 1000})
 	}
 
 	// 提示词：命令行目录 > config 的 system_prompt.dir（相对项目根）

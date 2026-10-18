@@ -23,7 +23,7 @@ case <-time.After(FgTimeoutMS):        // 超时 → 转后台，不取消
 则截断，全文落盘，正文尾部附一句"完整结果 N 字符在 <路径>，用 bash 的 cat / grep / tail 查看"——
 模型可以自己把全文抓回来，不丢数据。
 
-**超时**（默认 `tools.fg_timeout_ms = 30000`）：
+**超时**（默认 `tools.fg_timeout_sec = 30`）：
 
 - **不取消执行**。命令继续跑，这是整个机制的前提。
 - 立即回填一条 `tool` 消息（保证 `assistant.tool_calls` 与 `tool` 消息严格配对，
@@ -33,11 +33,11 @@ case <-time.After(FgTimeoutMS):        // 超时 → 转后台，不取消
 - 发两个事件：`tool_result`（带 `backgrounded: true`）与 `bg_start`。
 - 把那条 `execDone` 通道作为 `Promise` 交给后台编排器登记。
 
-**硬兜底**：`tools.timeout_ms`（默认 600000）是命令总时长上限，到点杀掉整个命令进程组。
+**硬兜底**：`tools.timeout_sec`（默认 600 秒）是命令总时长上限，到点杀掉整个命令进程组。
 也就是说"转后台"不是无限放任——前台等待不占模型，但命令本身仍有天花板。
 
 > 一个副作用值得知道：转后台的 bash 命令若自己再 `setsid` 起脱离进程，那个进程不受
-> `timeout_ms` 约束，也不在后台任务表里（见 §5 局限）。
+> `timeout_sec` 约束，也不在后台任务表里（见 §5 局限）。
 
 ---
 
@@ -142,14 +142,23 @@ if opt.EndCheck && n > 0 {
 
 | 配置 | 默认 | 作用 |
 |---|---|---|
-| `tools.fg_timeout_ms` | 30000 | 前台等待上限，超时转后台 |
-| `tools.timeout_ms` | 600000 | 命令总时长硬上限，到点杀进程组 |
+| `tools.fg_timeout_sec` | 30 | 前台等待上限（秒），超时转后台 |
+| `tools.timeout_sec` | 600 | 命令总时长硬上限（秒），到点杀进程组 |
 | `tools.result_limit` | 50000 | 回填给模型的字符上限，超出截断+落盘 |
 | `agent.end_check` | true | 轮末校验开关（热加载，下轮运行生效）|
 | `doom.warn_after` | 3 | 连续 N 次完全相同调用 → 注入警告，警告后仍重复 → 强停 |
 | `heartbeat.enabled` | false | 空闲到点自动开启一轮 run（类型必须是布尔，否则 `POST /config` 直接 400）|
 | `heartbeat.interval_min` | 30 | 空闲多少分钟后触发；run 期间不计时，run 结束才重置计时 |
 | `heartbeat.prompt` | — | 到点发给模型的心跳提示词（必须是字符串）|
+| `llm.timeout_sec` | 300 | 非流式请求整体超时（秒）|
+| `llm.stream_idle_sec` | 120 | **主循环**流式空闲超时（秒）：连续这么久没有任何 wire 字节（含 `: ping` 注释帧）→ 本轮报错收尾。此前主循环没有可配口径：空闲超时回落到 `max(timeout, 10 分钟)`，后端卡住就白挂 10 分钟 |
+| `context.stream_idle_sec` | 90 | **压缩流**空闲超时（秒），无 wire 字节 → 重试 |
+
+> **时间类配置一律以秒为单位**（2026-10-18 统一）。旧的 `*_ms` 键仍被接受：启动加载与
+> `POST /config` 都会自动换算（向上取整，500ms → 1s），并在响应/日志里回显换算说明；
+> 同一补丁里新旧键并存时以新键为准。秒键有范围守卫（`timeout_sec ≤ 86400`、
+> `stream_idle_sec ≤ 3600`）——把旧的毫秒数值填进秒键（`timeout_ms=300000` 当秒就是
+> 3.5 天）会被 400 挡下，而不是接受一个荒谬的超时。
 
 热加载分区：`llm`、`context`、`tools`、`doom`、`agent`、`heartbeat`（`POST /config` 改完即时生效，
 `agent` 分区在下一轮运行时生效）。

@@ -28,6 +28,9 @@ type ClientConfig struct {
 	Model     string
 	APIKey    string
 	TimeoutMS int // 整体请求超时（complete 非流式用；流式另有空闲超时）
+	// StreamIdleMS 主循环流式空闲超时（2026-10-18 A5，来自 llm.stream_idle_sec）：
+	// CompleteStream 传 idleMs=0 时用这个值，不再回落到 max(timeout_ms, 10 分钟)。
+	StreamIdleMS int
 }
 
 // OpenAiClient 流式/非流式双方法
@@ -253,16 +256,26 @@ type tcBuilder struct {
 	Args string
 }
 
+// idleFallback idleMs=0（主循环）时的空闲超时口径：
+// 优先 llm.stream_idle_sec（配置，WebUI 可改）；未配/非正 → 旧行为 max(timeout_ms, 10min)。
+func (c *OpenAiClient) idleFallback() time.Duration {
+	if c.cfg.StreamIdleMS > 0 {
+		return time.Duration(c.cfg.StreamIdleMS) * time.Millisecond
+	}
+	return time.Duration(math.Max(float64(c.cfg.TimeoutMS), 600000)) * time.Millisecond
+}
+
 func (c *OpenAiClient) CompleteStream(ctx context.Context, messages []types.Message, tools []types.ToolSpec, onDelta func(types.Delta), idleMs int) (*types.Response, error) {
 	data, err := c.buildBody(messages, tools, true)
 	if err != nil {
 		return nil, err
 	}
-	// 空闲超时：每 wire 块重置。缺省 idleMs=0 → max(timeout_ms, 10 分钟)
-	//（主循环宽松值，慢 prefill 不被误杀）；压缩路径传 stream_idle_ms。
+	// 空闲超时：每 wire 块重置。缺省 idleMs=0 → 取客户端配置的 stream_idle_ms
+	//（主循环口径，2026-10-18 A5；未配则回落 max(timeout_ms, 10 分钟)）；
+	// 压缩路径显式传 context.stream_idle_ms。
 	idleTimeout := time.Duration(idleMs) * time.Millisecond
 	if idleMs == 0 {
-		idleTimeout = time.Duration(math.Max(float64(c.cfg.TimeoutMS), 600000)) * time.Millisecond
+		idleTimeout = c.idleFallback()
 	}
 	// /stop（父 ctx）与空闲超时（idleTimer）两路独立 cancel 源
 	reqCtx, cancel := context.WithCancel(ctx)

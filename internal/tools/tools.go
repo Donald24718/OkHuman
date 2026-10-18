@@ -4,7 +4,7 @@ package tools
 // 抓被截断的 log 全文）都靠 bash 完成。
 //
 // 工具表由配置现生成（2026-10-02：命令总时长上限从硬编码 600s 改为
-// tools.timeout_ms 可配）：同配置 → 逐字同文本 → KV 前缀稳定。改 tools 段
+// tools.timeout_sec 可配）：同配置 → 逐字同文本 → KV 前缀稳定。改 tools 段
 // 会让描述变化，代价是前缀作废一次——这是必要的：描述里的超时数字必须与
 // 实际执行一致，否则模型基于假数字做决策（旧实现正是配置可改、描述写死
 // 30s/600s，两处不一致）。
@@ -32,8 +32,8 @@ const (
 )
 
 var (
-	toolTimeoutMS atomic.Int64            // 命令总时长上限（毫秒）
-	toolFgMS      atomic.Int64            // 前台等待（毫秒）——仅用于生成描述文本
+	toolTimeoutMS atomic.Int64 // 命令总时长上限（毫秒）
+	toolFgMS      atomic.Int64 // 前台等待（毫秒）——仅用于生成描述文本
 	toolsSpec     atomic.Pointer[[]types.ToolSpec]
 )
 
@@ -125,7 +125,7 @@ func toolBash(args map[string]interface{}) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("参数 command 缺失或不是字符串")
 	}
-	// 上限来自配置 tools.timeout_ms（2026-10-02；旧为硬编码 600）
+	// 上限来自配置 tools.timeout_sec（2026-10-02；旧为硬编码 600）
 	limitSec := int(toolTimeoutMS.Load()) / 1000
 	if limitSec < 1 {
 		limitSec = DefaultToolTimeoutMS / 1000
@@ -190,7 +190,7 @@ func toolBash(args map[string]interface{}) (string, error) {
 	if killed.Load() {
 		// 光说"已超时"不够：模型分不清"命令自己失败"与"被上限杀掉"，会误判重试。
 		// 给出上限值与出路（脱离进程组 / 调大配置）。
-		head += fmt.Sprintf("（超过 %d 秒上限被强制终止；要跑更久：用 setsid + 重定向完全脱离进程组，或调大配置 tools.timeout_ms）", timeoutSec)
+		head += fmt.Sprintf("（超过 %d 秒上限被强制终止；要跑更久：用 setsid + 重定向完全脱离进程组，或调大配置 tools.timeout_sec）", timeoutSec)
 	}
 	out := stdout.String()
 	errOut := stderr.String()

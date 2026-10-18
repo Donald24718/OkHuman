@@ -1,9 +1,32 @@
 {
-  "server": { "host": "127.0.0.1", "port": 8451 },
-  "llm": { "base_url": "http://127.0.0.1:8080/v1", "model": "local", "api_key": "", "timeout_ms": 300000 },
-  "system_prompt": { "dir": "prompts" },
-  "context": { "max_tokens": 150000, "keep_recent_chars": 60000 },
-  "tools": { "fg_timeout_ms": 30000, "result_limit": 50000, "timeout_ms": 600000 },
-  "doom": { "warn_after": 3 },
-  "agent": { "end_check": true }
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8451
+  },
+  "llm": {
+    "base_url": "http://127.0.0.1:8080/v1",
+    "model": "local",
+    "api_key": "",
+    "timeout_sec": 300,
+    "stream_idle_sec": 120
+  },
+  "system_prompt": {
+    "dir": "prompts"
+  },
+  "context": {
+    "max_tokens": 150000,
+    "keep_recent_chars": 60000,
+    "stream_idle_sec": 90
+  },
+  "tools": {
+    "result_limit": 50000,
+    "fg_timeout_sec": 30,
+    "timeout_sec": 600
+  },
+  "doom": {
+    "warn_after": 3
+  },
+  "agent": {
+    "end_check": true
+  }
 }

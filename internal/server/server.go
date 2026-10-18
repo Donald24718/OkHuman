@@ -213,7 +213,7 @@ func makeCm(a *AgentState) *ctxmgr.Manager {
 		MaxTokens:       cfg.Context.MaxTokens,
 		KeepRecentChars: cfg.Context.KeepRecentChars,
 		HardTruncChars:  cfg.Context.HardTruncChars,
-		StreamIdleMS:    cfg.Context.StreamIdleMS,
+		StreamIdleMS:    cfg.Context.StreamIdleSec * 1000, // 配置以秒为单位，内部按毫秒计时
 		CharsPerToken:   cfg.Context.CharsPerToken,
 	}, sp, cfg.Data.Dir)
 	m.SetSessionNo(int(a.SessionNo.Load()))
@@ -226,7 +226,8 @@ func makeCm(a *AgentState) *ctxmgr.Manager {
 
 // llmCfgOf config.LLMCfg → llm.ClientConfig
 func llmCfgOf(c config.LLMCfg) llm.ClientConfig {
-	return llm.ClientConfig{BaseURL: c.BaseURL, Model: c.Model, APIKey: c.APIKey, TimeoutMS: c.TimeoutMS}
+	return llm.ClientConfig{BaseURL: c.BaseURL, Model: c.Model, APIKey: c.APIKey,
+		TimeoutMS: c.TimeoutSec * 1000, StreamIdleMS: c.StreamIdleSec * 1000}
 }
 
 func pushCompressLog(a *AgentState, e ctxmgr.CompressEvent) {
@@ -251,7 +252,7 @@ func runOpt(a *AgentState, state *AppState) agent.RunOptions {
 		DataDir:       cfg.Data.Dir,
 		ResultLimit:   cfg.Tools.ResultLimit,
 		DoomWarnAfter: cfg.Doom.WarnAfter,
-		FgTimeoutMS:   cfg.Tools.FgTimeoutMS,
+		FgTimeoutMS:   cfg.Tools.FgTimeoutSec * 1000,
 		// 轮内搭车（2026-09-14 统一）：与 drain（runDrain）共享同一队列、splice 原子取走，
 		// 携带用户追加消息 + 已 settle 后台任务的通知（同一队列、同一逻辑）。
 		// 安全：本回调只在 lock.Run 内被调用（runLoop 持锁），drain 的下一轮
@@ -645,12 +646,12 @@ func applyConfigPatch(a *AgentState, patch map[string]interface{}) PatchResult {
 			MaxTokens:       nc.Context.MaxTokens,
 			KeepRecentChars: nc.Context.KeepRecentChars,
 			HardTruncChars:  nc.Context.HardTruncChars,
-			StreamIdleMS:    nc.Context.StreamIdleMS,
+			StreamIdleMS:    nc.Context.StreamIdleSec * 1000,
 			CharsPerToken:   nc.Context.CharsPerToken,
 		})
 	}
 	if has("tools") { // 工具超时热更新（2026-10-02）：重建工具表 + 新上限，下条命令生效
-		tools.Configure(nc.Tools.FgTimeoutMS, nc.Tools.TimeoutMS)
+		tools.Configure(nc.Tools.FgTimeoutSec*1000, nc.Tools.TimeoutSec*1000)
 	}
 	// 自我生命感知输入随配置热更新（llm base_url / server 段变化）
 	a.CM().SetSelfInfo(ctxmgr.SelfInfo{Port: nc.Server.Port, DataDir: nc.Data.Dir, LLMBaseURL: nc.LLM.BaseURL})
@@ -1346,7 +1347,7 @@ func (ap *App) handleAttachments(w http.ResponseWriter, r *http.Request) {
 // ---------- 手动压缩 / 手动剥离附件（2026-10-18，取代旧"LLM 4xx 三级回退"）----
 //
 // 旧阶梯靠硬编码 400/413/415 猜"请求体被拒"，是按 llama.cpp 行为定的，换后端
-// 就不成立（别的推理后端同一件事可能报别的码）。现在机器不猜，两个动作都由人按按钮。
+// 就不成立（strata 同一件事可能报别的码）。现在机器不猜，两个动作都由人按按钮。
 
 // handleCompressNow 手动压缩上下文：不等 token 阈值，按常规分批口径立刻压最旧一批。
 // run 进行中拒绝（409）——压缩会换掉会话结构（旧消息出列 + summary 替换），与在飞
@@ -1361,7 +1362,7 @@ func (ap *App) handleCompressNow(w http.ResponseWriter, r *http.Request) {
 	// 压缩期间持 RunLock（running=true）：防新 run 与压缩并发改会话结构（上面的 409
 	// 只挡住"已开跑"的 run，不挡这一句之后挤进来的新 run）。
 	// 事件广播到 /events：前端聊天区出现与自动压缩一样的"压缩中"流式活卡 + 最终压缩卡
-	// （此前手动压缩没人订阅压缩事件，点按钮后界面全程无输出）。
+	// （2026-10-18 修：此前手动压缩没人订阅压缩事件，点按钮后界面全程无输出）。
 	// 注：手动压缩不造 run_start/run_end 帧（不占轮次缓冲）→ 压缩途中刷新页面看不到
 	// 已流出的部分，压完的卡片由 /status 的 compress 日志与 /history 兜住。
 	var detail string
@@ -1584,20 +1585,21 @@ func (ap *App) handleConfigGet(w http.ResponseWriter, r *http.Request) {
 }
 
 // numChecks 数值段基础校验（与 TS 表一致）
+// 时间类配置统一以**秒**为单位（2026-10-18；旧 *_ms 键在 POST /config 入口自动
+// 换算，见 config.NormalizeTimeUnits）。上限是防"把毫秒数值填进秒键"——旧
+// timeout_ms=300000 若被当成秒就是 3.5 天，必须挡在门外。
 var numChecks = map[string]func(interface{}) bool{
 	"port":              func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 && n < 65536 },
-	"timeout_ms":        func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 },
-	"tick_ms":           func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 },
-	"catchup_max":       func(v interface{}) bool { n, ok := v.(float64); return ok && n >= 0 },
+	"timeout_sec":       func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 && n <= 86400 }, // ≤24h（秒）
 	"keep_recent_chars": func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 },
 	"hard_trunc_chars":  func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 },
-	"stream_idle_ms":    func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 },
+	"stream_idle_sec":   func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 && n <= 3600 }, // ≤1h（秒）
 	"max_tokens":        func(v interface{}) bool { n, ok := v.(float64); return ok && n > 100 },
 	// chars_per_token：0/负数 → 估算 Infinity/恒超阈（每条消息白压一次）；过大 →
 	// 严重低估 → 永不压缩 → 撑爆模型上下文。英文 ~4 字符/token，20 已极宽松。
 	"chars_per_token": func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 && n <= 20 },
 	"result_limit":    func(v interface{}) bool { n, ok := v.(float64); return ok && n > 1000 },
-	"fg_timeout_ms":   func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 },
+	"fg_timeout_sec":  func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 && n <= 86400 }, // ≤24h（秒）
 	"warn_after":      func(v interface{}) bool { n, ok := v.(float64); return ok && n >= 2 },
 	// interval_min：0/负 → 每 30s 巡检都会触发（等于把 agent 变成自循环）；上限
 	// 1440 分钟（24h）防手滑写成天级。
@@ -1638,6 +1640,9 @@ func (ap *App) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 旧 *_ms 键 → 新 *_sec 键（向上取整）：旧 webui / 旧脚本发旧键不会静默落回默认值。
+	// 换算发生在校验与落盘之前 → 落盘的永远是新键。
+	unitNotes := config.NormalizeTimeUnits(patch)
 	// 数值段基础校验
 	for section, secVal := range patch {
 		sec, ok := secVal.(map[string]interface{})
@@ -1683,7 +1688,7 @@ func (ap *App) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 	if ap.hooks != nil && ap.hooks.OnConfigSaved != nil {
 		ap.hooks.OnConfigSaved(patch)
 	}
-	writeJSON(w, 200, map[string]interface{}{"ok": true, "scope": "global", "applied": rl.Applied, "restart": rl.Restart})
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "scope": "global", "applied": rl.Applied, "restart": rl.Restart, "unit_notes": unitNotes})
 }
 
 // ---------- WebUI 静态页面（2026-08-29） ----------

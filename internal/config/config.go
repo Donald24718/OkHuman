@@ -6,6 +6,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 )
@@ -28,10 +29,16 @@ type ServerCfg struct {
 }
 
 type LLMCfg struct {
-	BaseURL   string `json:"base_url"`
-	Model     string `json:"model"`
-	APIKey    string `json:"api_key"`
-	TimeoutMS int    `json:"timeout_ms"`
+	BaseURL string `json:"base_url"`
+	Model   string `json:"model"`
+	APIKey  string `json:"api_key"`
+	// TimeoutSec 非流式 complete 的整体请求超时（秒）。
+	TimeoutSec int `json:"timeout_sec"`
+	// StreamIdleSec 主循环流式空闲超时（秒，2026-10-18 A5）：连续这么久没有任何
+	// wire 字节（含 ": ping" 注释帧）→ 判空闲超时、本轮报错收尾。此前主循环
+	// 没有可配口径：agent 传 idleMs=0，客户端回落到 max(timeout_ms, 10 分钟)，
+	// 后端卡住就白挂 10 分钟，且与压缩路径的 context.stream_idle_sec 口径不一致。
+	StreamIdleSec int `json:"stream_idle_sec"`
 }
 
 type SystemPromptCfg struct {
@@ -46,16 +53,16 @@ type ContextCfg struct {
 	MaxTokens       int     `json:"max_tokens"`
 	KeepRecentChars int     `json:"keep_recent_chars"`
 	HardTruncChars  int     `json:"hard_trunc_chars"`
-	StreamIdleMS    int     `json:"stream_idle_ms"`
+	StreamIdleSec   int     `json:"stream_idle_sec"` // 压缩流空闲超时（秒）
 	CharsPerToken   float64 `json:"chars_per_token"`
 }
 
 type ToolsCfg struct {
-	FgTimeoutMS int `json:"fg_timeout_ms"`
-	ResultLimit int `json:"result_limit"`
-	// TimeoutMS 命令总时长上限（毫秒）：超时 SIGKILL 整个命令进程组。
+	FgTimeoutSec int `json:"fg_timeout_sec"` // 前台执行超时（秒，超时转后台）
+	ResultLimit  int `json:"result_limit"`
+	// TimeoutSec 命令总时长上限（秒）：超时 SIGKILL 整个命令进程组。
 	// 转后台不重置此计时器——后台任务同样受约束（长驻服务须 setsid 脱离）。
-	TimeoutMS int `json:"timeout_ms"`
+	TimeoutSec int `json:"timeout_sec"`
 }
 
 type DoomCfg struct {
@@ -80,7 +87,6 @@ type HeartbeatCfg struct {
 // 操作、禁止主动对外联系（空闲时最容易出越权动作）。
 const DefaultHeartbeatPrompt = "（心跳：系统检测到你已空闲——最后一次 run 结束至今没有新的 run，现在由系统主动开启一轮。这不是主人发的消息，不构成新任务授权。请自查：挂起的后台任务是否出了结果、之前接下的活是否收尾、有没有明显该推进的下一步、有没有需要验证的结果。有就继续做；没有就一句话说明当前状态然后停下。不要为了找事做而执行无关操作，不要重复已完成的事，不要主动对外联系任何人。）"
 
-
 // Default 出厂默认（2026-09-14 易迁移：data 目录默认 $HOME/.okhuman；
 // 部署可用 config/default.json 或 OKHUMAN_DATA_DIR 环境变量覆盖）
 func Default() *Config {
@@ -90,11 +96,11 @@ func Default() *Config {
 	}
 	return &Config{
 		Server:       ServerCfg{Host: "127.0.0.1", Port: 8451},
-		LLM:          LLMCfg{BaseURL: "http://127.0.0.1:8080/v1", Model: "local", TimeoutMS: 300000},
+		LLM:          LLMCfg{BaseURL: "http://127.0.0.1:8080/v1", Model: "local", TimeoutSec: 300, StreamIdleSec: 120},
 		SystemPrompt: SystemPromptCfg{Dir: "prompts"},
 		Data:         DataCfg{Dir: filepath.Join(home, ".okhuman")},
-		Context:      ContextCfg{MaxTokens: 150000, KeepRecentChars: 60000, HardTruncChars: 150000, StreamIdleMS: 90000, CharsPerToken: 1.5},
-		Tools:        ToolsCfg{FgTimeoutMS: 30000, ResultLimit: 10000, TimeoutMS: 600000},
+		Context:      ContextCfg{MaxTokens: 150000, KeepRecentChars: 60000, HardTruncChars: 150000, StreamIdleSec: 90, CharsPerToken: 1.5},
+		Tools:        ToolsCfg{FgTimeoutSec: 30, ResultLimit: 10000, TimeoutSec: 600},
 		Doom:         DoomCfg{WarnAfter: 3},
 		Heartbeat:    HeartbeatCfg{Enabled: false, IntervalMin: 30, Prompt: DefaultHeartbeatPrompt},
 	}
@@ -113,6 +119,9 @@ func Load(root string) (*Config, error) {
 		var patch map[string]interface{}
 		if err := json.Unmarshal(data, &patch); err != nil {
 			return nil, fmt.Errorf("配置 %s 解析失败：%v", f, err)
+		}
+		for _, n := range NormalizeTimeUnits(patch) {
+			fmt.Fprintf(os.Stderr, "[config] 单位迁移：%s\n", n)
 		}
 		cfg = deepMergeConfig(cfg, patch)
 	}
@@ -135,6 +144,51 @@ func Load(root string) (*Config, error) {
 	return cfg, nil
 }
 
+// msToSec 旧毫秒键 → 新秒键（2026-10-18：配置里所有毫秒单位统一改秒）。
+// 段 → { 旧键: 新键 }。
+var msToSec = map[string]map[string]string{
+	"llm":     {"timeout_ms": "timeout_sec", "stream_idle_ms": "stream_idle_sec"},
+	"context": {"stream_idle_ms": "stream_idle_sec"},
+	"tools":   {"fg_timeout_ms": "fg_timeout_sec", "timeout_ms": "timeout_sec"},
+}
+
+// NormalizeTimeUnits 把补丁 map 里的旧 *_ms 键换算成对应 *_sec 键（向上取整，
+// 0.5s 不会被抹成 0），并剔除旧键；返回人类可读的换算说明（调用方打日志/回给前端）。
+// 两条路都要过：Load 读 config/*.json（旧文件不改也能跑），以及 POST /config 热更新
+// （旧 webui/旧脚本发旧键不会静默落回默认值——这是单位切换最大的坑：
+// 旧 timeout_ms=300000 若被当成秒就是 3.5 天）。
+// 新旧键同时出现时以新键为准，旧键丢弃并说明。
+func NormalizeTimeUnits(patch map[string]interface{}) []string {
+	var notes []string
+	for section, keys := range msToSec {
+		sec, ok := patch[section].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		for oldK, newK := range keys {
+			v, ok := sec[oldK]
+			if !ok {
+				continue
+			}
+			f, ok2 := v.(float64)
+			if !ok2 {
+				notes = append(notes, fmt.Sprintf("%s.%s 已废弃且不是数值 → 忽略", section, oldK))
+				delete(sec, oldK)
+				continue
+			}
+			converted := int(math.Ceil(f / 1000))
+			if _, has := sec[newK]; has {
+				notes = append(notes, fmt.Sprintf("%s.%s 已废弃 → 忽略（同补丁里已有 %s.%s）", section, oldK, section, newK))
+			} else {
+				sec[newK] = float64(converted)
+				notes = append(notes, fmt.Sprintf("%s.%s=%v（毫秒）→ %s.%s=%d（秒）", section, oldK, f, section, newK, converted))
+			}
+			delete(sec, oldK)
+		}
+	}
+	return notes
+}
+
 func parseInt(s string) (int, error) {
 	var n int
 	_, err := fmt.Sscanf(s, "%d", &n)
@@ -144,6 +198,7 @@ func parseInt(s string) (int, error) {
 // DeepMerge 把 patch 深合并进 cfg（热更新 / 补丁落盘共用）。
 // 返回新 Config（不修改原对象）；patch 非对象值直接覆盖。
 func DeepMerge(cfg *Config, patch map[string]interface{}) *Config {
+	NormalizeTimeUnits(patch)
 	merged := cfgToMap(cfg)
 	mergeMap(merged, patch)
 	out := Default()
@@ -153,6 +208,7 @@ func DeepMerge(cfg *Config, patch map[string]interface{}) *Config {
 
 // ApplyPatchInPlace 热更新用：patch 深合并进 cfg 自身（单实例全局活对象语义）
 func ApplyPatchInPlace(cfg *Config, patch map[string]interface{}) {
+	NormalizeTimeUnits(patch)
 	merged := cfgToMap(cfg)
 	mergeMap(merged, patch)
 	applyMap(cfg, merged)
