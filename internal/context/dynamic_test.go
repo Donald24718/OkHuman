@@ -29,7 +29,10 @@ func TestPortToPID(t *testing.T) {
 
 // TestParseHostPort base_url 解析
 func TestParseHostPort(t *testing.T) {
-	cases := []struct{ in, wantHost string; wantPort int }{
+	cases := []struct {
+		in, wantHost string
+		wantPort     int
+	}{
 		{"http://127.0.0.1:8080/v1", "127.0.0.1:8080", 8080},
 		{"http://localhost:9000", "localhost:9000", 9000},
 		{"", "", 0},
@@ -41,7 +44,6 @@ func TestParseHostPort(t *testing.T) {
 		}
 	}
 }
-
 
 // TestComposeLocked 动态注入：系统首自我块 + 每条消息尾时间戳
 func TestComposeLocked(t *testing.T) {
@@ -55,7 +57,7 @@ func TestComposeLocked(t *testing.T) {
 		exeDir = filepath.Dir(strings.TrimSuffix(exe, " (deleted)"))
 	}
 	m.AddMessage(&types.RawEntry{Role: "user", Content: "你好"})
-	msgs := m.Compose(nil)
+	msgs := m.Compose()
 	sys, _ := msgs[0].Content.(string)
 	if !strings.HasPrefix(sys, "[你的生命]") {
 		t.Fatalf("system 未以自我块开头: %s", sys[:min(40, len(sys))])

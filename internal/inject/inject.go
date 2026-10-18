@@ -108,16 +108,17 @@ func (r *Resolver) ClearCache(id string) {
 	}
 }
 
-// PersistDemotion 4xx 降级成功回写（2026-09-19）：侧车内容替换为文本提示。
-// 降级本是请求级（Compose 变体，不动侧车）——对“持久坏附件”（内容损坏的图片，
-// 每次 LLM 调用必 400），下轮请求原样恢复坏 part，每轮都先 4xx 再降级。
-// 回写后后续 Resolve 拿到提示，根治。返回侧车是否存在并被改写。
-func PersistDemotion(dir, id string) bool {
+// StripSidecar 把侧车内容永久替换成文本提示（2026-10-18；旧名 PersistDemotion，
+// 那时由"LLM 4xx 自动降级"触发，现只由 WebUI「剥离全部注入附件」/ POST
+// /strip-injects 显式触发）。此后 Resolve 拿到的是提示，原附件内容不再进请求。
+// 提示文本确定性（无时间戳无随机数）→ 同一 id 每次解析逐字一致 → KV 前缀稳定。
+// 返回侧车是否存在并被改写。
+func StripSidecar(dir, id string) bool {
 	p := filepath.Join(dir, id+".json")
 	if _, err := os.Stat(p); err != nil {
 		return false
 	}
-	stub := []types.ContentPart{types.TextPart(fmt.Sprintf("附件 %s 因 LLM 4xx 降级为文本提示，原附件未发送", id))}
+	stub := []types.ContentPart{types.TextPart(fmt.Sprintf("附件 %s 已按用户手动指令剥离，原附件内容不再发送", id))}
 	b, err := json.Marshal(stub)
 	if err != nil {
 		return false

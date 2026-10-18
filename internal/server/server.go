@@ -156,9 +156,9 @@ type AppState struct {
 	// LastRunEnd 最近一次 run 结束的时刻（Unix 毫秒）——空闲心跳的计时基准
 	// （2026-10-17）。口径由用户定：**只有 run 结束才重置**，正在 run 期间不计时。
 	// 用 atomic 而非 state.mu：心跳只读它，避免与 RunLock→state.mu 锁序纠缠。
-	LastRunEnd    atomic.Int64
-	InjectSeq     int
-	Injects       []InjectInfo
+	LastRunEnd atomic.Int64
+	InjectSeq  int
+	Injects    []InjectInfo
 }
 
 // NewAppState AppState 工厂（2026-08-31）：统一初始化事件广播集 + 消息队列 + 活动 drain + 轮次缓冲。
@@ -195,7 +195,7 @@ func CreateAgentState(cfg *config.Config, client llm.LlmClient, systemPrompt str
 	a.CfgRef.Store(cfg)
 	a.SessionNo.Store(1)
 	cm := makeCm(a)
-	a.rt.Store(&agentRuntime{CM: cm, Agent: agent.New(client, systemPrompt, cm, filepath.Join(a.Cfg().Data.Dir, "inject")), BG: background.NewOrchestrator()})
+	a.rt.Store(&agentRuntime{CM: cm, Agent: agent.New(client, systemPrompt, cm), BG: background.NewOrchestrator()})
 	return a
 }
 
@@ -622,6 +622,9 @@ func applyConfigPatch(a *AgentState, patch map[string]interface{}) PatchResult {
 	if has("doom") {
 		applied = append(applied, "doom（死循环告警阈值，下轮运行生效）")
 	}
+	if has("heartbeat") {
+		applied = append(applied, "heartbeat（开关/间隔/提示词，下一个巡检 tick ≤30s 内生效）")
+	}
 
 	// COW 热更新（2026-09-14 审计修：旧实现 ApplyPatchInPlace 原地改共享
 	// *Config——runOpt / 只读端点的并发读与写入数据竞争，字符串字段撕裂读可
@@ -796,10 +799,14 @@ func (ap *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ap.handleEvents(w, r)
 	case r.Method == http.MethodPost && path == "/inject":
 		ap.handleInject(w, r)
+	case r.Method == http.MethodPost && path == "/strip-injects":
+		ap.handleStripInjects(w, r)
 	case r.Method == http.MethodPost && path == "/drop":
 		ap.handleDrop(w, r)
 	case r.Method == http.MethodGet && path == "/attachments":
 		ap.handleAttachments(w, r)
+	case r.Method == http.MethodPost && path == "/compress":
+		ap.handleCompressNow(w, r)
 	case r.Method == http.MethodPost && path == "/reset":
 		ap.handleReset(w, r)
 	case r.Method == http.MethodPost && path == "/stop":
@@ -914,8 +921,8 @@ func (ap *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 	a.promptMu.Unlock()
 
 	writeJSON(w, 200, map[string]interface{}{
-		"session": int(a.SessionNo.Load()),
-		"running": running,
+		"session":   int(a.SessionNo.Load()),
+		"running":   running,
 		"heartbeat": heartbeatStatus(cfg.Heartbeat, ap.state.LastRunEnd.Load(), running),
 		"system_prompt": map[string]interface{}{
 			"fallback": fallback,
@@ -1336,6 +1343,58 @@ func (ap *App) handleAttachments(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{"injects": injects})
 }
 
+// ---------- 手动压缩 / 手动剥离附件（2026-10-18，取代旧"LLM 4xx 三级回退"）----
+//
+// 旧阶梯靠硬编码 400/413/415 猜"请求体被拒"，是按 llama.cpp 行为定的，换后端
+// 就不成立（别的推理后端同一件事可能报别的码）。现在机器不猜，两个动作都由人按按钮。
+
+// handleCompressNow 手动压缩上下文：不等 token 阈值，按常规分批口径立刻压最旧一批。
+// run 进行中拒绝（409）——压缩会换掉会话结构（旧消息出列 + summary 替换），与在飞
+// run 交错只会让下一轮看到意外的上下文。本请求会阻塞到压缩 LLM 调用结束（可能几十
+// 秒到几分钟）；进度经 SSE 的 compress_delta 实时可见。
+func (ap *App) handleCompressNow(w http.ResponseWriter, r *http.Request) {
+	a := ap.state.Agent
+	if a.Lock.Running() {
+		writeJSON(w, 409, map[string]interface{}{"error": "run 进行中：等本轮结束再手动压缩"})
+		return
+	}
+	detail, did := a.CM().CompressNow()
+	// detail 里带两个落盘路径（全文存档 / 总结文本），UI 直接显示
+	writeJSON(w, 200, map[string]interface{}{"ok": did, "did": did, "detail": detail})
+}
+
+// handleStripInjects 手动剥离全部外部注入附件：逐个把侧车永久回写成文本提示 +
+// 清解析器缓存 → 后续 compose 不再发原附件内容（永久，不是本轮请求级）。
+// run 进行中**允许**：坏附件卡住 run 时这正是自救路径，且它只改"引用解析出什么"，
+// 不动会话结构（不增删消息 → 无索引漂移）。
+func (ap *App) handleStripInjects(w http.ResponseWriter, r *http.Request) {
+	a := ap.state.Agent
+	dir := filepath.Join(a.Cfg().Data.Dir, "inject")
+	files, _ := filepath.Glob(filepath.Join(dir, "inj-*.json"))
+	stripped := make([]string, 0, len(files))
+	for _, f := range files {
+		id := strings.TrimSuffix(filepath.Base(f), ".json")
+		if !injIDRe.MatchString(id) {
+			continue
+		}
+		if inject.StripSidecar(dir, id) {
+			stripped = append(stripped, id)
+		}
+		ctxmgr.ClearResolverCacheEntry(id)
+	}
+	// 侧车字节变了，附件列表同步（否则侧栏显示的还是原图大小）
+	ap.state.mu.Lock()
+	for i := range ap.state.Injects {
+		if ap.state.Injects[i].Bytes > 0 {
+			ap.state.Injects[i].Bytes = inject.InjectFileSize(dir, ap.state.Injects[i].ID)
+		}
+	}
+	n := len(ap.state.Injects)
+	ap.state.mu.Unlock()
+	fmt.Printf("[inject] 手动剥离附件 %d 个（会话登记 %d 个）→ 侧车回写文本提示，后续调用不再发原内容\n", len(stripped), n)
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "stripped": stripped, "count": len(stripped)})
+}
+
 // ---------- /reset：新会话 ----------
 
 func (ap *App) handleReset(w http.ResponseWriter, r *http.Request) {
@@ -1346,7 +1405,11 @@ func (ap *App) handleReset(w http.ResponseWriter, r *http.Request) {
 	// LLM 流（partial 保留、本轮立即收尾），重建整体包进 Lock.Run——与在飞 run
 	// 互斥，等当前轮完全结束后才原子换运行时（在飞的是长工具时最长等其结束）。
 	a.Agent().Stop()
+	recordPath, recordedMsgs := "", 0
 	a.Lock.Run(func() error {
+		// 重置前先把旧会话全文落盘（2026-10-18 用户定）：下面整体换掉 Manager，
+		// 旧会话原文除压缩存档外就无处可寻了。放在换入之前 → 文件名带的还是旧会话号。
+		recordPath, recordedMsgs = a.CM().DumpSessionRecord("重置会话")
 		a.SessionNo.Add(1)
 		ap.state.mu.Lock()
 		ap.state.MessageQueue = nil // 未发消息随会话清除（2026-08-31）
@@ -1374,13 +1437,21 @@ func (ap *App) handleReset(w http.ResponseWriter, r *http.Request) {
 		sp := a.SystemPrompt
 		a.promptMu.Unlock()
 		newCM := makeCm(a)
-		a.rt.Store(&agentRuntime{CM: newCM, Agent: agent.New(client, sp, newCM, filepath.Join(a.Cfg().Data.Dir, "inject")), BG: background.NewOrchestrator()})
+		a.rt.Store(&agentRuntime{CM: newCM, Agent: agent.New(client, sp, newCM), BG: background.NewOrchestrator()})
 		if ap.hooks != nil && ap.hooks.OnSessionRebuilt != nil {
 			ap.hooks.OnSessionRebuilt(a)
 		}
 		return nil
 	})
-	writeJSON(w, 200, map[string]interface{}{"ok": true, "session": int(a.SessionNo.Load())})
+	if recordPath != "" {
+		fmt.Printf("[reset] 旧会话全文已落盘：%s（%d 条消息）\n", recordPath, recordedMsgs)
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"ok":          true,
+		"session":     int(a.SessionNo.Load()),
+		"record":      recordPath, // 旧会话全文文件（空会话为 ""）
+		"record_msgs": recordedMsgs,
+	})
 }
 
 // ---------- /stop：中断当前 LLM 输出（2026-08-29） ----------
@@ -1520,6 +1591,19 @@ var numChecks = map[string]func(interface{}) bool{
 	"interval_min": func(v interface{}) bool { n, ok := v.(float64); return ok && n >= 1 && n <= 1440 },
 }
 
+// typeChecks 布尔/字符串键的类型校验（2026-10-18）：applyMap 走 json.Unmarshal，
+// 类型不符的键会被**静默跳过**、落回 Default() 的值——enabled 写成 "yes" 等于
+// 把心跳悄悄关掉（Default 是 false），prompt 写成数字等于把自定义提示词换回出厂词。
+// 这类补丁现在多由 agent 自己 curl 发出，手滑概率远高于人填表单，必须 400 明说，
+// 不能"接受但改错"。
+var typeChecks = map[string]struct {
+	chk  func(interface{}) bool
+	want string
+}{
+	"enabled": {func(v interface{}) bool { _, ok := v.(bool); return ok }, "布尔 true/false"},
+	"prompt":  {func(v interface{}) bool { _, ok := v.(string); return ok }, "字符串"},
+}
+
 func (ap *App) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 	b := tryReadJSON(r)
 	var patch map[string]interface{}
@@ -1549,6 +1633,11 @@ func (ap *App) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for k, v := range sec {
+			if tc, ok := typeChecks[k]; ok && !tc.chk(v) {
+				vb, _ := json.Marshal(v)
+				writeJSON(w, 400, map[string]interface{}{"error": fmt.Sprintf("%s.%s 类型非法：%s（需 %s）", section, k, string(vb), tc.want)})
+				return
+			}
 			if chk, ok := numChecks[k]; ok && !chk(v) {
 				vb, _ := json.Marshal(v)
 				writeJSON(w, 400, map[string]interface{}{"error": fmt.Sprintf("%s.%s 数值非法：%s", section, k, string(vb))})

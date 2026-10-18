@@ -8,10 +8,10 @@ package context
 // 上下文注入（2026-09-11）：/inject 的 base64 parts 存侧车文件，会话只存
 // 轻量 inject_ref。本模块是唯一的"引用→真实 parts"解析点：LLM 永远看不到
 // 引用，只见真实附件；侧车写入后不可变 → 解析确定性 → KV 前缀逐 token 稳定。
-// demote 回退（2026-09-13）：LLM 4xx（上下文超长 413/415 或 base64 图撑爆
-// 请求 400）→ 注入附件降级为文本存根再试：
-//   - newest：只降最近一条带注入的消息（更早的图保真 → KV 前缀尽量不动）
-//   - all：全部降级
+// 附件降级（2026-09-13 的"4xx 请求级降级"）已于 2026-10-18 随三级回退阶梯一并
+// 删除：触发条件写死 400/413/415 是按 llama.cpp 行为定的，换后端不成立。
+// 现在附件的剥离只有显式路径：WebUI「剥离全部注入附件」→ POST /strip-injects
+// → inject.PersistDemotion 永久回写侧车（见 server.handleStripInjects）。
 
 import (
 	"fmt"
@@ -36,21 +36,17 @@ var resolveInject atomic.Pointer[inject.Resolver]
 // ConfigureInjectResolver 启动/重置时设置全局侧车解析器
 func ConfigureInjectResolver(r *inject.Resolver) { resolveInject.Store(r) }
 
-// ClearResolverCacheEntry 清全局解析器的指定 id 缓存（侧车被改写后调用，如 4xx
-// 降级回写；2026-09-19）——否则解析器内存缓存继续返回旧（坏）parts。
+// ClearResolverCacheEntry 清全局解析器的指定 id 缓存——侧车文件被改写后必须调
+// （/strip-injects 手动剥离、/drop 删侧车），否则解析器内存缓存继续返回旧 parts，
+// "已剥离/已删"的附件下一轮照样发出去。
 func ClearResolverCacheEntry(id string) {
 	if r := resolveInject.Load(); r != nil {
 		r.ClearCache(id)
 	}
 }
 
-// ComposeOptions demote 模式（""=正常 / "newest"=只降最近注入 / "all"=全降）
-type ComposeOptions struct {
-	DemoteInjects string
-}
-
 // ComposeMessages 会话状态 → LLM 请求（纯函数）
-func ComposeMessages(session *types.SessionState, systemPrompt string, opts *ComposeOptions) []types.Message {
+func ComposeMessages(session *types.SessionState, systemPrompt string) []types.Message {
 	// 孤儿 tool 判定：tool_call_id 不在任何 assistant.tool_calls 里
 	callIds := map[string]bool{}
 	for i := range session.Messages {
@@ -58,20 +54,11 @@ func ComposeMessages(session *types.SessionState, systemPrompt string, opts *Com
 			callIds[tc.ID] = true
 		}
 	}
-	newestInjectIdx := -1
-	if opts != nil && opts.DemoteInjects == "newest" {
-		for i := len(session.Messages) - 1; i >= 0; i-- {
-			if session.Messages[i].HasInjectRef() {
-				newestInjectIdx = i
-				break
-			}
-		}
-	}
 	out := []types.Message{{Role: "system", Content: systemPrompt}}
 	if session.Summary != nil {
 		out = append(out, types.Message{Role: "user", Content: SummaryMarker + "\n" + session.Summary.Content})
 	}
-	for i, e := range session.Messages {
+	for _, e := range session.Messages {
 		if e.Role == "tool" {
 			tcid := ""
 			if e.ToolCallID != nil {
@@ -88,11 +75,9 @@ func ComposeMessages(session *types.SessionState, systemPrompt string, opts *Com
 				out = append(out, types.Message{Role: "user", Content: fmt.Sprintf("%s %s]\n%s", ToolResultMarker, label, types.AsString(e.Content))})
 			}
 		} else {
-			demote := (opts != nil && opts.DemoteInjects == "all") ||
-				(opts != nil && opts.DemoteInjects == "newest" && i == newestInjectIdx)
 			m := types.Message{Role: e.Role, Content: e.Content}
 			if parts := types.AsParts(e.Content); parts != nil {
-				m.Content = resolveContentParts(parts, demote)
+				m.Content = resolveContentParts(parts)
 			}
 			if e.Role == "assistant" && len(e.ToolCalls) > 0 {
 				m.ToolCalls = e.ToolCalls
@@ -106,9 +91,9 @@ func ComposeMessages(session *types.SessionState, systemPrompt string, opts *Com
 	return out
 }
 
-// resolveContentParts 把 content parts 里的 inject_ref 解析成真实 parts（带缓存）；
-// demote 时注入引用降级为文本存根
-func resolveContentParts(parts []types.ContentPart, demote bool) []types.ContentPart {
+// resolveContentParts 把 content parts 里的 inject_ref 解析成真实 parts（带缓存）。
+// 侧车已被剥离（/strip-injects）→ 解析出来就是文本提示；侧车丢失 → 丢失存根。
+func resolveContentParts(parts []types.ContentPart) []types.ContentPart {
 	out := []types.ContentPart{}
 	for _, p := range parts {
 		if p.Type == "inject_ref" {
@@ -116,9 +101,7 @@ func resolveContentParts(parts []types.ContentPart, demote bool) []types.Content
 			if r := resolveInject.Load(); r != nil {
 				resolved = r.Resolve(p.Ref)
 			}
-			if demote && resolved != nil {
-				out = append(out, types.TextPart(fmt.Sprintf("（附件 %s 本轮未发送，仅以文本提示保留）", p.Ref)))
-			} else if resolved != nil {
+			if resolved != nil {
 				out = append(out, resolved...)
 			} else {
 				out = append(out, types.TextPart(fmt.Sprintf("（附件 %s 已清理或丢失）", p.Ref)))
@@ -129,7 +112,6 @@ func resolveContentParts(parts []types.ContentPart, demote bool) []types.Content
 	}
 	return out
 }
-
 
 // utf16Len 字符数（UTF-16 code units，对齐 TS text.length 口径——所有预算/
 // 统计统一用它，中文 BMP 字符各计 1、代理对计 2）

@@ -148,3 +148,39 @@ func TestSummaryFilePairing(t *testing.T) {
 		t.Fatalf("总结文件头缺配对存档指引：%s", body)
 	}
 }
+
+// TestDumpSessionRecord（2026-10-18）：重置会话前的全文落盘。
+// 重置会整体换掉 Manager，旧会话原文除压缩存档外无处可寻 → DumpSessionRecord
+// 必须写出与压缩存档同口径的文件，并在文件头标明触发场景。
+func TestDumpSessionRecord(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(llm.NewFakeLLM(nil), Cfg{
+		MaxTokens: 1000000, KeepRecentChars: 60000, HardTruncChars: 50000,
+		StreamIdleMS: 30000, CharsPerToken: 2,
+	}, "系统提示词ABC", dir)
+	if p, n := m.DumpSessionRecord("重置会话"); p != "" || n != 0 {
+		t.Fatalf("空会话不该落盘：%s n=%d", p, n)
+	}
+	m.AddMessage(&types.RawEntry{Role: "user", Content: "待留下的原文甲"})
+	m.AddMessage(&types.RawEntry{Role: "assistant", Content: "待留下的原文乙"})
+	path, n := m.DumpSessionRecord("重置会话")
+	if n != 2 {
+		t.Fatalf("消息条数 = %d，期望 2", n)
+	}
+	if !strings.HasPrefix(path, filepath.Join(dir, "session-records")) {
+		t.Fatalf("落盘位置不对：%s", path)
+	}
+	if !strings.Contains(filepath.Base(path), "ctx-") {
+		t.Errorf("文件名应与压缩存档同口径（ctx- 前缀）：%s", path)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读全文存档失败: %v", err)
+	}
+	got := string(b)
+	for _, want := range []string{"触发=重置会话", "待留下的原文甲", "待留下的原文乙", "系统提示词ABC"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("全文存档缺 %q", want)
+		}
+	}
+}

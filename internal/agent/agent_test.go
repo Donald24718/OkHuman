@@ -20,7 +20,7 @@ func newTestAgent(steps []llm.FakeStep) (*Agent, *llm.FakeLLM) {
 		MaxTokens: 1000000, KeepRecentChars: 60000, HardTruncChars: 50000,
 		StreamIdleMS: 30000, CharsPerToken: 2,
 	}, "系统提示", t0TempDir())
-	return New(fake, "系统提示", cm, ""), fake // injectDir=""：既有测试不触注入回写
+	return New(fake, "系统提示", cm), fake
 }
 
 func t0TempDir() string { return "/tmp/okhuman-agent-test" }
@@ -37,6 +37,7 @@ func testRunOpt() RunOptions {
 		// 不会无限追问，见 llm/fake.go nextStep）。
 	}
 }
+
 type failOnceClient struct {
 	inner llm.LlmClient
 	fails int
@@ -64,16 +65,15 @@ func (c *failOnceClient) CompleteStream(ctx context.Context, messages []types.Me
 	return c.inner.CompleteStream(ctx, messages, tools, onDelta, idleMs)
 }
 
-// TestInjectDemotePersist（2026-09-19）：4xx 降级成功 → 侧车回写文本提示（治本）。
-// 旧行为（请求级降级，不动侧车）：坏 part 留在侧车，下轮请求原样恢复，
-// 每轮都先 4xx 再降级。回写后侧车变提示，后续调用不再发坏 part。
-func TestInjectDemotePersist(t *testing.T) {
+// TestLLM4xxPropagates（2026-10-18）：三级回退阶梯已删——LLM 回 4xx 原样抛出、
+// 本轮终止。机器不再猜"是不是附件坏了"，也不再自动回写侧车；附件剥离改由人显式
+// 按按钮（POST /strip-injects，见 server/manual_actions_test.go）。
+func TestLLM4xxPropagates(t *testing.T) {
 	base := t.TempDir()
 	injectDir := filepath.Join(base, "inject")
 	if err := os.MkdirAll(injectDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// 坏附件侧车（假 PNG：base64 解码是 "test\n"，LLM 必拒载）
 	bad := `[{"type":"image_url","image_url":{"url":"data:image/png;base64,dGVzdAo="}}]`
 	if err := os.WriteFile(filepath.Join(injectDir, "inj-1.json"), []byte(bad), 0o644); err != nil {
 		t.Fatal(err)
@@ -82,39 +82,29 @@ func TestInjectDemotePersist(t *testing.T) {
 	ctxmgr.ConfigureInjectResolver(res)
 	t.Cleanup(func() { ctxmgr.ConfigureInjectResolver(inject.NewResolver(t.TempDir(), nil)) })
 
-	inner := llm.NewFakeLLM([]llm.FakeStep{{Type: "text", Text: "降级后正常"}})
+	inner := llm.NewFakeLLM([]llm.FakeStep{{Type: "text", Text: "这步不该被消费"}})
 	cm := ctxmgr.NewManager(inner, ctxmgr.Cfg{
 		MaxTokens: 1000000, KeepRecentChars: 60000, HardTruncChars: 50000,
 		StreamIdleMS: 30000, CharsPerToken: 2,
 	}, "系统提示", t.TempDir())
-	// 会话里放一条带注入引用的消息（/inject 的标记消息）
 	cm.AddMessage(&types.RawEntry{Role: "user", Content: []types.ContentPart{
 		types.TextPart("[okattach] 附件 inj-1"),
 		types.RefPart("inj-1"),
 	}})
-	a := New(&failOnceClient{inner: inner, fails: 1}, "系统提示", cm, injectDir)
+	a := New(&failOnceClient{inner: inner, fails: 1}, "系统提示", cm)
 
-	reply, err := a.Run(context.Background(), "你好", testRunOpt())
-	if err != nil {
-		t.Fatalf("run 失败: %v", err)
+	_, err := a.Run(context.Background(), "你好", testRunOpt())
+	if err == nil {
+		t.Fatal("LLM 4xx 应原样抛出（阶梯已删，没有兜底重试）")
 	}
-	if reply != "降级后正常" {
-		t.Fatalf("回复 = %q，want 降级后正常", reply)
+	if !strings.Contains(err.Error(), "Failed to load image") {
+		t.Fatalf("错误内容不对: %v", err)
 	}
-	// 断言：侧车已被回写成文本提示（不再含 image_url）
 	got, err := os.ReadFile(filepath.Join(injectDir, "inj-1.json"))
 	if err != nil {
 		t.Fatalf("侧车读取失败: %v", err)
 	}
-	if strings.Contains(string(got), "image_url") {
-		t.Errorf("侧车应已回写为文本提示，仍含 image_url: %s", got)
-	}
-	if !strings.Contains(string(got), "降级为文本提示") {
-		t.Errorf("侧车应含降级提示文案: %s", got)
-	}
-	// 断言：解析器缓存已清（重新 resolve 拿到提示而非坏 part）
-	parts := res.Resolve("inj-1")
-	if len(parts) != 1 || parts[0].Type != "text" {
-		t.Errorf("resolve 应返回单条文本提示，实际 %+v", parts)
+	if !strings.Contains(string(got), "image_url") {
+		t.Errorf("侧车不该被自动改写（剥离只应由人触发）: %s", got)
 	}
 }

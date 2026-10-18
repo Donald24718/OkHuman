@@ -60,11 +60,6 @@ func (e *HTTPError) Error() string {
 	return fmt.Sprintf("LLM %d: %s", e.Status, b)
 }
 
-// Is4xx 回退阶梯触发条件：400/413/415（请求体被拒）
-func (e *HTTPError) Is4xx() bool {
-	return e.Status == 400 || e.Status == 413 || e.Status == 415
-}
-
 // IdleTimeoutError 流式空闲超时（无 wire 字节超过 idleMs，含 ": ping" 注释帧）。
 // 压缩路径据此重试（最多 3 次），3 次仍无响应 → 硬截断兜底。
 type IdleTimeoutError struct {

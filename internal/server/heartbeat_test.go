@@ -165,3 +165,48 @@ func containsStr(xs []interface{}, want string) bool {
 	}
 	return false
 }
+
+// TestHeartbeatConfigTypeGuard 类型守卫（2026-10-18）：enabled / prompt 传错类型
+// 必须 400 且不动已生效配置。不守卫的话 applyMap 的 json.Unmarshal 会跳过该键、
+// 落回 Default()——enabled 静默变 false（心跳关掉）、prompt 静默换回出厂词，
+// 调用方（尤其 agent 自己 curl）完全看不出来。
+func TestHeartbeatConfigTypeGuard(t *testing.T) {
+	cfg := config.Default()
+	cfg.Data.Dir = t.TempDir()
+	a := CreateAgentState(cfg, llm.NewFakeLLM(nil), "sys", []PromptFileInfo{}, true, "")
+	st := NewAppState(cfg, t.TempDir(), a)
+	ap := New(st, nil)
+
+	var out map[string]interface{}
+	code := postJSON(ap, "/config", map[string]interface{}{
+		"patch": map[string]interface{}{"heartbeat": map[string]interface{}{
+			"enabled": true, "interval_min": 12, "prompt": "自定义心跳词",
+		}},
+	}, &out)
+	if code != 200 {
+		t.Fatalf("合法补丁被拒：code=%d body=%v", code, out)
+	}
+	if ap2, ok := out["applied"].([]interface{}); !ok || len(ap2) == 0 {
+		t.Errorf("合法补丁应报 applied 含 heartbeat，实际：%v", out)
+	}
+
+	bads := []map[string]interface{}{
+		{"enabled": "yes"}, // 布尔写成字符串
+		{"enabled": 1},     // 布尔写成数字
+		{"prompt": 123},    // 字符串写成数字
+		{"prompt": map[string]interface{}{"a": "b"}}, // 字符串写成对象
+	}
+	for _, bad := range bads {
+		var o map[string]interface{}
+		code := postJSON(ap, "/config", map[string]interface{}{
+			"patch": map[string]interface{}{"heartbeat": bad},
+		}, &o)
+		if code != 400 {
+			t.Errorf("补丁 %v 应被拒（400），实际 %d body=%v", bad, code, o)
+		}
+	}
+	hb := a.Cfg().Heartbeat
+	if !hb.Enabled || hb.IntervalMin != 12 || hb.Prompt != "自定义心跳词" {
+		t.Errorf("非法补丁改动了已生效配置：%+v", hb)
+	}
+}

@@ -53,21 +53,24 @@ type Cfg struct {
 type Manager struct {
 	mu       sync.Mutex
 	changeMu sync.Mutex // 审计 H2 修（2026-09-14）：串行化"变更全程"
-	//（AddMessage 的 append+压缩+落盘、ForceHardTruncate）。/inject 与在飞 run
+	//（AddMessage 的 append+压缩+落盘、CompressNow）。/inject 与在飞 run
 	// 并发 AddMessage 时，旧代码两个压缩并行、各自按压缩前下标切 batch → 陈旧
 	// 下标切错位置可能丢错消息；持锁后压缩串行、下标始终有效。
-	llm          llm.LlmClient
-	cfg          Cfg
-	systemPrompt string
-	session      *types.SessionState
-	seq          int
-	sessionNo    int
-	recordDir    string
-	runCtx       *context.Context // 当前 run 的中止信号（压缩流用；/stop 时连压缩一起中止）
-	compressL    []func(CompressEvent)
-	deltaL       []func(string, types.Delta)
-	persistL     []func(*types.SessionState, int)
-	selfInfo     SelfInfo // 自我生命感知输入（动态注入 2026-09-20）
+	llm llm.LlmClient
+	cfg Cfg
+	// 最近一次压缩落盘的两个文件（session-records 全文存档 / session-summaries 总结）。
+	// 手动压缩（CompressNow）把这两个路径报给调用方，UI 才能直接给出文件位置。
+	lastRecordPath, lastSummaryPath string
+	systemPrompt                    string
+	session                         *types.SessionState
+	seq                             int
+	sessionNo                       int
+	recordDir                       string
+	runCtx                          *context.Context // 当前 run 的中止信号（压缩流用；/stop 时连压缩一起中止）
+	compressL                       []func(CompressEvent)
+	deltaL                          []func(string, types.Delta)
+	persistL                        []func(*types.SessionState, int)
+	selfInfo                        SelfInfo // 自我生命感知输入（动态注入 2026-09-20）
 }
 
 // NewManager 新建（空会话）
@@ -221,18 +224,18 @@ func removeFn[T any](l []T, fn T) []T {
 }
 
 // Compose 组装发给 LLM 的消息（主循环与压缩请求共用 → 前缀逐 token 一致）
-func (m *Manager) Compose(opts *ComposeOptions) []types.Message {
+func (m *Manager) Compose() []types.Message {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.composeLocked(opts)
+	return m.composeLocked()
 }
 
 // composeLocked = 基础组装 + 动态注入（2026-09-20，持锁调用）：系统提示词首
 // prepend 自我生命感知块（本实例端口/pid + LLM 端口/pid，每次调用现算 →
 // 端口/pid 变化实时更新）。消息本体不再注入任何东西（时间戳功能同日砍掉），
 // 会话前缀跨 run 逐 token 稳定 → KV 前缀可复用。
-func (m *Manager) composeLocked(opts *ComposeOptions) []types.Message {
-	msgs := ComposeMessages(m.session, m.systemPrompt, opts)
+func (m *Manager) composeLocked() []types.Message {
+	msgs := ComposeMessages(m.session, m.systemPrompt)
 	if sb := m.selfBlockLocked(); sb != "" {
 		if sp, ok := msgs[0].Content.(string); ok {
 			msgs[0].Content = sb + "\n\n" + sp
@@ -307,6 +310,20 @@ func (m *Manager) maybeCompress() {
 	m.doCompress(batch)
 }
 
+// DumpSessionRecord 把当前会话全文落盘到 session-records/（与压缩存档同一命名口径
+// ctx-<会话号>-<时间戳>-seq<N>.txt），返回 (路径, 消息条数)；空会话不落盘返回 ("", 0)。
+// 用途：重置会话前保住旧会话原文——重置整体换掉 Manager，除压缩存档外旧会话无处可寻。
+// 只读会话不改结构，故与任何路径都安全（持 mu 快照写文件）。
+func (m *Manager) DumpSessionRecord(reason string) (string, int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := len(m.session.Messages)
+	if n == 0 && m.session.Summary == nil {
+		return "", 0
+	}
+	return m.writeSessionRecordLocked(m.recordTsLocked(), reason), n
+}
+
 // estimateTotalLocked 估算总 token（持锁调用）
 func (m *Manager) estimateTotalLocked() int {
 	t := EstimateTokens(m.systemPrompt, m.cfg.CharsPerToken)
@@ -326,13 +343,14 @@ func (m *Manager) estimateTotalLocked() int {
 func (m *Manager) doCompress(batch []types.RawEntry) {
 	m.mu.Lock()
 	ts := m.recordTsLocked()
-	recordPath := m.writeSessionRecordLocked(ts)
+	recordPath := m.writeSessionRecordLocked(ts, "压缩")
+	m.lastRecordPath = recordPath
 	oldSummary := ""
 	if m.session.Summary != nil {
 		oldSummary = m.session.Summary.Content
 	}
 	beforeChars := sessionChars(m.session)
-	prefix := m.composeLocked(nil)
+	prefix := m.composeLocked()
 	streamIdleMS := m.cfg.StreamIdleMS
 	m.mu.Unlock()
 
@@ -376,6 +394,7 @@ func (m *Manager) doCompress(batch []types.RawEntry) {
 		if recordPath != "[记录写入失败]" {
 			summaryPath = m.writeSummaryFileLocked(ts, res.Text, res.Rounds, beforeChars, recordPath)
 		}
+		m.lastSummaryPath = summaryPath
 		if summaryPath != "" && summaryPath != "[记录写入失败]" {
 			ref += "\n\n[压缩后总结文本：" + summaryPath + " —— 回忆任务轨迹先看这里（时间线/关键实体/完成状态）]"
 		}
@@ -428,16 +447,49 @@ func (m *Manager) llmLocked() llm.LlmClient {
 	return m.llm
 }
 
-// ForceHardTruncate 兜底硬截断（LLM 4xx 三级阶梯第三级）：不经 LLM 压缩重试，
-// 直接保留最近 hard_trunc_chars 字符，完整原文落 session-records/
-func (m *Manager) ForceHardTruncate() {
+// CompressNow 手动压缩（WebUI「手动压缩上下文」按钮）：不等 token 阈值，按
+// keep_recent_chars 预算把最旧一批交给 LLM 压成 summary——与 maybeCompress 同
+// 一套分批口径与同一条压缩路径，只是触发由人做。返回 (说明, 是否真的压了)。
+// 持 changeMu 与在飞 run 的 AddMessage 串行；server 侧另有一道"run 进行中拒绝"
+// 的闸（避免在 run 中途换掉会话结构）。
+func (m *Manager) CompressNow() (string, bool) {
 	m.changeMu.Lock()
 	defer m.changeMu.Unlock()
 	m.mu.Lock()
-	ts := m.recordTsLocked()
-	recordPath := m.writeSessionRecordLocked(ts)
-	m.hardTruncateLocked(recordPath)
+	n := len(m.session.Messages)
+	if n == 0 {
+		m.mu.Unlock()
+		return "会话为空，没有可压缩的内容", false
+	}
+	keep := 1
+	acc := messageChars(m.session.Messages[n-1])
+	for i := n - 2; i >= 0; i-- {
+		c := messageChars(m.session.Messages[i])
+		if acc+c > m.cfg.KeepRecentChars {
+			break
+		}
+		acc += c
+		keep++
+	}
+	batch := m.session.Messages[:n-keep]
+	hasSummary := m.session.Summary != nil
+	before := sessionChars(m.session)
 	m.mu.Unlock()
+	if len(batch) == 0 && !hasSummary {
+		return fmt.Sprintf("无可压内容（全部 %d 条都在保留预算内，且无旧 summary）", n), false
+	}
+	m.doCompress(batch)
+	m.mu.Lock()
+	rec, sum := m.lastRecordPath, m.lastSummaryPath
+	m.mu.Unlock()
+	detail := fmt.Sprintf("已提交压缩：%d 条最旧消息 + 旧 summary → 1 条 summary（压缩前 %d 字符）", len(batch), before)
+	if rec != "" && rec != "[记录写入失败]" {
+		detail += "\n全文存档：" + rec
+	}
+	if sum != "" && sum != "[记录写入失败]" {
+		detail += "\n总结文本：" + sum
+	}
+	return detail, true
 }
 
 // hardTruncateLocked 硬截断（持锁）：压缩 3 次重试均空闲超时（或 4xx 阶梯）→
@@ -498,21 +550,24 @@ func (m *Manager) writeSummaryFileLocked(ts, text string, rounds, beforeChars in
 	return "[记录写入失败]"
 }
 
-// writeSessionRecordLocked 压缩触发时生成会话完整记录
-// （recordDir/session-records/ctx-<会话号>-<时间戳>-seq<N>.txt，持锁调用）。
-// 内容 = 压缩前的完整会话（system 提示词 + summary + 全部消息原文）。
+// writeSessionRecordLocked 生成会话完整记录（recordDir/session-records/
+// ctx-<会话号>-<时间戳>-seq<N>.txt，持锁调用）。内容 = 落盘时刻的完整会话
+// （system 提示词 + summary + 全部消息原文）。
+// reason 只进文件头标明触发场景："压缩"（自动/手动压缩前，防细节丢失）与
+// "重置会话"（2026-10-18：重置会整体换掉 Manager，旧会话原文除压缩存档外无处可寻
+// → 重置前无条件先存一份全文，主人要的就是这个）。
 // 人类可读的纯文本；结构固定：压缩后总结置顶 → system 提示词 → 消息按时间序。
 // 文件名毫秒精度 + seq 后缀（同毫秒不撞名）。ts 由调用方生成（doCompress 把同一 ts
 // 传给本函数与 writeSummaryFileLocked → 存档/总结同名基座配对）。
-func (m *Manager) writeSessionRecordLocked(ts string) string {
+func (m *Manager) writeSessionRecordLocked(ts, reason string) string {
 	iso := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
 	var lines []string
-	lines = append(lines, fmt.Sprintf("# 会话完整记录 会话号=%d 生成=%s（单实例：agent 由落盘目录 okhuman-<port>/ 标识）", m.sessionNo, iso))
+	lines = append(lines, fmt.Sprintf("# 会话完整记录 会话号=%d 生成=%s 触发=%s（单实例：agent 由落盘目录 okhuman-<port>/ 标识）", m.sessionNo, iso, reason))
 	if m.session.Summary != nil {
 		lines = append(lines, "", "## 压缩后总结（LLM 滚动总结，压缩本批之前生成）", "", m.session.Summary.Content, "")
 	}
 	lines = append(lines, "## 系统提示词", "", m.systemPrompt, "")
-	lines = append(lines, "## 消息（按时间序，压缩触发时的完整会话）")
+	lines = append(lines, "## 消息（按时间序，落盘时刻的完整会话）")
 	for _, e := range m.session.Messages {
 		role := e.Role
 		if e.Role == "tool" {

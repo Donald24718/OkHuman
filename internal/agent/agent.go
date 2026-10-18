@@ -36,7 +36,6 @@ import (
 	"time"
 
 	ctxmgr "okhuman/internal/context"
-	"okhuman/internal/inject"
 	"okhuman/internal/llm"
 	"okhuman/internal/tools"
 	"okhuman/internal/types"
@@ -58,7 +57,7 @@ type RunOptions struct {
 	// 工具转后台时回调（由 server.runOpt 实现：注册任务 + 挂 settle 回调；
 	// settle 时通知自动入消息队列，2026-09-14）
 	OnBackgroundStart func(types.BackgroundStartArgs)
-	OnEvent                func(types.AgentEvent)
+	OnEvent           func(types.AgentEvent)
 	// 本轮消息来源（事件广播标记用，2026-08-31）：user = 单条用户消息；
 	// merged = 运行中积攒的多条合并消息。
 	Kind string
@@ -94,7 +93,6 @@ type Agent struct {
 	llm           llm.LlmClient
 	systemPrompt  string
 	cm            *ctxmgr.Manager
-	injectDir     string // 注入侧车目录（4xx 降级成功回写用，2026-09-19；""=不回写）
 	lastCalls     []callRec
 	warned        bool
 	stopRequested atomic.Bool
@@ -108,8 +106,8 @@ type callRec struct {
 }
 
 // New 新建 agent
-func New(client llm.LlmClient, systemPrompt string, cm *ctxmgr.Manager, injectDir string) *Agent {
-	return &Agent{llm: client, systemPrompt: systemPrompt, cm: cm, injectDir: injectDir}
+func New(client llm.LlmClient, systemPrompt string, cm *ctxmgr.Manager) *Agent {
+	return &Agent{llm: client, systemPrompt: systemPrompt, cm: cm}
 }
 
 // SetLLM 运行时热更新 LLM 客户端（WebUI 配置页改 llm 段后）
@@ -338,11 +336,12 @@ func (a *Agent) writeToolLog(opt RunOptions, full string) string {
 // /stop 时 cancel → fetch 断开 → llama.cpp 取消生成；本方法把已收的增量包成
 // AgentStoppedError 抛出（由 runUserMessage 收尾）。
 //
-// LLM 4xx 三级回退阶梯（2026-09-13，用户拍板"粗暴版"）：
-// ① 正常请求 → ② 4xx：最近一条带附件的消息降级文本提示重试 → ③ 仍 4xx：全部附件降级重试
-// → ④ 仍 4xx：触发兜底硬截断压缩后重试（再败则抛，轮次死，人工介入）。
-// 降级是永久的（用户设计意图）：降级成功即回写侧车为文本提示，被拒附件不恢复（2026-09-19 修，原实现是请求级、下轮原样恢复→持久坏附件每轮复发）；触发限 400/413/415
-// （请求体被拒），其余错误（5xx/401/404/网络错）终止阶梯原样抛（配置类错误不配吃硬截断）。
+// 2026-10-18：删掉"LLM 4xx 三级回退阶梯"（4xx→降级最近附件→全部附件→硬截断）。
+// 理由：触发条件写死 400/413/415，是按某个后端的响应码定的；换推理后端时同一件事
+// 可能报别的码（503/500/别的），阶梯既不触发也拦不住，等于把猜测固化进控制流。
+// 现在 LLM 报错就原样抛出、本轮终止。附件出问题的处置改由人显式做：
+// WebUI「剥离全部注入附件」按钮（POST /strip-injects，永久回写侧车）+
+// 「手动压缩上下文」按钮（POST /compress）。
 func (a *Agent) llmCall(ctx context.Context, emit func(types.AgentEvent), totals *TokenTotals) (*types.Response, error) {
 	// 上一轮 /stop 挂起后若本轮已重置（stopRequested=false 说明新 run），这里正常走
 	if a.stopRequested.Load() {
@@ -368,89 +367,22 @@ func (a *Agent) llmCall(ctx context.Context, emit func(types.AgentEvent), totals
 			emit(types.AgentEvent{"type": "delta", "text": d.Text})
 		}
 	}
-	isLlm4xx := isLlm4xxErr
 
 	var resp *types.Response
-	var ladderErr error
-	stopped := func() bool { return a.stopRequested.Load() || callCtx.Err() != nil }
+	err := a.streamOnce(callCtx, client, a.cm.Compose(), onDelta, &resp)
 
-	messages := a.cm.Compose(nil)
-	firstErr := a.streamOnce(callCtx, client, messages, onDelta, &resp)
-	if firstErr != nil {
-		// /stop：cancel 导致 fetch 读流抛错 → 转为 AgentStoppedError（带 partial）
-		if stopped() {
-			return nil, &AgentStoppedError{Partial: partial}
-		}
-		if !isLlm4xx(firstErr) {
-			return nil, firstErr
-		}
-		// ===== 三级阶梯（有界，不循环）=====
-		var modes []string
-		if a.sessionHasInject() {
-			modes = []string{"demote-newest", "demote-all", "truncate"}
-		} else {
-			modes = []string{"truncate"}
-		}
-		for _, mode := range modes {
-			action := "触发兜底硬截断压缩"
-			switch mode {
-			case "demote-newest":
-				action = "最近一条带附件的降级文本提示"
-			case "demote-all":
-				action = "全部附件降级文本提示"
-			}
-			fmt.Printf("[llm] LLM 4xx（%s）→ %s重试\n", truncateStr(firstErr.Error(), 200), action)
-			if mode == "truncate" {
-				a.cm.ForceHardTruncate()
-			}
-			switch mode {
-			case "demote-newest":
-				messages = a.cm.Compose(&ctxmgr.ComposeOptions{DemoteInjects: "newest"})
-			case "demote-all":
-				messages = a.cm.Compose(&ctxmgr.ComposeOptions{DemoteInjects: "all"})
-			default:
-				messages = a.cm.Compose(nil)
-			}
-			err2 := a.streamOnce(callCtx, client, messages, onDelta, &resp)
-			if resp != nil {
-				detail := truncateStr(firstErr.Error(), 300)
-				fmt.Printf("[llm] 4xx 回退阶梯：%s 重试成功（首次报错：%s）\n", mode, detail)
-				emit(types.AgentEvent{"type": "inject_fallback", "mode": mode, "detail": detail})
-				// 2026-09-19：降级成功 → 回写侧车（治本）。降级本是请求级（不动侧车），
-				// 对持久坏附件（内容损坏的图片，每次调用必 400）每轮都先 4xx 再降级；
-				// 回写后侧车变文本提示，后续 resolve 不再发坏 part。
-				if mode != "truncate" {
-					dir := a.injectDir
-					for _, id := range a.demotedInjectIDs(mode) {
-						if inject.PersistDemotion(dir, id) {
-							ctxmgr.ClearResolverCacheEntry(id)
-							fmt.Printf("[inject] %s 降级回写侧车（后续调用不再发原 part）\n", id)
-						}
-					}
-				}
-				break
-			}
-			if stopped() {
-				return nil, &AgentStoppedError{Partial: partial}
-			}
-			if !isLlm4xx(err2) {
-				return nil, err2 // 非 4xx → 阶梯终止
-			}
-			// 仍 4xx → 下一级
-		}
-		if resp == nil {
-			ladderErr = fmt.Errorf("LLM 4xx 回退阶梯耗尽：%s", truncateStr(firstErr.Error(), 300))
-		}
-	}
 	a.mu.Lock()
 	a.callCancel = nil
 	a.mu.Unlock()
 
-	if resp == nil {
-		if ladderErr == nil {
-			ladderErr = fmt.Errorf("llmCall: 4xx 阶梯耗尽")
+	if err != nil {
+		if a.stopRequested.Load() || callCtx.Err() != nil {
+			return nil, &AgentStoppedError{Partial: partial}
 		}
-		return nil, ladderErr
+		return nil, err // 不猜、不降级、不重试：原样抛出，本轮终止
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("llmCall: 流式调用无响应（内部异常）")
 	}
 	totals.PromptTokens += resp.Usage.PromptTokens
 	totals.CompletionTokens += resp.Usage.CompletionTokens
@@ -467,59 +399,6 @@ func (a *Agent) streamOnce(ctx context.Context, client llm.LlmClient, messages [
 	return err
 }
 
-// isLlm4xxErr LLM 4xx 判定（400/413/415 = 请求体被拒；与 TS 正则等价）
-func isLlm4xxErr(e error) bool {
-	h, ok := e.(*llm.HTTPError)
-	if !ok {
-		return false
-	}
-	return h.Is4xx()
-}
-
-// sessionHasInject 会话里是否存在附件引用（inject_ref）——4xx 阶梯只对"有附件"的会话降级
-// demotedInjectIDs 返回本次降级覆盖的注入 id（2026-09-19）：
-// "newest"=会话里最近一条带附件的消息；"all"=会话内全部 inject_ref。
-func (a *Agent) demotedInjectIDs(mode string) []string {
-	sess := a.cm.Session()
-	refs := func(i int) (string, bool) {
-		for _, p := range types.AsParts(sess.Messages[i].Content) {
-			if p.Type == "inject_ref" && p.Ref != "" {
-				return p.Ref, true
-			}
-		}
-		return "", false
-	}
-	ids := map[string]bool{}
-	if mode == "newest" {
-		for i := len(sess.Messages) - 1; i >= 0; i-- {
-			if id, ok := refs(i); ok {
-				ids[id] = true
-				break
-			}
-		}
-	} else {
-		for i := range sess.Messages {
-			if id, ok := refs(i); ok {
-				ids[id] = true
-			}
-		}
-	}
-	out := make([]string, 0, len(ids))
-	for id := range ids {
-		out = append(out, id)
-	}
-	return out
-}
-
-func (a *Agent) sessionHasInject() bool {
-	for _, m := range a.cm.Session().Messages {
-		if m.HasInjectRef() {
-			return true
-		}
-	}
-	return false
-}
-
 // finishText 纯文本收尾：存 assistant 消息 + 发事件。流式下正文/思考已由 delta
 // 逐块发出，这里不再重发全量 text/thinking（避免 WebUI 重复渲染）。
 func (a *Agent) finishText(resp *types.Response, emit func(types.AgentEvent), totals *TokenTotals) (string, error) {
@@ -527,7 +406,6 @@ func (a *Agent) finishText(resp *types.Response, emit func(types.AgentEvent), to
 	emit(types.AgentEvent{"type": "done", "usage": totals})
 	return resp.Content, nil
 }
-
 
 // bgStartedNotice 前台超时转后台时回填给模型的 tool 消息。
 //
@@ -538,7 +416,6 @@ func (a *Agent) finishText(resp *types.Response, emit func(types.AgentEvent), to
 func bgStartedNotice(fgSec int) string {
 	return fmt.Sprintf("（系统：此调用前台等待超过 %d 秒未完成，已自动转入后台继续执行。无需等待，可继续其他工作或直接基于已有信息回复；任务完成后系统会自动通知结果——通知到达会自动开启新一轮，你不必守着。）", fgSec)
 }
-
 
 // runLoop 工具循环：从一次 LLM 响应开始，带 tool_calls → 逐个执行工具并回填 →
 // 再 LLM；无工具调用 → 收笔（finishText）。工具循环本身不设迭代上限：

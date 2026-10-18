@@ -50,10 +50,6 @@
   textarea { resize: vertical; font-family: var(--mono); font-size: 13px; }
   label.f { display: block; margin-bottom: 10px; }
   label.f span { display: block; color: var(--dim); font-size: 12px; margin-bottom: 4px; }
-  .hb-bar { margin: 10px 0 14px; padding: 10px 14px; border: 1px solid var(--border);
-    border-radius: 8px; background: var(--bg2); font-size: 14px; }
-  .hb-bar b { font-variant-numeric: tabular-nums; font-size: 18px; letter-spacing: .5px; }
-  .hb-bar .dim { color: var(--dim); font-size: 12px; }
 
   /* ---------- 侧栏 ---------- */
   aside {
@@ -80,7 +76,11 @@
   }
   nav a:hover { background: var(--bg3); color: var(--text); }
   nav a.active { background: var(--bg3); color: #fff; box-shadow: inset 2px 0 0 var(--accent); }
-  .side-foot { margin-top: auto; padding: 10px 8px 0; font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 7px; }
+  .side-foot { margin-top: auto; padding: 10px 8px 0; font-size: 12px; color: var(--dim); display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+  .sf-row { display: flex; align-items: center; gap: 7px; }
+  /* 心跳倒计时常驻左下角（2026-10-18 用户定，从配置页搬来）：切到任何页面都看得见 */
+  .hb-foot { display: flex; align-items: baseline; gap: 5px; cursor: default; }
+  .hb-foot b { font-variant-numeric: tabular-nums; color: var(--fg); }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
   .dot.ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
   .dot.err { background: var(--red); box-shadow: 0 0 6px var(--red); }
@@ -263,7 +263,10 @@
     <a data-page="prompts">📝 提示词</a>
     <a data-page="config">⚙️ 配置</a>
   </nav>
-  <div class="side-foot"><span class="dot" id="healthDot"></span><span id="healthText">检测中…</span></div>
+  <div class="side-foot">
+    <div class="sf-row"><span class="dot" id="healthDot"></span><span id="healthText">检测中…</span></div>
+    <div id="hbBar" class="hb-foot" style="display:none"></div>
+  </div>
 </aside>
 <main>
   <!-- ================= 聊天 ================= -->
@@ -272,6 +275,8 @@
       <h1>💬 聊天
         <span class="sub" id="chatMeta"></span>
         <button class="small" onclick="resetSession()">🧹 重置会话</button>
+        <button class="small" id="compressBtn" onclick="manualCompress()" title="不等 token 阈值，立刻把最旧一批消息压成 summary（与自动压缩同一套分批口径）。run 进行中会被拒绝。">🗜️ 手动压缩上下文</button>
+        <button class="small" id="stripBtn" onclick="manualStripInjects()" title="把全部外部注入附件（inject 侧车）永久回写成文本提示：之后的调用不再发送原附件内容。只影响外部注入的附件，不碰工具结果。run 进行中也可点。">📎 剥离全部注入附件</button>
       </h1>
       <div id="chatBoxes"><button class="to-bottom" id="toBottomBtn" style="display:none">⬇ 回到底部</button></div>
       <div id="chatInputRow">
@@ -352,7 +357,6 @@
     <div class="cfg-scope">
       <span class="dim" id="cfgPatchFile" style="font-size:12px">落盘 config/user.json（重启恢复）</span>
     </div>
-    <div id="hbBar" class="hb-bar" style="display:none"></div>
     <div id="cfgBody"></div>
     <div class="row" style="margin-top:6px">
       <button class="primary" style="padding:9px 30px;font-size:15px" onclick="saveConfig()">💾 保存并生效</button>
@@ -470,7 +474,8 @@ function toast(msg, isErr) {
   d.className = "toast" + (isErr ? " err" : "");
   d.textContent = msg;
   $("toast").appendChild(d);
-  setTimeout(() => d.remove(), isErr ? 6000 : 3500);
+  // 长消息（带文件路径）多留一会儿，否则来不及看就被抹掉
+  setTimeout(() => d.remove(), isErr ? 6000 : (msg.length > 60 ? 9000 : 3500));
 }
 function fmtBytes(n) {
   if (n == null) return "-";
@@ -521,8 +526,6 @@ function showPage(p) {
   if (L) L();
   stopAuto();
   if (p === "status") startAuto();
-  stopHb();
-  if (p === "config") startHb();
 }
 /* 页面可见时自动刷新（状态页每 3s） */
 let autoTimer = null;
@@ -536,10 +539,12 @@ function startAuto() {
 }
 function stopAuto() { if (autoTimer) { clearInterval(autoTimer); autoTimer = null; } }
 
-/* ================= 心跳倒计时（配置页，2026-10-17 用户定） ================= */
-/* 数据源是 /status 的 heartbeat 段：next_due_ms 由服务端算，与浏览器同机同时钟，
+/* ================= 心跳倒计时（左侧栏底部，常驻） ================= */
+/* 2026-10-18 用户定：从配置页搬到侧栏左下角——心跳是"实例此刻活着且在等什么"的
+   体征，跟着健康灯放一起，切到聊天/状态/提示词页都看得见，不该藏在配置页里。
+   数据源是 /status 的 heartbeat 段：next_due_ms 由服务端算，与浏览器同机同时钟，
    直接 Date.now() 相减。每秒本地重算（不累积误差），每 5s 回源校准——run 结束、
-   改开关/间隔都会改变下次时刻。只在配置页可见时跑，切页即停（见 showPage）。 */
+   改开关/间隔都会改变下次时刻。常驻计时（init 起，不按页面开关）。 */
 let hbState = null, hbTick = null, hbPull = null;
 function fmtCountdown(ms) {
   if (ms == null || ms < 0) ms = 0;
@@ -560,22 +565,28 @@ function renderHbBar() {
   if (!bar) return;
   if (!hbState || !hbState.hb) { bar.style.display = "none"; return; }
   const hb = hbState.hb;
+  const meta = `间隔 ${hb.interval_min} 分钟` + (hb.idle_ms != null ? ` ｜ 已空闲 ${fmtDur(hb.idle_ms)}` : "");
+  bar.title = meta;
   if (!hb.enabled) {
-    bar.innerHTML = `💤 心跳已关闭 <span class="dim">（下面把 enabled 设为「开」并保存即启用）</span>`;
-    bar.style.display = "block";
-    return;
-  }
-  if (hbState.running) {
-    bar.innerHTML = `⏳ 正在 run —— <span class="dim">心跳计时暂停（run 结束才重新计时；间隔 ${hb.interval_min} 分钟）</span>`;
+    bar.innerHTML = `💤 心跳已关闭`;
+    bar.title = "在 ⚙️ 配置 页把 heartbeat.enabled 设为「开」并保存即启用";
+  } else if (hbState.running) {
+    bar.innerHTML = `⏳ run 中 · 心跳暂停`;
+    bar.title = `正在 run：心跳计时暂停，run 结束才重新计时（${meta}）`;
   } else if (hb.next_due_ms == null) {
-    bar.innerHTML = `⏸ 心跳计时未开始 <span class="dim">（间隔 ${hb.interval_min} 分钟）</span>`;
+    bar.innerHTML = `⏸ 心跳未计时`;
+    bar.title = `计时未开始（${meta}）`;
   } else {
     const left = hb.next_due_ms - Date.now();
-    bar.innerHTML = left <= 0
-      ? `🔔 心跳到点，本轮巡检内即将触发`
-      : `⏱ 下次心跳 <b>${fmtCountdown(left)}</b> 后 <span class="dim">｜ 间隔 ${hb.interval_min} 分钟 ｜ 已空闲 ${fmtDur(hb.idle_ms)}</span>`;
+    if (left <= 0) {
+      bar.innerHTML = `🔔 心跳到点`;
+      bar.title = `到点，本轮巡检内即将触发（${meta}）`;
+    } else {
+      bar.innerHTML = `⏱ 下次心跳 <b>${fmtCountdown(left)}</b>`;
+      bar.title = meta;
+    }
   }
-  bar.style.display = "block";
+  bar.style.display = "flex";
 }
 function startHb() {
   stopHb();
@@ -965,11 +976,55 @@ async function stopChat() {
     await fetch("/stop", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
   } catch (e) { toast("中断请求失败：" + e.message, true); }
 }
+/* 手动压缩上下文（2026-10-18）：不等 token 阈值，按常规分批口径立刻压最旧一批。
+   取代旧"LLM 4xx 三级回退"的第一级——机器不再靠状态码猜上下文超长，由人判断。
+   请求会阻塞到压缩 LLM 调用结束（几十秒到几分钟），进度经 SSE 的 compress 卡片实时可见。 */
+async function manualCompress() {
+  if (state.busy) { toast("run 进行中：等本轮结束再手动压缩", true); return; }
+  if (!confirm("手动压缩上下文？\n不等阈值，立刻把最旧一批消息（保留预算之外的）交给 LLM 压成 summary。\n要等一次 LLM 调用，可能几十秒到几分钟。")) return;
+  const btn = $("compressBtn"), meta = $("chatMeta"), old = btn.textContent;
+  btn.disabled = true; btn.textContent = "🗜️ 压缩中…";
+  meta.textContent = "手动压缩中…（进度见下方压缩卡片）";
+  try {
+    const j = await apiPost("/compress", {});
+    if (j.did) toast("已压缩：" + (j.detail || ""), false);
+    else toast("未压缩：" + (j.detail || "无可压内容"));
+    loadStatus();
+  } catch (e) {
+    toast("手动压缩失败：" + e.message, true);
+  } finally {
+    btn.disabled = false; btn.textContent = old; meta.textContent = "";
+  }
+}
+
+/* 手动剥离全部注入附件（2026-10-18）：把 inject 侧车永久回写成文本提示，之后的
+   调用不再发送原附件内容（永久，不是本轮请求级）。取代旧"三级回退"的第二/三级
+   ——旧阶梯靠硬编码 400/413/415 猜"附件撑爆请求体"，换后端就不成立。
+   run 进行中允许：坏附件卡住 run 时这是自救路径（只改引用解析结果，不动会话结构）。 */
+async function manualStripInjects() {
+  if (!confirm("剥离全部注入附件？\n把本会话全部外部注入附件永久回写成文本提示：之后的每次调用都不再发送原附件内容。\n永久生效、不可撤销（要恢复只能重新注入）。\n只影响外部注入的附件，不碰工具结果。")) return;
+  const btn = $("stripBtn"), old = btn.textContent;
+  btn.disabled = true; btn.textContent = "📎 剥离中…";
+  try {
+    const j = await apiPost("/strip-injects", {});
+    const ids = j.stripped || [];
+    toast(ids.length ? `已剥离 ${ids.length} 个附件：${ids.join(", ")}` : "没有可剥离的附件");
+    loadStatus();
+  } catch (e) {
+    toast("剥离附件失败：" + e.message, true);
+  } finally {
+    btn.disabled = false; btn.textContent = old;
+  }
+}
+
 async function resetSession() {
-  if (!confirm("重置会话？\n当前上下文将清空，会话编号 +1。")) return;
+  if (!confirm("重置会话？\n当前上下文将清空，会话编号 +1。\n重置前会自动把旧会话全文落盘到 session-records/（全文存档，含系统提示词与全部消息原文）。")) return;
   try {
     const j = await apiPost("/reset", {});
-    toast(`会话已重置 → #${j.session}`);
+    // record 缺失 = 后端是旧版（不返回该字段），此时不说"未落盘"，免得谎报
+    toast(j.record ? `会话已重置 → #${j.session}｜旧会话全文：${j.record}`
+      : (j.record === undefined ? `会话已重置 → #${j.session}`
+                                 : `会话已重置 → #${j.session}（空会话，未落盘）`));
     const b = state.box;
     if (b) { b.el.innerHTML = ""; b.loaded = false; b.session = j.session; }
     state.seenRuns = [];
@@ -1217,6 +1272,7 @@ async function saveConfig() {
   health();
   setInterval(health, 8000);
   eventsFor(); // 常驻 /events 流（2026-08-31 方案A）：刷新/重开页面后续接
+  startHb();   // 心跳倒计时常驻侧栏左下角（2026-10-18）：不按页开关
   startQueuePolling(); // /queue 2s 对齐
   await showBox(); // 页面加载 / 刷新后显示聊天框（含历史）
 })();
