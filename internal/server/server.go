@@ -1082,7 +1082,7 @@ func (c *sseConn) close() {
 	close(c.done)
 }
 
-// /chat/stream 已删除（2026-10-18 健壮性复查，主人定）：它是"同步流式"端点——
+// /chat/stream 已删除（2026-10-18 健壮性复查，定案）：它是"同步流式"端点——
 // run 每产生一个事件就在 **run 自己的 goroutine 里**往该连接的 socket 写一帧，
 // 而 sseConn.write 无 deadline。对端不读 → 内核缓冲填满 → write 挂住 → run 回不到
 // "读 LLM 下一批字节"那一步：轻则空闲计时器误判"模型没响应"把本轮判死，重则本轮
