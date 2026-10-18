@@ -419,6 +419,16 @@ async function restoreChatBox() {
     b.el.innerHTML = `<div class="empty">历史加载失败：${esc(e2.message)}</div>`;
   }
 }
+/* 强制重建聊天框（缺口补齐用）：restoreChatBox 在框非空时会直接返回，
+ * 必须先清空 + 清 loaded 标记才会真的重新拉 /history。 */
+async function reloadChatBox() {
+  const b = getBox();
+  if (!b) return;
+  b.el.innerHTML = "";
+  b.loaded = false;
+  await restoreChatBox();
+}
+
 function renderHistoryEntry(e) {
   if (e.role === "user") {
     // /inject 附件消息的 content 是 parts 数组（2026-09-11）：渲染文本 + 附件徽标
@@ -788,6 +798,12 @@ function handleChatEvent(type, data) {
       clearQueueTags();
       compressLiveEndAll();
       refreshQueue();
+      // 本轮曾落后超窗（开头几批已被缓冲挤掉）→ 轮结束后 /history 已含完整本轮，
+      // 重载补全：绝不让界面留一条缺开头的气泡（2026-10-18 修 B）
+      if (state.gapInRound) {
+        state.gapInRound = false;
+        reloadChatBox();
+      }
       break;
     case "delta":
       streamDelta(data);
@@ -878,15 +894,23 @@ function syncUi(running) {
 }
 function chatFinish() { syncUi(false); }
 
-/* ================= /events 常驻事件流（2026-08-31 方案A） ================= */
+/* ============ 事件取用：短轮询 GET /events/poll（2026-10-18 健壮性修 B） ============
+ * 内核把事件按"发车"打包进内存批次缓冲（每批带全局递增号，保留最近 10 批 / 3MB），
+ * 前端带自己的游标来取增量。
+ *
+ * 为什么不再用 EventSource：旧模型里 run 的 emit 直接往每个 SSE 连接写 socket，
+ * 一个挂起的标签页（被系统冻结、断网、代理缓冲）就能把 run 卡在那次写上——期间读不到
+ * LLM 的新字节 → 空闲计时器误判"模型没响应" → 本轮被判超时失败；压缩更会被连累：
+ * 3 次空闲重试全被同一个卡住的客户端掐住，第 3 次触发硬截断，最老一批上下文没有
+ * summary 就没了。现在 run 只写内存，谁慢谁自己落后，互不影响，也不踢任何客户端。
+ *
+ * 代价（如实）：打字机从逐 token 变成每 ~200ms 一段；落后超过缓冲窗口时服务端会
+ * 明确告知缺口（gap），前端提示并从 /history 补齐——绝不静默少内容。 */
+const EVENT_TICK_MS = 200, EVENT_TICK_HIDDEN_MS = 2000;
 function eventsFor() {
   if (state.events) return state.events;
-  const es = new EventSource("/events");
-  state.events = es;
-  const on = (name, fn) => es.addEventListener(name, (ev) => {
-    let d; try { d = JSON.parse(ev.data); } catch { return; }
-    try { fn(d); } catch (e) { console.error("[events]", name, e); }
-  });
+  const h = {};
+  const on = (name, fn) => { h[name] = (d) => { try { fn(d); } catch (e) { console.error("[events]", name, e); } }; };
   on("hello", (d) => {
     syncUi(d.running);
     for (const m of (d.queued || [])) String(m).startsWith(BG_NOTICE_PREFIX) ? chatSysHtml(m, true) : chatUserHtml(m, true);
@@ -915,13 +939,61 @@ function eventsFor() {
   on("compress_delta", (d) => handleChatEvent("compress_delta", d));
   on("doom_warn", (d) => handleChatEvent("doom_warn", d));
   on("doom_stop", (d) => handleChatEvent("doom_stop", d));
-  on("error", (d) => {
-    // EventSource 的 "error" 分两种——服务端广播的 run error 带 data，连接自身断开无 data（浏览器自动重连）。
-    if (d && d.message) handleChatEvent("error", d);
-  });
+  on("error", (d) => { if (d && d.message) handleChatEvent("error", d); });
   on("done", (d) => handleChatEvent("done", d));
-  return es;
+
+  const ev = { cursor: null, timer: null, fails: 0 };
+  state.events = ev;
+
+  // 服务端给的是 /events 同款原始帧（event: X\ndata: {...}\n\n），自己解析后派发
+  function dispatchFrame(f) {
+    let name = "", data = "";
+    for (const line of String(f).split("\n")) {
+      if (line.startsWith("event:")) name = line.slice(6).trim();
+      else if (line.startsWith("data:")) data += line.slice(5).trim();
+      else if (line.startsWith(":")) continue; // 注释帧（保活 ping）
+    }
+    if (!name || !h[name]) return;
+    let d; try { d = JSON.parse(data); } catch { return; }
+    h[name](d);
+  }
+
+  // 落后超窗：明确提示 + 走 /history 补齐（绝不静默少内容）。一次页面停留只提示一次。
+  function noteGap(n) {
+    state.gapInRound = true; // 本轮有缺口：run_end 后重载历史补全
+    if (state.gapNoticed) return;
+    state.gapNoticed = true;
+    chatSysHtml(`⚠ 有 ${n} 批事件没送到（本页面落后过多），正在从历史补齐`, true);
+    const bub = document.querySelector(".bubble.streaming");
+    if (bub) bub.insertAdjacentHTML("afterbegin", `<div class="queue-tag">⚠ 开头部分未收到 · 本轮结束后自动补全</div>`);
+    // 此刻不重载：轮还在跑时 /history 会截断当前轮，重载反而把正在流的气泡丢掉。
+    // 补全在 run_end 做（那时 /history 已含完整本轮）。
+  }
+
+  async function tick() {
+    const q = ev.cursor == null ? "-1" : String(ev.cursor); // -1 = 新客户端：给正在跑的那一轮
+    try {
+      const r = await fetch("/events/poll?since=" + q, { cache: "no-store" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const j = await r.json();
+      for (const b of (j.batches || [])) {
+        for (const f of (b.frames || [])) dispatchFrame(f);
+        ev.cursor = b.seq;
+      }
+      if (ev.cursor == null) ev.cursor = j.latest ?? 0;
+      if ((j.gap || 0) > 0) noteGap(j.gap);
+      if (ev.fails >= 3) chatSysHtml("✓ 事件通道已恢复", true);
+      ev.fails = 0;
+    } catch (e) {
+      ev.fails++;
+      if (ev.fails === 3) chatSysHtml("⚠ 事件通道暂时不通（" + esc(e.message) + "），仍在重试", true);
+    }
+    ev.timer = setTimeout(tick, document.hidden ? EVENT_TICK_HIDDEN_MS : EVENT_TICK_MS);
+  }
+  ev.timer = setTimeout(tick, 0);
+  return ev;
 }
+
 /* 队列状态轮询（2s）：running 以服务端为准（含活动 drain，多轮间隙不闪），
  * 排队消息补显"排队中"气泡（重连/hello 错过的兜底）。事件驱动为主，轮询只做对齐。 */
 let queueTimer = null;

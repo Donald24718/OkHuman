@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -134,26 +135,16 @@ type drainResult struct {
 	Err   error
 }
 
-// subEntry 事件广播订阅（2026-09-14 审计修：带唯一 id——旧实现用
-// reflect.ValueOf(fn).Pointer() 判同，同一函数字面量产生的所有闭共享同一
-// 代码指针 → 任一 /events 连接断开时会把其他连接的订阅一并摘除）
-type subEntry struct {
-	ID uint64
-	Fn func(string)
-}
-
-var subSeq atomic.Uint64 // 订阅 id 发号器
-
 // AppState 单实例服务状态
 type AppState struct {
-	Root          string // 项目根（webui 静态文件 / config/user.json 落盘用）
-	Agent         *AgentState
-	mu            sync.Mutex // 保护下面全部字段
-	BroadcastSubs []subEntry
-	MessageQueue  []string
-	ActiveDrain   *drainHandle
-	RoundBuf      *roundBuf
-	RunSeq        int
+	Root         string // 项目根（webui 静态文件 / config/user.json 落盘用）
+	Agent        *AgentState
+	mu           sync.Mutex // 保护下面全部字段
+	Evt          *eventLog  // 事件批次缓冲（发车机制内核，见 eventlog.go）
+	MessageQueue []string
+	ActiveDrain  *drainHandle
+	RoundBuf     *roundBuf
+	RunSeq       int
 	// LastRunEnd 最近一次 run 结束的时刻（Unix 毫秒）——空闲心跳的计时基准
 	// （2026-10-17）。口径由用户定：**只有 run 结束才重置**，正在 run 期间不计时。
 	// 用 atomic 而非 state.mu：心跳只读它，避免与 RunLock→state.mu 锁序纠缠。
@@ -180,11 +171,11 @@ func (st *AppState) logf(format string, args ...interface{}) {
 // cfg 参数保留兼容（配置统一存于 AgentState.CfgRef）。
 func NewAppState(cfg *config.Config, root string, agent *AgentState) *AppState {
 	st := &AppState{
-		Root:          root,
-		Agent:         agent,
-		BroadcastSubs: []subEntry{},
-		MessageQueue:  []string{},
-		Injects:       []InjectInfo{},
+		Root:         root,
+		Agent:        agent,
+		Evt:          newEventLog(),
+		MessageQueue: []string{},
+		Injects:      []InjectInfo{},
 	}
 	// 启动即视为"刚 run 完"：空闲计时从此刻开始，不会一启动就发心跳
 	st.LastRunEnd.Store(time.Now().UnixMilli())
@@ -350,17 +341,10 @@ func broadcastEvent(state *AppState, e types.AgentEvent) {
 	} else if state.RoundBuf != nil && len(state.RoundBuf.Frames) < maxRoundFrames {
 		state.RoundBuf.Frames = append(state.RoundBuf.Frames, payload)
 	}
-	subs := append([]subEntry(nil), state.BroadcastSubs...)
 	state.mu.Unlock()
-	if len(subs) == 0 {
-		return
-	}
-	for _, s := range subs {
-		func() {
-			defer func() { _ = recover() }() // 订阅者写失败：由其对端断开清理
-			s.Fn(payload)
-		}()
-	}
+	// 只进内存缓冲（2026-10-18 修 B）：写 socket 由各消费者自己的 goroutine 做，
+	// run 的 emit 路径上没有任何网络动作——慢客户端卡不到 run。
+	state.Evt.add(payload, strOf(e["type"]))
 }
 
 // logRunEvent run 事件里的 doom/bg 记录（所有入口统一）
@@ -815,6 +799,8 @@ func (ap *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ap.handleEnqueue(w, r)
 	case r.Method == http.MethodGet && path == "/events":
 		ap.handleEvents(w, r)
+	case r.Method == http.MethodGet && path == "/events/poll":
+		ap.handleEventsPoll(w, r)
 	case r.Method == http.MethodPost && path == "/inject":
 		ap.handleInject(w, r)
 	case r.Method == http.MethodPost && path == "/strip-injects":
@@ -1166,26 +1152,27 @@ func (ap *App) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 // ---------- /events：常驻事件广播（2026-08-31 方案A） ----------
 // 订阅本实例的全部 run 事件（run_start/delta/tool_*/done/…）。前端一个常驻
 // EventSource，刷新/重开页面后续接——不再丢"刷新瞬间正在流式那轮"的显示。
+// handleEvents SSE 常驻事件流（QQ 桥 / voice-chat 等外部消费者的通道，
+// **协议字节级不变**：同样的 event:/data: 帧、同样的 hello 与本轮重放）。
+//
+// 2026-10-18 健壮性修 B：写 socket 从 run 的 goroutine 挪到**本 handler 自己的
+// goroutine**——run 只把帧放进 state.Evt 内存缓冲，这里按节奏从缓冲取、往本连接
+// 写。慢客户端只会卡住自己这个 handler，卡不到 run（旧实现里 run 直接写 socket：
+// 一个挂起的标签页能让本轮被判空闲超时；压缩更会被连累——3 次空闲重试后触发
+// 硬截断，最老一批上下文没有 summary 就没了）。
+// 不踢客户端：本连接落后超过缓冲窗口时，缺口由 /history 兜底（QQ 桥本来就有
+// /history 兜底轮询）。
 func (ap *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 	a := ap.state.Agent
 	conn := newSSE(w)
-	conn.heartbeat()
-	subID := subSeq.Add(1)
-	sub := func(payload string) { conn.write(payload) }
 	ap.state.mu.Lock()
-	// 订阅：每次广播回调里直接写本连接（broadcastEvent 逐个 recover 隔离）
-	ap.state.BroadcastSubs = append(ap.state.BroadcastSubs, subEntry{ID: subID, Fn: sub})
-	// 连接建立即报当前状态（前端据此对齐：running + 排队消息全文 + 后台任务数）。
-	// queued 带全文：刷新/重开/重连后前端据此补显"排队中"气泡（与历史去重）。
 	queued := append([]string(nil), ap.state.MessageQueue...)
 	running := a.Lock.Running() || ap.state.ActiveDrain != nil
 	session := int(a.SessionNo.Load())
 	bgPending := a.BG().Count()
-	var replay []string
-	// 重放：仅当正在跑时，补发当前轮已流出的帧。空闲时不重放——已完成的
-	// 轮次由前端 /history 加载，重放会重复出气泡。只重放 round=当前 session 的缓冲。
+	var roundFrames []string
 	if running && ap.state.RoundBuf != nil && ap.state.RoundBuf.Round == session {
-		replay = append([]string(nil), ap.state.RoundBuf.Frames...)
+		roundFrames = append([]string(nil), ap.state.RoundBuf.Frames...)
 	}
 	ap.state.mu.Unlock()
 	conn.write(fmt.Sprintf("event: hello\ndata: %s\n\n", jsonStr(map[string]interface{}{
@@ -1194,21 +1181,64 @@ func (ap *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 		"queued":     queued,
 		"bg_pending": bgPending,
 	})))
-	for _, f := range replay {
-		conn.write(f)
-	}
-	// 连接挂着直到对端断开 → 清订阅、停心跳
-	<-r.Context().Done()
-	ap.state.mu.Lock()
-	kept := ap.state.BroadcastSubs[:0]
-	for _, s := range ap.state.BroadcastSubs {
-		if s.ID != subID {
-			kept = append(kept, s)
+	// 重放：优先走事件缓冲（原子、含尚未发车的帧）；本轮开头已被窗口挤掉时
+	// 回退 RoundBuf 整轮重放（保住"长轮中途重订也能补全本轮"的旧语义）
+	bs, _, _, fromRoundStart := ap.state.Evt.takeSince(-1)
+	if len(bs) > 0 && fromRoundStart {
+		conn.write(joinFrames(bs))
+	} else {
+		for _, f := range roundFrames {
+			conn.write(f)
 		}
 	}
-	ap.state.BroadcastSubs = kept
+	cur := ap.state.Evt.latestSeq()
+	tick := time.NewTicker(eventPollTick)
+	defer tick.Stop()
+	ping := time.NewTicker(5 * time.Second)
+	defer ping.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			conn.close()
+			return
+		case <-ping.C:
+			conn.write(": ping\n\n") // 保活：外部消费者靠周期性数据判活
+			continue
+		case <-tick.C:
+		}
+		got, _, _, _ := ap.state.Evt.takeSince(cur)
+		if len(got) == 0 {
+			continue
+		}
+		conn.write(joinFrames(got))
+		cur = got[len(got)-1].Seq
+	}
+}
+
+// eventPollTick 消费者从缓冲取批次的节奏（SSE 与 WebUI 短轮询同一口径）
+const eventPollTick = 200 * time.Millisecond
+
+// handleEventsPoll WebUI 短轮询取事件（2026-10-18 修 B：发车 + 前端自己取）。
+// since=-1（或缺省）= 新客户端：有轮在跑就从本轮开头给（界面不空白），否则只报
+// 最新号（已完成轮的历史由 /history 给）。since=N = 取 N 之后的批次。
+// gap>0 = 客户端落后超过缓冲窗口，中间 gap 批已被挤掉 → 前端必须提示并走 /history 补。
+func (ap *App) handleEventsPoll(w http.ResponseWriter, r *http.Request) {
+	s := -1
+	if q := r.URL.Query().Get("since"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil {
+			s = n
+		}
+	}
+	bs, latest, gap, _ := ap.state.Evt.takeSince(s)
+	if bs == nil {
+		bs = []eventBatch{}
+	}
+	ap.state.mu.Lock()
+	running := ap.state.Agent.Lock.Running() || ap.state.ActiveDrain != nil
 	ap.state.mu.Unlock()
-	conn.close()
+	writeJSON(w, 200, map[string]interface{}{
+		"batches": bs, "latest": latest, "gap": gap, "running": running,
+	})
 }
 
 // ---------- 上下文注入（2026-09-11，厄运定：内核只给接口，识别/格式是插件的事） ----------
