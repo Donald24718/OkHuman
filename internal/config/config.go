@@ -181,7 +181,7 @@ func NormalizeTimeUnits(patch map[string]interface{}) []string {
 				notes = append(notes, fmt.Sprintf("%s.%s 已废弃 → 忽略（同补丁里已有 %s.%s）", section, oldK, section, newK))
 			} else {
 				sec[newK] = float64(converted)
-				notes = append(notes, fmt.Sprintf("%s.%s=%v（毫秒）→ %s.%s=%d（秒）", section, oldK, f, section, newK, converted))
+				notes = append(notes, fmt.Sprintf("%s.%s=%.0f（毫秒）→ %s.%s=%d（秒）", section, oldK, f, section, newK, converted))
 			}
 			delete(sec, oldK)
 		}
