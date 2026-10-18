@@ -10,7 +10,8 @@ package context
 //   （回忆轨迹先看总结，被压掉的细节按需 cat/grep 存档抓回）
 // - 失败兜底：空闲超时重试 3 次仍失败 → 硬截断到 hard_trunc_chars；
 //   其他错误（含 /stop 中断）→ 不重试、session 不变（下轮消息再试）
-// - 4xx 回退阶梯（agent 包调用）：forceHardTruncate 直接硬截断不经 LLM
+// - 硬截断只有一个触发点：上面那条 3 次空闲超时（2026-10-18 删 4xx 回退阶梯后，
+//   原先经阶梯调用的 forceHardTruncate 入口已不存在）
 //
 // 热更新（2026-09-03）：SetCfg/SetLLM/SetSystemPrompt 支持 POST /config 即时生效。
 
@@ -493,7 +494,7 @@ func (m *Manager) CompressNow() (string, bool) {
 	return detail, true
 }
 
-// hardTruncateLocked 硬截断（持锁）：压缩 3 次重试均空闲超时（或 4xx 阶梯）→
+// hardTruncateLocked 硬截断（持锁）：压缩 3 次重试均空闲超时 →
 // 放弃 LLM 压缩，直接保留最近 hard_trunc_chars 字符预算内的原文，其余丢弃
 // （完整内容已在 session-records/ 落盘，数据不丢）。summary 置为记录文件路径引用。
 func (m *Manager) hardTruncateLocked(recordPath string) {

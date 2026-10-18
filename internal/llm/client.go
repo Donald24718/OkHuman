@@ -46,10 +46,15 @@ func NewOpenAiClient(cfg ClientConfig) *OpenAiClient {
 // Config 返回当前构造参数（热更新比对用）
 func (c *OpenAiClient) Config() ClientConfig { return c.cfg }
 
-// ---------- 错误类型（agent 4xx 阶梯按 HTTPError.Status 判定） ----------
+// ---------- 错误类型 ----------
+//
+// 2026-10-18：agent 侧的"LLM 4xx 三级回退阶梯"已整体删除（按状态码猜附件问题
+// 是按 llama.cpp 行为写死的，换后端就不成立）。现在 LLM 报错原样上抛、本轮终止，
+// 附件处置由人显式做（POST /strip-injects 永久回写侧车）。Status 字段保留——
+// 排障要看状态码，但已没有任何按状态码分支的控制流。
 
 // HTTPError LLM 返回非 2xx。Error() 串格式 "LLM <status>: <body前500>"
-// （与 TS 版完全一致，日志/阶梯正则口径不变）
+// （与 TS 版一致，日志口径不变）
 type HTTPError struct {
 	Status int
 	Body   string

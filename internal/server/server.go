@@ -160,6 +160,20 @@ type AppState struct {
 	LastRunEnd atomic.Int64
 	InjectSeq  int
 	Injects    []InjectInfo
+
+	// Log 落盘日志回调（main 注入 persist.Log）。2026-10-18 健壮性修 D：server 层
+	// 此前没有 logger，关键操作（手动剥离附件、重置会话落盘、附件载入失败）只能
+	// fmt.Printf → 只进 stdout，okhuman.log 里查不到做过什么，审计断链。
+	// nil 时静默（测试路径不注入）。
+	Log func(string)
+}
+
+// logf 落盘日志（Log 未注入时静默，不 panic）
+func (st *AppState) logf(format string, args ...interface{}) {
+	if st.Log == nil {
+		return
+	}
+	st.Log(fmt.Sprintf(format, args...))
 }
 
 // NewAppState AppState 工厂（2026-08-31）：统一初始化事件广播集 + 消息队列 + 活动 drain + 轮次缓冲。
@@ -771,6 +785,7 @@ func (ap *App) reconfigureResolver() {
 		}
 		ap.state.Injects = kept
 		ap.state.mu.Unlock()
+		ap.state.logf("[inject] 附件 %s 载入失败（%s）→ 已从附件列表摘除，报错存根回传 LLM", id, reason)
 	}
 	res := inject.NewResolver(filepath.Join(ap.state.Agent.Cfg().Data.Dir, "inject"), onFail)
 	ap.resolver.Store(res)
@@ -1406,7 +1421,7 @@ func (ap *App) handleStripInjects(w http.ResponseWriter, r *http.Request) {
 	}
 	n := len(ap.state.Injects)
 	ap.state.mu.Unlock()
-	fmt.Printf("[inject] 手动剥离附件 %d 个（会话登记 %d 个）→ 侧车回写文本提示，后续调用不再发原内容\n", len(stripped), n)
+	ap.state.logf("[inject] 手动剥离附件 %d 个（会话登记 %d 个）→ 侧车回写文本提示，后续调用不再发原内容", len(stripped), n)
 	writeJSON(w, 200, map[string]interface{}{"ok": true, "stripped": stripped, "count": len(stripped)})
 }
 
@@ -1459,7 +1474,7 @@ func (ap *App) handleReset(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if recordPath != "" {
-		fmt.Printf("[reset] 旧会话全文已落盘：%s（%d 条消息）\n", recordPath, recordedMsgs)
+		ap.state.logf("[reset] 旧会话全文已落盘：%s（%d 条消息）", recordPath, recordedMsgs)
 	}
 	writeJSON(w, 200, map[string]interface{}{
 		"ok":          true,

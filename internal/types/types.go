@@ -28,7 +28,8 @@ type Function struct {
 // ContentPart 内容 part：主进程=透传管道（2026-09-20 解耦重构）。
 // 只认"带非空 type 字段的 JSON 对象"，负载原样转发给 LLM 端点（part 语义属于
 // LLM，如 llama-server 的 input_video / image_url / 未来新类型，主程序零感知）；
-// 4xx 降级类型无关，整条注入统一换文本存根。
+// 附件出问题的处置不再自动降级（2026-10-18 删 4xx 阶梯）：由人显式 POST
+// /strip-injects，把侧车永久回写成文本存根（inject.StripSidecar）。
 // Type/Text/Ref 是解析时提取的便捷字段（inject_ref 识别、降级、字符统计、
 // /history 展示用），不参与序列化。
 type ContentPart struct {

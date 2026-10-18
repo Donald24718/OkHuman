@@ -206,6 +206,7 @@ func main() {
 
 	// ---------- 服务状态（单实例） ----------
 	appState := server.NewAppState(cfg, root, a)
+	appState.Log = log // server 层落盘日志（2026-10-18 修 D：关键操作进 okhuman.log）
 
 	app := server.New(appState, &server.Hooks{
 		OnSessionRebuilt: func(a *server.AgentState) {
