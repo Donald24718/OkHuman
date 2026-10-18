@@ -33,12 +33,12 @@ func TestEventLogFlushPolicy(t *testing.T) {
 	el := newEventLog()
 	el.add(frame("delta", 1), "delta")
 	el.add(frame("delta", 2), "delta")
-	bs, latest, _, _ := el.takeSince(0)
+	bs, latest, _, _ := el.takeSince(0, 0)
 	if latest != 1 || len(bs) != 1 || len(bs[0].Frames) != 2 {
 		t.Fatalf("两条 delta 应在同一批：latest=%d bs=%v", latest, bs)
 	}
 	el.add(frame("tool_result", 3), "tool_result")
-	bs, latest, _, _ = el.takeSince(1)
+	bs, latest, _, _ = el.takeSince(1, 0)
 	if latest != 2 || len(bs) != 1 || len(bs[0].Frames) != 1 {
 		t.Fatalf("结构性帧应立即发车：latest=%d bs=%v", latest, bs)
 	}
@@ -48,15 +48,16 @@ func TestEventLogFlushPolicy(t *testing.T) {
 // 一个消费者落后超窗，不得影响另一个消费者取到的内容。
 func TestEventLogWindowGapAndIsolation(t *testing.T) {
 	el := newEventLog()
-	for i := 1; i <= 30; i++ {
+	n := maxEventBatches + 10
+	for i := 1; i <= n; i++ {
 		el.add(frame("run_start", i), "run_start") // 结构性 → 每帧一批
 	}
-	_, latest, _, _ := el.takeSince(0)
-	if latest != 30 {
-		t.Fatalf("应发车 30 批，得 %d", latest)
+	_, latest, _, _ := el.takeSince(0, 0)
+	if latest != n {
+		t.Fatalf("应发车 %d 批，得 %d", n, latest)
 	}
 	// 停在 0 的慢消费者：只能拿到窗口内批次，且必须被告知缺口
-	slow, _, gap, _ := el.takeSince(0)
+	slow, _, gap, _ := el.takeSince(0, 0)
 	if gap == 0 {
 		t.Fatal("落后超窗必须报缺口（前端据此走 /history 补）")
 	}
@@ -64,8 +65,8 @@ func TestEventLogWindowGapAndIsolation(t *testing.T) {
 		t.Fatalf("窗口应给 %d 批，得 %d", maxEventBatches, len(slow))
 	}
 	// 跟得上的快消费者：不受慢消费者影响，无缺口
-	fast, _, gap2, _ := el.takeSince(29)
-	if gap2 != 0 || len(fast) != 1 || fast[0].Seq != 30 {
+	fast, _, gap2, _ := el.takeSince(n-1, 0)
+	if gap2 != 0 || len(fast) != 1 || fast[0].Seq != n {
 		t.Fatalf("快消费者被影响：gap=%d bs=%v", gap2, fast)
 	}
 	// 字节上限同样能裁窗（一批含超大帧时按批数会低估）
@@ -73,7 +74,7 @@ func TestEventLogWindowGapAndIsolation(t *testing.T) {
 	for i := 1; i <= 4; i++ {
 		el2.add(strings.Repeat("x", 900<<10), "run_start")
 	}
-	if _, _, gap3, _ := el2.takeSince(0); gap3 == 0 {
+	if _, _, gap3, _ := el2.takeSince(0, 0); gap3 == 0 {
 		t.Fatal("超字节上限应裁窗并报缺口")
 	}
 }
@@ -83,7 +84,7 @@ func TestEventLogNewClientReplay(t *testing.T) {
 	el := newEventLog()
 	el.add(frame("run_start", 1), "run_start")
 	el.add(frame("delta", 2), "delta")
-	bs, _, _, fromStart := el.takeSince(-1)
+	bs, _, _, fromStart := el.takeSince(-1, 0)
 	if !fromStart || len(bs) == 0 || !strings.Contains(bs[0].Frames[0], "run_start") {
 		t.Fatalf("轮在跑时新客户端应从本轮开头拿：%v", bs)
 	}
@@ -91,7 +92,7 @@ func TestEventLogNewClientReplay(t *testing.T) {
 	el2 := newEventLog()
 	el2.add(frame("run_start", 1), "run_start")
 	el2.add(frame("run_end", 2), "run_end")
-	if bs2, _, _, _ := el2.takeSince(-1); len(bs2) != 0 {
+	if bs2, _, _, _ := el2.takeSince(-1, 0); len(bs2) != 0 {
 		t.Fatalf("无轮在跑时不得回放历史轮：%v", bs2)
 	}
 }
@@ -180,3 +181,40 @@ func min(a, b int) int {
 // 编译期确保 http/httptest 引用被用到（部分测试文件共享包级 import）
 var _ = http.MethodGet
 var _ = httptest.NewServer
+
+// 单次 poll 的批次上限：落后很多时不让客户端一次被整窗（最多 3MB）帧砸住，
+// 分批给、游标只推进已给的部分，客户端连续取就能追平（且不报缺口——没被挤掉）。
+func TestEventLogPollBatchLimit(t *testing.T) {
+	el := newEventLog()
+	n := maxEventBatches // 200 批，全在窗口内
+	for i := 1; i <= n; i++ {
+		el.add(frame("run_start", i), "run_start")
+	}
+	got := 0
+	cur := 0
+	rounds := 0
+	for {
+		bs, latest, gap, _ := el.takeSince(cur, maxPollBatches)
+		if gap != 0 {
+			t.Fatalf("窗口内不该报缺口：gap=%d", gap)
+		}
+		if len(bs) > maxPollBatches {
+			t.Fatalf("单次给了 %d 批，超上限 %d", len(bs), maxPollBatches)
+		}
+		if len(bs) == 0 {
+			break
+		}
+		got += len(bs)
+		cur = bs[len(bs)-1].Seq
+		if rounds++; rounds > 20 {
+			t.Fatal("追赶没收敛")
+		}
+		_ = latest
+	}
+	if got != n {
+		t.Fatalf("分批追赶应取回全部 %d 批，得 %d（%d 轮）", n, got, rounds)
+	}
+	if rounds != (n+maxPollBatches-1)/maxPollBatches {
+		t.Fatalf("追赶轮数异常：%d", rounds)
+	}
+}

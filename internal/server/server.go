@@ -1183,7 +1183,7 @@ func (ap *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 	})))
 	// 重放：优先走事件缓冲（原子、含尚未发车的帧）；本轮开头已被窗口挤掉时
 	// 回退 RoundBuf 整轮重放（保住"长轮中途重订也能补全本轮"的旧语义）
-	bs, _, _, fromRoundStart := ap.state.Evt.takeSince(-1)
+	bs, _, _, fromRoundStart := ap.state.Evt.takeSince(-1, 0)
 	if len(bs) > 0 && fromRoundStart {
 		conn.write(joinFrames(bs))
 	} else {
@@ -1206,7 +1206,7 @@ func (ap *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 			continue
 		case <-tick.C:
 		}
-		got, _, _, _ := ap.state.Evt.takeSince(cur)
+		got, _, _, _ := ap.state.Evt.takeSince(cur, 0)
 		if len(got) == 0 {
 			continue
 		}
@@ -1229,7 +1229,7 @@ func (ap *App) handleEventsPoll(w http.ResponseWriter, r *http.Request) {
 			s = n
 		}
 	}
-	bs, latest, gap, _ := ap.state.Evt.takeSince(s)
+	bs, latest, gap, _ := ap.state.Evt.takeSince(s, maxPollBatches)
 	if bs == nil {
 		bs = []eventBatch{}
 	}

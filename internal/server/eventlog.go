@@ -26,9 +26,15 @@ import (
 // 界面收尾与结构变化不该等一个节奏；delta / compress_delta 攒着，由消费者来取时
 // 或攒够 eventBatchBytes 时发车（不养后台定时器 goroutine）。
 const (
-	maxEventBatches = 10       // 滑动窗口：最近 10 批
+	// 滑动窗口。批数帽要够大：慢消费者（QQ 桥发一条 QQ 气泡要 1-2 秒，期间不读
+	// socket）落后时靠窗口补齐中间帧，10 批在工具调用密集的长轮里很容易被挤掉。
+	// 内存上限由字节帽兜住（3MB），批数放大只多元数据。
+	maxEventBatches = 200      // 滑动窗口：最近 200 批
 	maxEventBytes   = 3 << 20  // 窗口字节上限（一批可能含整条工具结果，光按批数会低估）
 	eventBatchBytes = 64 << 10 // 攒够这么多字节提前发车
+	// maxPollBatches 单次 poll 最多给多少批：落后很多时不让浏览器一次被 3MB 帧砸住
+	// 渲染，分批追赶（前端 200ms 一取 → 追赶速度远超产生速度）。
+	maxPollBatches = 50
 )
 
 // eventBatch 一次发车打包的 SSE 帧（Frames 里就是 /events 上的原始帧文本）
@@ -108,7 +114,9 @@ func (el *eventLog) trimLocked() {
 //
 // fromRoundStart 仅 s==-1 时有意义：true = 返回的批次确实从本轮开头开始
 // （false = 本轮开头已被窗口挤掉，调用方应改用 RoundBuf 整轮重放兜底）
-func (el *eventLog) takeSince(s int) (out []eventBatch, latest int, gap int, fromRoundStart bool) {
+// limitBatches ≤0 表示不限（SSE 连接自己消化）；>0 单次最多给这么多批，
+// 游标只推进已给的部分，客户端下次继续取（落后很多时分批追赶）。
+func (el *eventLog) takeSince(s int, limitBatches int) (out []eventBatch, latest int, gap int, fromRoundStart bool) {
 	el.mu.Lock()
 	defer el.mu.Unlock()
 	el.flushLocked()
@@ -130,6 +138,9 @@ func (el *eventLog) takeSince(s int) (out []eventBatch, latest int, gap int, fro
 	}
 	for _, b := range el.batches {
 		if b.Seq > s {
+			if limitBatches > 0 && len(out) >= limitBatches {
+				break
+			}
 			out = append(out, b)
 		}
 	}
