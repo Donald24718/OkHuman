@@ -1358,7 +1358,20 @@ func (ap *App) handleCompressNow(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 409, map[string]interface{}{"error": "run 进行中：等本轮结束再手动压缩"})
 		return
 	}
-	detail, did := a.CM().CompressNow()
+	// 压缩期间持 RunLock（running=true）：防新 run 与压缩并发改会话结构（上面的 409
+	// 只挡住"已开跑"的 run，不挡这一句之后挤进来的新 run）。
+	// 事件广播到 /events：前端聊天区出现与自动压缩一样的"压缩中"流式活卡 + 最终压缩卡
+	// （此前手动压缩没人订阅压缩事件，点按钮后界面全程无输出）。
+	// 注：手动压缩不造 run_start/run_end 帧（不占轮次缓冲）→ 压缩途中刷新页面看不到
+	// 已流出的部分，压完的卡片由 /status 的 compress 日志与 /history 兜住。
+	var detail string
+	var did bool
+	a.Lock.Run(func() error {
+		detail, did = a.Agent().CompressNowWithEvents(func(e types.AgentEvent) {
+			broadcastEvent(ap.state, e)
+		})
+		return nil
+	})
 	// detail 里带两个落盘路径（全文存档 / 总结文本），UI 直接显示
 	writeJSON(w, 200, map[string]interface{}{"ok": did, "did": did, "detail": detail})
 }

@@ -130,6 +130,13 @@ func main() {
 		client = llm.NewFakeLLM([]llm.FakeStep{
 			{Type: "tool", Name: "bash", Args: map[string]interface{}{"command": "echo hello-okhuman"}},
 			{Type: "text", Text: "（FakeLLM）命令已执行，输出见工具结果。"},
+			// 压缩请求（自动或手动）走这条：Deltas = 流式增量，让"压缩中"卡片在
+			// fake 模式下也能看到思考与正文逐段出现（演示/手测 UI 用）。
+			{Type: "compress", Text: "（FakeLLM）早前对话要点：任务、结论、待办。", Deltas: []types.Delta{
+				{Thinking: "（fake）先扫最旧一批消息…"},
+				{Text: "（fake）提炼任务与结论…"},
+				{Text: "（fake）写入滚动 summary。"},
+			}},
 		})
 	} else {
 		client = llm.NewOpenAiClient(llm.ClientConfig{BaseURL: cfg.LLM.BaseURL, Model: cfg.LLM.Model, APIKey: cfg.LLM.APIKey, TimeoutMS: cfg.LLM.TimeoutMS})
