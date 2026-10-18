@@ -39,6 +39,13 @@ type LLMCfg struct {
 	// 没有可配口径：agent 传 idleMs=0，客户端回落到 max(timeout_ms, 10 分钟)，
 	// 后端卡住就白挂 10 分钟，且与压缩路径的 context.stream_idle_sec 口径不一致。
 	StreamIdleSec int `json:"stream_idle_sec"`
+	// MaxResponseBytes LLM 单次响应总量上限（字节，2026-10-18 健壮性修 A）：
+	// 入站方向此前只有两处封顶（工具输出 32MB、HTTP 请求体 256MB），唯独"LLM
+	// 往回吐"这一路不设防——正文/思考/工具参数逐块累加、SSE 单行无上限、非流式
+	// 直接 Decode 整个 body。上游（代理层/后端）出 bug 或被换掉时疯狂吐内容 →
+	// 本进程内存无界增长（数据目录在 tmpfs，等于两头一起吃）。空闲计时器帮不上：
+	// 它每有字节就重置，慢速无限流可以永远跑。0 → 用内置默认 256MB。
+	MaxResponseBytes int64 `json:"max_response_bytes"`
 }
 
 type SystemPromptCfg struct {
@@ -96,7 +103,7 @@ func Default() *Config {
 	}
 	return &Config{
 		Server:       ServerCfg{Host: "127.0.0.1", Port: 8451},
-		LLM:          LLMCfg{BaseURL: "http://127.0.0.1:8080/v1", Model: "local", TimeoutSec: 300, StreamIdleSec: 120},
+		LLM:          LLMCfg{BaseURL: "http://127.0.0.1:8080/v1", Model: "local", TimeoutSec: 300, StreamIdleSec: 120, MaxResponseBytes: 256 << 20},
 		SystemPrompt: SystemPromptCfg{Dir: "prompts"},
 		Data:         DataCfg{Dir: filepath.Join(home, ".okhuman")},
 		Context:      ContextCfg{MaxTokens: 150000, KeepRecentChars: 60000, HardTruncChars: 150000, StreamIdleSec: 90, CharsPerToken: 1.5},

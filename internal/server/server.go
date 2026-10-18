@@ -242,7 +242,8 @@ func makeCm(a *AgentState) *ctxmgr.Manager {
 // llmCfgOf config.LLMCfg → llm.ClientConfig
 func llmCfgOf(c config.LLMCfg) llm.ClientConfig {
 	return llm.ClientConfig{BaseURL: c.BaseURL, Model: c.Model, APIKey: c.APIKey,
-		TimeoutMS: c.TimeoutSec * 1000, StreamIdleMS: c.StreamIdleSec * 1000}
+		TimeoutMS: c.TimeoutSec * 1000, StreamIdleMS: c.StreamIdleSec * 1000,
+		MaxResponseBytes: c.MaxResponseBytes}
 }
 
 func pushCompressLog(a *AgentState, e ctxmgr.CompressEvent) {
@@ -1605,12 +1606,13 @@ func (ap *App) handleConfigGet(w http.ResponseWriter, r *http.Request) {
 // 换算，见 config.NormalizeTimeUnits）。上限是防"把毫秒数值填进秒键"——旧
 // timeout_ms=300000 若被当成秒就是 3.5 天，必须挡在门外。
 var numChecks = map[string]func(interface{}) bool{
-	"port":              func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 && n < 65536 },
-	"timeout_sec":       func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 && n <= 86400 }, // ≤24h（秒）
-	"keep_recent_chars": func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 },
-	"hard_trunc_chars":  func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 },
-	"stream_idle_sec":   func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 && n <= 3600 }, // ≤1h（秒）
-	"max_tokens":        func(v interface{}) bool { n, ok := v.(float64); return ok && n > 100 },
+	"port":               func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 && n < 65536 },
+	"timeout_sec":        func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 && n <= 86400 }, // ≤24h（秒）
+	"keep_recent_chars":  func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 },
+	"hard_trunc_chars":   func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 },
+	"stream_idle_sec":    func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 && n <= 3600 },      // ≤1h（秒）
+	"max_response_bytes": func(v interface{}) bool { n, ok := v.(float64); return ok && n >= 1024 && n <= 4<<30 }, // 1KB–4GiB（字节）
+	"max_tokens":         func(v interface{}) bool { n, ok := v.(float64); return ok && n > 100 },
 	// chars_per_token：0/负数 → 估算 Infinity/恒超阈（每条消息白压一次）；过大 →
 	// 严重低估 → 永不压缩 → 撑爆模型上下文。英文 ~4 字符/token，20 已极宽松。
 	"chars_per_token": func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 && n <= 20 },

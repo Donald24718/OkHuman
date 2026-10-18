@@ -31,6 +31,8 @@ type ClientConfig struct {
 	// StreamIdleMS 主循环流式空闲超时（2026-10-18 A5，来自 llm.stream_idle_sec）：
 	// CompleteStream 传 idleMs=0 时用这个值，不再回落到 max(timeout_ms, 10 分钟)。
 	StreamIdleMS int
+	// MaxResponseBytes 单次响应总量上限（字节，0 → DefaultMaxResponseBytes）
+	MaxResponseBytes int64
 }
 
 // OpenAiClient 流式/非流式双方法
@@ -45,6 +47,65 @@ func NewOpenAiClient(cfg ClientConfig) *OpenAiClient {
 
 // Config 返回当前构造参数（热更新比对用）
 func (c *OpenAiClient) Config() ClientConfig { return c.cfg }
+
+// ---------- 响应体量闸（2026-10-18 健壮性修 A） ----------
+//
+// 闸放在 reader 层：正文/思考/工具参数/SSE 单行的所有累加都源自读到的字节，
+// 一处计数即覆盖全部累加点，不必逐个检查。
+
+// DefaultMaxResponseBytes 未配置时的响应总量上限（256MB，与 HTTP 请求体同档）
+const DefaultMaxResponseBytes int64 = 256 << 20
+
+// maxToolCallSlots 单次响应 tool_calls 槽位上限：总量闸管的是字节，海量小帧
+// 仍能把按 index 建的槽位表撑大（index 由上游给），故单独设条目闸。
+const maxToolCallSlots = 4096
+
+// ResponseTooLargeError LLM 响应超过上限 → 本轮终止。独立错误类型：不会被
+// 压缩路径"只重试 IdleTimeoutError"的逻辑误判成可重试。
+type ResponseTooLargeError struct {
+	LimitBytes int64
+	GotBytes   int64
+	What       string // "body" | "tool_call_slots"
+}
+
+func (e *ResponseTooLargeError) Error() string {
+	if e.What == "tool_call_slots" {
+		return fmt.Sprintf("LLM 响应 tool_calls 槽位超过上限 %d（已见 %d）→ 本轮终止", e.LimitBytes, e.GotBytes)
+	}
+	return fmt.Sprintf("LLM 响应体量超过上限 %d 字节（已读 %d）→ 本轮终止", e.LimitBytes, e.GotBytes)
+}
+
+// cappedReader 计数并在超过上限时报错
+type cappedReader struct {
+	r   io.Reader
+	max int64
+	n   int64
+}
+
+func (r *cappedReader) over() bool { return r.n > r.max }
+
+func (r *cappedReader) overErr() error {
+	return &ResponseTooLargeError{LimitBytes: r.max, GotBytes: r.n, What: "body"}
+}
+
+func (r *cappedReader) Read(p []byte) (int, error) {
+	if r.over() {
+		return 0, r.overErr()
+	}
+	n, err := r.r.Read(p)
+	r.n += int64(n)
+	if r.over() {
+		return n, r.overErr()
+	}
+	return n, err
+}
+
+func (c *OpenAiClient) maxRespBytes() int64 {
+	if c.cfg.MaxResponseBytes > 0 {
+		return c.cfg.MaxResponseBytes
+	}
+	return DefaultMaxResponseBytes
+}
 
 // ---------- 错误类型 ----------
 //
@@ -179,7 +240,11 @@ func (c *OpenAiClient) Complete(ctx context.Context, messages []types.Message, t
 			CacheN int `json:"cache_n"`
 		} `json:"timings"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&j); err != nil {
+	cr := &cappedReader{r: resp.Body, max: c.maxRespBytes()}
+	if err := json.NewDecoder(cr).Decode(&j); err != nil {
+		if cr.over() { // 超限优先报体量（JSON 报错会掩盖真实原因）
+			return nil, cr.overErr()
+		}
 		return nil, fmt.Errorf("LLM 响应 JSON 解析失败：%v", err)
 	}
 	respOut := &types.Response{}
@@ -327,7 +392,7 @@ func (c *OpenAiClient) CompleteStream(ctx context.Context, messages []types.Mess
 	tcAcc := map[int]*tcBuilder{}
 	var tcOrder []int
 
-	br := bufio.NewReaderSize(resp.Body, 1<<16)
+	br := bufio.NewReaderSize(&cappedReader{r: resp.Body, max: c.maxRespBytes()}, 1<<16)
 	for {
 		line, rerr := br.ReadString('\n')
 		if n := len(line); n > 0 {
@@ -338,6 +403,10 @@ func (c *OpenAiClient) CompleteStream(ctx context.Context, messages []types.Mess
 					var f sseFrame
 					if json.Unmarshal([]byte(payload), &f) == nil {
 						c.processFrame(&f, &content, &reasoning, finishReason, &usage, tcAcc, &tcOrder, onDelta)
+						if len(tcAcc) > maxToolCallSlots {
+							return nil, &ResponseTooLargeError{LimitBytes: maxToolCallSlots,
+								GotBytes: int64(len(tcAcc)), What: "tool_call_slots"}
+						}
 					}
 				}
 			}

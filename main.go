@@ -148,7 +148,7 @@ func main() {
 			}},
 		})
 	} else {
-		client = llm.NewOpenAiClient(llm.ClientConfig{BaseURL: cfg.LLM.BaseURL, Model: cfg.LLM.Model, APIKey: cfg.LLM.APIKey, TimeoutMS: cfg.LLM.TimeoutSec * 1000, StreamIdleMS: cfg.LLM.StreamIdleSec * 1000})
+		client = llm.NewOpenAiClient(llm.ClientConfig{BaseURL: cfg.LLM.BaseURL, Model: cfg.LLM.Model, APIKey: cfg.LLM.APIKey, TimeoutMS: cfg.LLM.TimeoutSec * 1000, StreamIdleMS: cfg.LLM.StreamIdleSec * 1000, MaxResponseBytes: cfg.LLM.MaxResponseBytes})
 	}
 
 	// 提示词：命令行目录 > config 的 system_prompt.dir（相对项目根）
