@@ -15,5 +15,7 @@
       "max_msgs_per_min": 20
     }
   ],
-  "markdown_enabled": true
+  "markdown_enabled": true,
+  "commands_enabled": true,
+  "command_openids": []
 }

@@ -31,6 +31,24 @@ cd "<本目录>" && go build -o okhuman-qq-bridge okhuman-qq-bridge.go
 
 **改完源码 = 没干活，重编 + 真实启动验证 = 才干完**（2026-09-20 老 bug 复发的根因就是忘了 go build，见 LESSONS.md）。
 
+## QQ 侧控制指令（2026-10-18）
+
+QQ 里发**整条恰好等于**指令的消息，桥就地处理、**不转给 agent、不入队、不发 ACK**，直接把结果回给发送者：
+
+| 指令 | 打到实例 | 干什么 |
+|---|---|---|
+| `/stop`（别名 `/停` `/停止` `/中断`） | `POST /stop` | 中断 agent 循环：取消在飞 LLM 请求；正在执行工具则本次工具跑完、在下次 LLM 调用前强停。已生成的 partial 保留进会话 |
+| `/restart`（别名 `/reset` `/重开` `/重置`） | `POST /reset` | 先停，再清未发消息队列 / 注入附件 / 未完成后台任务，换会话；旧会话全文落盘（路径只写进实例日志与 WebUI，**不进 QQ**） |
+
+要点：
+- **必须整条 = 指令**（`/stop 一下`、`帮我 /stop` 都算普通消息），防误伤。
+- `/stop` 不清队列：队列里还有未发消息的话会接着开新轮，回复里会写明条数并提示发 `/restart`。
+- `/restart` 会**等当前轮完全收尾**才换会话（长工具在飞时可能很久）。超过 180 秒没等到，回复会说明"请求已送达、实例会在当前轮结束后换会话"，不是失败。
+- 门控（config.json 顶层，与 `data_dir` 同级）：`commands_enabled`（默认 true）、`command_openids`（sender openid 白名单，空 = 该 bot 绑定的渠道内所有人可用；渠道本身已按 `channel_id` / `c2c:<openid>` 过滤）。**能发指令 = 能中断和清空该实例的会话**，接的是别人的 QQ 就把白名单填上。
+- 回复文案不带本机绝对路径（QQ 是外部渠道）。
+
+测试：`qq_commands_test.go`（识别与别名、白名单门控、端点调用与错误原样带出、旧实例无 `record` 字段的兼容、文案不泄漏本机路径、指令绝不转发给 agent、普通消息不受影响）。
+
 ## 配置（本目录 config.json，config.json.example 为模板）
 
 首次使用：`cp config.json.example config.json`，填入你自己的 app_id / client_secret / channel_id。

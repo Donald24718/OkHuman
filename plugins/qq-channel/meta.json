@@ -1,1 +1,1 @@
-{"summary": "QQ 频道桥（okhuman-qq-bridge）：把 OkHuman 接入 QQ 频道，频道消息与 agent 回复双向转发（Go 移植自 TS 版 qq-channel）"}
+{"summary": "QQ 频道桥（okhuman-qq-bridge）：把 OkHuman 接入 QQ 频道，频道消息与 agent 回复双向转发（Go 移植自 TS 版 qq-channel）；QQ 侧可发 /stop 中断 agent 循环、/restart 重置会话（commands_enabled + command_openids 门控）"}

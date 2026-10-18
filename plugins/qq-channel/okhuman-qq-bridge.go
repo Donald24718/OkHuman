@@ -372,7 +372,12 @@ type SharedCfg struct {
 	MaxMsgChars      int    `json:"max_msg_chars"`
 	SendFailStop     int    `json:"send_fail_stop"`
 	AckMessage       string `json:"ack_message"`
-	MarkdownEnabled  bool `json:"markdown_enabled"`
+	MarkdownEnabled  bool     `json:"markdown_enabled"`
+
+	// QQ 侧控制指令（2026-10-18）：/stop 中断 agent 循环，/restart 重置会话。
+	CommandsEnabled bool     `json:"commands_enabled"`
+	// 白名单（sender openid）。空 = 该 bot 绑定的渠道内任何人都可发指令。
+	CommandOpenIDs []string `json:"command_openids"`
 }
 
 type BridgeConfig struct {
@@ -393,6 +398,7 @@ func defaultSharedCfg() SharedCfg {
 		SendFailStop:     5,
 		AckMessage:       "收到",
 		MarkdownEnabled:  true,
+		CommandsEnabled:  true,
 	}
 }
 
@@ -519,6 +525,8 @@ type QQChannel struct {
 	onStream      func(string) error
 	onMessage     func(string) (string, error)
 	onAttachments func(string) error // 2026-09-15 方向A：附件落盘后 /inject 路径文本通知
+	onCommand     func(string) (string, error) // 2026-10-18：QQ 侧 /stop /restart
+	sendReplyFn   func(string, string) error  // 回复出口（默认 = sendReply；测试可注入）
 	logf          func(string)
 
 	mu             sync.Mutex
@@ -538,8 +546,9 @@ type QQChannel struct {
 
 func NewQQChannel(shared SharedCfg, bot BotCfg, dataDir string,
 	onStream func(string) error, onMessage func(string) (string, error),
-	onAttachments func(string) error, logf func(string)) *QQChannel {
-	return &QQChannel{
+	onAttachments func(string) error, onCommand func(string) (string, error),
+	logf func(string)) *QQChannel {
+	c := &QQChannel{
 		shared:        shared,
 		bot:           bot,
 		botID:         bot.AppID,
@@ -549,8 +558,11 @@ func NewQQChannel(shared SharedCfg, bot BotCfg, dataDir string,
 		onStream:      onStream,
 		onMessage:     onMessage,
 		onAttachments: onAttachments,
+		onCommand:     onCommand,
 		logf:          logf,
 	}
+	c.sendReplyFn = c.sendReply
+	return c
 }
 
 func (c *QQChannel) start() error {
@@ -1008,6 +1020,11 @@ func (c *QQChannel) handleMessage(m *qqMsg) {
 	if utf16len(content) > c.shared.MaxMsgChars {
 		text = jsslice(content, c.shared.MaxMsgChars)
 	}
+	// 6'. 控制指令（整条 = /stop 或 /restart 才算）：不进 agent、不入队、不发 ACK
+	if cmd, ok := agentCommandOf(text); ok {
+		c.handleAgentCommand(cmd, msgSenderID(m), chID)
+		return
+	}
 	c.logf(fmt.Sprintf("频道消息收到（channel=%s），转发 agent", chID))
 	// 7. 即时 ACK
 	if c.shared.AckMessage != "" {
@@ -1047,16 +1064,7 @@ func (c *QQChannel) handleC2CMessage(m *qqMsg) {
 		return
 	}
 	// 3. sender 抽取（user_openid 优先，逐级回退）
-	sender := ""
-	if m.Author != nil && m.Author.UserOpenID != nil && *m.Author.UserOpenID != "" {
-		sender = *m.Author.UserOpenID
-	} else if m.UserOpenID != nil && *m.UserOpenID != "" {
-		sender = *m.UserOpenID
-	} else if m.Author != nil && m.Author.ID != nil && *m.Author.ID != "" {
-		sender = *m.Author.ID
-	} else if m.ID != nil && *m.ID != "" {
-		sender = *m.ID
-	}
+	sender := msgSenderID(m)
 	if sender == "" {
 		return
 	}
@@ -1109,6 +1117,11 @@ func (c *QQChannel) handleC2CMessage(m *qqMsg) {
 	text := content
 	if utf16len(content) > c.shared.MaxMsgChars {
 		text = jsslice(content, c.shared.MaxMsgChars)
+	}
+	// 6'. 控制指令（整条 = /stop 或 /restart 才算）
+	if cmd, ok := agentCommandOf(text); ok {
+		c.handleAgentCommand(cmd, sender, "c2c:"+sender)
+		return
 	}
 	c.logf(fmt.Sprintf("私聊收到（sender=%s），转发 agent", sender))
 	// 7. 即时 ACK
@@ -1991,6 +2004,210 @@ func makeOnMessage(instanceURL, instanceID string) func(string) (string, error) 
 	}
 }
 
+// ---------- QQ 侧控制指令（2026-10-18）----------
+
+// agentCommandOf 识别整条消息是否为控制指令。必须整条 = 指令（"/stop 一下" 不算），
+// 免得正常说话里带个 /stop 就误伤。返回规范名 stop / restart。
+func agentCommandOf(text string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(text)) {
+	case "/stop", "/停", "/停止", "/中断":
+		return "stop", true
+	case "/restart", "/reset", "/重开", "/重置":
+		return "restart", true
+	}
+	return "", false
+}
+
+// msgSenderID 抽发送者标识（user_openid 优先，逐级回退），用于指令白名单
+func msgSenderID(m *qqMsg) string {
+	if m.Author != nil && m.Author.UserOpenID != nil && *m.Author.UserOpenID != "" {
+		return *m.Author.UserOpenID
+	}
+	if m.UserOpenID != nil && *m.UserOpenID != "" {
+		return *m.UserOpenID
+	}
+	if m.Author != nil && m.Author.ID != nil && *m.Author.ID != "" {
+		return *m.Author.ID
+	}
+	if m.ID != nil {
+		return *m.ID
+	}
+	return ""
+}
+
+// commandAllowed 指令门控：总开关 + 可选白名单（空 = 该 bot 绑定的渠道内所有人可用；
+// 渠道本身已在 handleMessage/handleC2CMessage 里按 channel_id / c2c:<openid> 过滤过）
+func (c *QQChannel) commandAllowed(sender string) bool {
+	if !c.shared.CommandsEnabled {
+		return false
+	}
+	if len(c.shared.CommandOpenIDs) == 0 {
+		return true
+	}
+	for _, o := range c.shared.CommandOpenIDs {
+		if strings.EqualFold(strings.TrimSpace(o), sender) && sender != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// handleAgentCommand 执行控制指令并把结果直接回给发送者：不进 agent、不入队、不发 ACK。
+// target = 回复目标（频道 = channel_id，私聊 = "c2c:<openid>"）。返回是否已消费该消息。
+func (c *QQChannel) handleAgentCommand(cmd, sender, target string) bool {
+	if !c.commandAllowed(sender) {
+		c.logf(fmt.Sprintf("控制指令被拒（cmd=%s sender=%s）：未启用或不在白名单", cmd, sender))
+		_ = c.sendReplyFn(target, "控制指令未开放（本 bot 未启用，或你不在白名单里）。")
+		return true
+	}
+	if c.onCommand == nil {
+		c.logf("控制指令无处理器（onCommand 为空）")
+		return true
+	}
+	reply, err := c.onCommand(cmd)
+	if err != nil {
+		c.logf(fmt.Sprintf("控制指令失败（cmd=%s）：%v", cmd, err))
+		_ = c.sendReplyFn(target, "指令执行失败："+err.Error())
+		return true
+	}
+	_ = c.sendReplyFn(target, reply)
+	c.logf(fmt.Sprintf("控制指令完成（cmd=%s sender=%s）：%s", cmd, sender, jsslice(reply, 120)))
+	return true
+}
+
+// queueSnap 实例 /queue 的快照（读失败返回零值，不影响主指令结果）
+type queueSnap struct {
+	running bool
+	queued  int
+	userSeq int
+}
+
+func queueSnapshot(base string) queueSnap {
+	res, err := (&http.Client{Timeout: 5 * time.Second}).Get(base + "/queue")
+	if err != nil {
+		return queueSnap{}
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	var j struct {
+		Running *bool    `json:"running"`
+		Queued  []string `json:"queued"`
+		UserSeq *int     `json:"user_seq"`
+	}
+	_ = json.Unmarshal(body, &j)
+	q := queueSnap{queued: len(j.Queued)}
+	if j.Running != nil {
+		q.running = *j.Running
+	}
+	if j.UserSeq != nil {
+		q.userSeq = *j.UserSeq
+	}
+	return q
+}
+
+// postAgentEndpoint 向实例发无 body 的 POST，返回解析后的 JSON（解析失败 = 空 map）与状态码
+func postAgentEndpoint(url string, timeout time.Duration) (map[string]interface{}, int, error) {
+	req, err := http.NewRequest("POST", url, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	res, err := (&http.Client{Timeout: timeout}).Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	j := map[string]interface{}{}
+	if len(body) > 0 {
+		_ = json.Unmarshal(body, &j)
+	}
+	return j, res.StatusCode, nil
+}
+
+func agentErrDetail(j map[string]interface{}) string {
+	if v, ok := j["error"].(string); ok && strings.TrimSpace(v) != "" {
+		return jsslice(strings.TrimSpace(v), 200)
+	}
+	return "（无错误详情）"
+}
+
+// makeOnCommand 控制指令 → 实例管理端点：
+//	stop    → POST /stop  ：取消在飞 LLM 请求；若正在执行工具，本次工具跑完后在下次 LLM 调用前强停。
+//	restart → POST /reset ：先停，再清未发消息队列/注入附件/后台任务，换会话（旧会话全文落盘）。
+// 文案里不带本机绝对路径（落盘路径只说"见实例日志/WebUI"）——QQ 是外部渠道。
+func makeOnCommand(instanceURL, instanceID string, logf func(string)) func(string) (string, error) {
+	return func(cmd string) (string, error) {
+		base := strings.TrimRight(instanceURL, "/")
+		switch cmd {
+		case "stop":
+			before := queueSnapshot(base)
+			j, code, err := postAgentEndpoint(base+"/stop", 10*time.Second)
+			if err != nil {
+				return "", fmt.Errorf("实例 %s /stop 请求失败：%v", instanceID, err)
+			}
+			if code < 200 || code >= 300 {
+				return "", fmt.Errorf("实例 %s /stop %d：%s", instanceID, code, agentErrDetail(j))
+			}
+			after := queueSnapshot(base)
+			sb := &strings.Builder{}
+			fmt.Fprintf(sb, "已中断 → 实例 %s（/stop %d）\n", instanceID, code)
+			fmt.Fprintf(sb, "中断前：running=%v，待发消息 %d 条\n", before.running, before.queued)
+			fmt.Fprintf(sb, "现在：running=%v，待发消息 %d 条\n", after.running, after.queued)
+			sb.WriteString("已生成的部分保留进会话，不会丢。")
+			if after.queued > 0 {
+				fmt.Fprintf(sb, "队列里还有 %d 条，会接着开新轮——要一并清空发 /restart。", after.queued)
+			}
+			return sb.String(), nil
+		case "restart":
+			j, code, err := postAgentEndpoint(base+"/reset", 180*time.Second)
+			if err != nil {
+				// /reset 会等当前轮完全收尾（长工具在飞时可能很久）。超时 ≠ 没生效：
+				// 请求已送达，实例会在当前轮结束后换会话。
+				if ue, ok := err.(*url.Error); ok && ue.Timeout() {
+					return "重置已送达实例 " + instanceID + "，但等当前轮收尾超过 180 秒" +
+						"（可能有长工具在跑）。实例会在当前轮结束后完成换会话——" +
+						"要立刻停掉在飞的先 /stop。", nil
+				}
+				return "", fmt.Errorf("实例 %s /reset 请求失败：%v", instanceID, err)
+			}
+			if code < 200 || code >= 300 {
+				return "", fmt.Errorf("实例 %s /reset %d：%s", instanceID, code, agentErrDetail(j))
+			}
+			sess := "?"
+			if v, ok := j["session"].(float64); ok {
+				sess = strconv.Itoa(int(v))
+			}
+			after := queueSnapshot(base)
+			sb := &strings.Builder{}
+			fmt.Fprintf(sb, "已重置会话 → 实例 %s（/reset %d）：新会话 #%s\n", instanceID, code, sess)
+			sb.WriteString("未发消息队列、注入附件、未完成后台任务已随会话清空。")
+			if rec, ok := j["record"].(string); ok {
+				if strings.TrimSpace(rec) == "" {
+					sb.WriteString("\n旧会话为空，未落盘存档。")
+				} else {
+					n := -1
+					if v, ok2 := j["record_msgs"].(float64); ok2 {
+						n = int(v)
+					}
+					if n >= 0 {
+						fmt.Fprintf(sb, "\n旧会话全文已落盘（%d 条消息，路径见实例日志与 WebUI）。", n)
+					} else {
+						sb.WriteString("\n旧会话全文已落盘（路径见实例日志与 WebUI）。")
+					}
+				}
+			} else {
+				sb.WriteString("\n（该实例版本不回报全文存档路径）")
+			}
+			if after.queued > 0 {
+				fmt.Fprintf(sb, "\n注意：重置后又有 %d 条消息在队列里。", after.queued)
+			}
+			return sb.String(), nil
+		default:
+			return "", fmt.Errorf("未知指令：%s", cmd)
+		}
+	}
+}
+
 // ---------- 启动 ----------
 
 func main() {
@@ -2078,6 +2295,7 @@ func main() {
 			makeOnStream(instURL, instanceID, logf),
 			makeOnMessage(instURL, instanceID),
 			makeOnAttachments(instURL, instanceID),
+			makeOnCommand(instURL, instanceID, logf),
 			func(m string) { logf("[bot=" + botID + "] " + m) })
 		started = append(started, ch)
 		go func(ch *QQChannel, instanceID, instURL string) {
