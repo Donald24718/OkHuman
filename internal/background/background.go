@@ -47,23 +47,31 @@ func NewRunLock() *RunLock {
 // Running 是否有 run 在执行
 func (l *RunLock) Running() bool { return l.running.Load() }
 
-// Run 排队执行 fn；返回 fn 的结果/错误，排队本身永不丢（上一个 run 即使失败也继续）
+// Run 排队执行 fn；返回 fn 的结果/错误，排队本身永不丢（上一个 run 即使失败也继续）。
+//
+// 释放动作全部在 defer 内（2026-10-18 健壮性修）：旧实现把"running=false + 唤醒
+// idleWaiters + 归还令牌"写在 fn() 之后，fn panic 时整段被跳过 → 令牌永久占住、
+// running 恒 true，此后所有 run（/chat /enqueue /reset /compress / 心跳 / 后台通知）
+// 永久阻塞，实例只能重启（实测：panic 穿过 Run 后 Running() 仍为 true，第二次 Run
+// 永久阻塞）。server 层的 recover 只把 panic 转成一条错误消息，救不了这把锁。
+// 这里不 recover——保持"panic 由上层统一隔离并报错"的既有语义，只保证锁一定归还。
 func (l *RunLock) Run(fn func() error) error {
 	l.ch <- struct{}{}
 	l.running.Store(true)
-	err := fn()
-	l.running.Store(false)
-	// 队列清空 → 通知所有 waitIdle（在 running=false 之后唤醒，
-	// 唤醒方看到的 running 已是最新值）
-	l.mu.Lock()
-	waiters := l.idleWaiters
-	l.idleWaiters = nil
-	l.mu.Unlock()
-	for _, w := range waiters {
-		w()
-	}
-	<-l.ch
-	return err
+	defer func() {
+		l.running.Store(false)
+		// 队列清空 → 通知所有 waitIdle（在 running=false 之后唤醒，
+		// 唤醒方看到的 running 已是最新值）
+		l.mu.Lock()
+		waiters := l.idleWaiters
+		l.idleWaiters = nil
+		l.mu.Unlock()
+		for _, w := range waiters {
+			w()
+		}
+		<-l.ch
+	}()
+	return fn()
 }
 
 // WaitIdle 等队列完全空闲（当前 run + 排队 run 都结束）；已空闲则立即返回。
@@ -93,7 +101,6 @@ type BackgroundOrchestrator struct {
 func NewOrchestrator() *BackgroundOrchestrator {
 	return &BackgroundOrchestrator{tasks: map[string]*types.PendingBackgroundTask{}}
 }
-
 
 // maxStoredResultBytes 任务表内 Result 的存储上限（256KB）：通知入队用的是
 // 完整结果（由 server 格式化），表里只留截断副本供 /backgrounds 查看。
