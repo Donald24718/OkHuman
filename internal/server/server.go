@@ -4,11 +4,11 @@
 //	GET  /health /status /queue /history /backgrounds /attachments
 //	GET  /events (SSE 常驻广播) /prompts /prompts/file /config
 //	GET  / /favicon.ico /marked.min.js (WebUI 静态)
-//	POST /chat /chat/stream (SSE) /enqueue /inject /drop /reset /stop
+//	POST /chat /enqueue /inject /drop /reset /stop
 //	POST /prompts/file /prompts/reload /config
 //
 // 单实例模型（§11）：一个进程 = 一个 agent；事件广播集 + 消息队列 +
-// 活动 drain + 轮次缓冲集中在 AppState，三入口（/chat /chat/stream /enqueue）
+// 活动 drain + 轮次缓冲集中在 AppState，两入口（/chat /enqueue）
 // 共享同一 drain（splice 队列不并发）。
 package server
 
@@ -366,7 +366,7 @@ func logRunEvent(a *AgentState, e types.AgentEvent) {
 }
 
 // makeOnEvent 本实例的统一事件回调：记日志（doom/bg）+ 广播给所有 /events 订阅者。
-// 所有 run 入口（/chat /chat/stream /enqueue 排空 / 定时任务触发）共用。
+// 所有 run 入口（/chat /enqueue 排空 / 定时任务触发）共用。
 func makeOnEvent(state *AppState, a *AgentState) func(types.AgentEvent) {
 	return func(e types.AgentEvent) {
 		logRunEvent(a, e)
@@ -377,7 +377,7 @@ func makeOnEvent(state *AppState, a *AgentState) func(types.AgentEvent) {
 // enqueueAndWake 唯一入队入口（2026-09-14）：在 state.mu 内原子完成
 // "取队列位置 + 入队 + 取/起活动 drain"——入队与 drain 的终止判定同一把锁，
 // 不存在"drain 正要退出时入队落空、消息挂起"的竞态（旧 startDrain 两把锁
-// 判定之间的窗口，2026-09-14 修）。四个调用方：/chat /chat/stream /enqueue
+// 判定之间的窗口，2026-09-14 修）。三个调用方：/chat /enqueue
 // 与后台 settle 通知（同一逻辑）。返回 handle（可等 done 读 res）+ 入队前
 // 队列已有条数。
 func enqueueAndWake(state *AppState, a *AgentState, msg string, onEvent func(types.AgentEvent)) (*drainHandle, int) {
@@ -793,8 +793,6 @@ func (ap *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ap.handleBackgrounds(w, r)
 	case r.Method == http.MethodPost && path == "/chat":
 		ap.handleChat(w, r)
-	case r.Method == http.MethodPost && path == "/chat/stream":
-		ap.handleChatStream(w, r)
 	case r.Method == http.MethodPost && path == "/enqueue":
 		ap.handleEnqueue(w, r)
 	case r.Method == http.MethodGet && path == "/events":
@@ -1016,7 +1014,7 @@ func (ap *App) handleBackgrounds(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ---------- /chat /chat/stream /enqueue ----------
+// ---------- /chat /enqueue ----------
 
 func (ap *App) handleChat(w http.ResponseWriter, r *http.Request) {
 	b := tryReadJSON(r)
@@ -1033,7 +1031,7 @@ func (ap *App) handleChat(w http.ResponseWriter, r *http.Request) {
 		broadcastEvent(ap.state, e)
 	}
 	started := time.Now()
-	// 入队 + 活动 drain（2026-08-31，同 /chat/stream）：运行中发的消息合并成一条一起发
+	// 入队 + 活动 drain（2026-08-31）：运行中发的消息合并成一条一起发
 	h, _ := enqueueAndWake(ap.state, a, message, onEvent)
 	<-h.done
 	if h.res.Err != nil {
@@ -1074,22 +1072,8 @@ func (c *sseConn) push(event string, data interface{}) {
 	c.write(fmt.Sprintf("event: %s\ndata: %s\n\n", event, jsonStr(data)))
 }
 
-// heartbeat 5s 心跳保活（同 TS）：LLM 思考 / 工具执行期间可能长时间无事件，
-// 防空闲超时机制（反向代理）掐断长连接。
-func (c *sseConn) heartbeat() {
-	go func() {
-		t := time.NewTicker(5 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-t.C:
-				c.write(": ping\n\n")
-			case <-c.done:
-				return
-			}
-		}
-	}()
-}
+// 5s 保活 ping 现在只在 handleEvents 里发（本连接自己的 ticker）——
+// 旧的 sseConn.heartbeat 随 /chat/stream 一起删了（它只服务那个端点）。
 
 func (c *sseConn) close() {
 	c.mu.Lock()
@@ -1098,34 +1082,16 @@ func (c *sseConn) close() {
 	close(c.done)
 }
 
-func (ap *App) handleChatStream(w http.ResponseWriter, r *http.Request) {
-	b := tryReadJSON(r)
-	message, _ := b["message"].(string)
-	if message == "" {
-		writeJSON(w, 400, map[string]interface{}{"error": `body 需为 { "message": "..." }`})
-		return
-	}
-	a := ap.state.Agent
-	conn := newSSE(w)
-	conn.heartbeat()
-	onEvent := func(e types.AgentEvent) {
-		// doom/bg 事件记日志 + 广播到 /events（2026-08-31 方案A：刷新后新连接也能收全）
-		logRunEvent(a, e)
-		broadcastEvent(ap.state, e)
-		// 本流也推全量事件（API 流式客户端兼容；WebUI 走 /enqueue + /events，不用本端点）
-		conn.push(strOf(e["type"]), e)
-	}
-	h, queuedBefore := enqueueAndWake(ap.state, a, message, onEvent)
-	conn.push("start", map[string]interface{}{"message": message, "queued_before": queuedBefore})
-	<-h.done
-	if h.res.Err != nil {
-		conn.push("error", map[string]interface{}{"message": h.res.Err.Error()})
-		// run 抛错 → 停止排空（队列保留，下次 /chat 或 /enqueue 触发时继续）
-	} else {
-		conn.push("finish", map[string]interface{}{"reply": h.res.Reply, "ms": h.res.MS})
-	}
-	conn.close()
-}
+// /chat/stream 已删除（2026-10-18 健壮性复查，主人定）：它是"同步流式"端点——
+// run 每产生一个事件就在 **run 自己的 goroutine 里**往该连接的 socket 写一帧，
+// 而 sseConn.write 无 deadline。对端不读 → 内核缓冲填满 → write 挂住 → run 回不到
+// "读 LLM 下一批字节"那一步：轻则空闲计时器误判"模型没响应"把本轮判死，重则本轮
+// 永不结束、运行锁一直被占，队列里所有消息一起等，实例对外不回话只能重启。
+// 这正是修 B 消灭的模式（修 B 只覆盖了 /events，这个端点漏了）。
+// 插件契约改为：流式一律 POST /enqueue（异步入队）+ GET /events（SSE 订阅）或
+// GET /events/poll（短轮询）——那两个通道是"内核只写内存、消费者按自己节奏取"，
+// 慢客户端只卡自己，落后超窗还会明确报 gap 让调用方走 /history 补。
+// 本机三方（QQ 桥 / 语音 / WebUI）本来就走 /enqueue + /events，删除不影响它们。
 
 // handleEnqueue 统一入队（2026-08-31）：走队列/drain 机制。
 // queuedBefore/position 在 enqueueAndWake 的同一把锁内取出（2026-09-14 起
