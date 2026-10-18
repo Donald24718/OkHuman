@@ -139,8 +139,9 @@ type drainResult struct {
 type AppState struct {
 	Root         string // 项目根（webui 静态文件 / config/user.json 落盘用）
 	Agent        *AgentState
-	mu           sync.Mutex // 保护下面全部字段
-	Evt          *eventLog  // 事件批次缓冲（发车机制内核，见 eventlog.go）
+	mu           sync.Mutex   // 保护下面全部字段
+	Evt          *eventLog    // 事件批次缓冲（发车机制内核，见 eventlog.go）
+	pollReqs     atomic.Int64 // /events/poll 累计次数（访问日志汇总用，不逐条记）
 	MessageQueue []string
 	ActiveDrain  *drainHandle
 	RoundBuf     *roundBuf
@@ -597,7 +598,7 @@ type PatchResult struct {
 //	需重启的段：server / data / system_prompt。
 //
 // 返回 { applied: 即时生效的段, restart: 需要重启才生效的段 }。
-func applyConfigPatch(a *AgentState, patch map[string]interface{}) PatchResult {
+func applyConfigPatch(a *AgentState, patch map[string]interface{}, logf func(format string, args ...interface{})) PatchResult {
 	applied := []string{}
 	restart := []string{}
 	has := func(s string) bool { _, ok := patch[s]; return ok }
@@ -635,6 +636,7 @@ func applyConfigPatch(a *AgentState, patch map[string]interface{}) PatchResult {
 	nc := config.DeepMerge(old, patch)
 	if has("llm") && llmCfgOf(nc.LLM) != llmCfgOf(old.LLM) {
 		client := llm.NewOpenAiClient(llmCfgOf(nc.LLM))
+		client.SetLogger(func(m string) { logf("%s", m) }) // 热更重建的客户端也要有协议层异常留痕（畸形帧等）
 		a.llmMu.Lock()
 		a.LLM = client
 		a.llmMu.Unlock()
@@ -739,7 +741,7 @@ func reloadAgentPrompt(a *AgentState) prompt.Loaded {
 // Hooks /reset 重建会话后回调（重挂落盘监听）；配置页保存后回调（入口落盘 config/user.json 用）
 type Hooks struct {
 	OnSessionRebuilt func(a *AgentState)
-	OnConfigSaved    func(patch map[string]interface{})
+	OnConfigSaved    func(patch map[string]interface{}) error // 返回 error = 内存已生效但落盘失败
 }
 
 // App HTTP 应用（实现 http.Handler）
@@ -777,8 +779,50 @@ func (ap *App) reconfigureResolver() {
 	ctxmgr.ConfigureInjectResolver(res)
 }
 
-// ServeHTTP 路由（与 TS 端点全集一一对应）
+// statusRecorder 只为拿到响应状态码。**必须显式转发 Flush**：SSE 端点里
+// newSSE 做 w.(http.Flusher) 断言，内嵌 ResponseWriter 不会自动实现 Flusher，
+// 忘了转发 → 断言失败 → 事件流不再 flush（表现为"连上了但收不到东西"）。
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// ServeHTTP 访问日志（2026-10-18 复查修 3）：以前实例根本不记请求路径，
+// 于是"有没有人在用某个端点"这类问题永远无法回答（判断 /chat/stream 能不能删、
+// 外部插件有没有按旧文档调用，都卡在这）。只记 method/path/status/耗时——
+// **绝不记 body 与 query**：body 里是会话内容与附件路径，query 里也无必要信息。
+//
+// /events/poll 例外：WebUI 每 200ms 一次，逐条记会把日志刷爆 → 只累计数，
+// 每 1000 次打一行汇总。/events（SSE）逐条记：一行 = 一条长连接的建立到关闭，
+// 耗时即连接存活时长，正好是 QQ 桥 / 语音重连痕迹。
 func (ap *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+	if path == "/events/poll" {
+		ap.route(w, r)
+		if n := ap.state.pollReqs.Add(1); n%1000 == 0 {
+			ap.state.logf("[http] GET /events/poll 累计 %d 次（WebUI 短轮询，不逐条记）", n)
+		}
+		return
+	}
+	start := time.Now()
+	rec := &statusRecorder{ResponseWriter: w, status: 200}
+	ap.route(rec, r)
+	ap.state.logf("[http] %s %s → %d (%dms)", r.Method, path, rec.status, time.Since(start).Milliseconds())
+}
+
+// route 路由本体（与 TS 端点全集一一对应）
+func (ap *App) route(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	switch {
 	case r.Method == http.MethodGet && path == "/health":
@@ -1698,11 +1742,34 @@ func (ap *App) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// 应用（单实例：全局 = 本实例）
-	rl := applyConfigPatch(ap.state.Agent, patch)
+	rl := applyConfigPatch(ap.state.Agent, patch, ap.state.logf)
+	// 落盘结果必须如实上报（2026-10-18 复查修 1）：旧实现把 AtomicWriteFile 的错误
+	// 吞掉，无论成败都打"已保存并即时生效"并回 ok:true → 盘满/只读/权限变了时，
+	// 用户以为改动扛得住重启，实际重启后回到旧值，且日志里查不到失败痕迹。
+	// 现在：内存里确实生效了（applyConfigPatch 已做），但 saved 单独表态。
+	saved := true
+	var saveErr string
 	if ap.hooks != nil && ap.hooks.OnConfigSaved != nil {
-		ap.hooks.OnConfigSaved(patch)
+		if err := ap.hooks.OnConfigSaved(patch); err != nil {
+			saved = false
+			saveErr = err.Error()
+			ap.state.logf("[config] ⚠ 配置已在内存生效，但落盘 config/user.json 失败：%s —— 重启后会回到旧值", saveErr)
+		}
 	}
-	writeJSON(w, 200, map[string]interface{}{"ok": true, "scope": "global", "applied": rl.Applied, "restart": rl.Restart, "unit_notes": unitNotes})
+	if saved {
+		keys := make([]string, 0, len(patch))
+		for k := range patch {
+			keys = append(keys, k)
+		}
+		ap.state.logf("[config] 全局配置已保存并即时生效（落盘 config/user.json）：%s", strings.Join(keys, ", "))
+	}
+	resp := map[string]interface{}{"ok": true, "scope": "global", "saved": saved,
+		"applied": rl.Applied, "restart": rl.Restart, "unit_notes": unitNotes}
+	if !saved {
+		resp["save_error"] = saveErr
+		resp["warning"] = "配置已在本次运行生效，但未能写入 config/user.json —— 重启后会回到旧值（原因见 save_error）"
+	}
+	writeJSON(w, 200, resp)
 }
 
 // ---------- WebUI 静态页面（2026-08-29） ----------

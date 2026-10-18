@@ -149,6 +149,9 @@ func main() {
 		})
 	} else {
 		client = llm.NewOpenAiClient(llm.ClientConfig{BaseURL: cfg.LLM.BaseURL, Model: cfg.LLM.Model, APIKey: cfg.LLM.APIKey, TimeoutMS: cfg.LLM.TimeoutSec * 1000, StreamIdleMS: cfg.LLM.StreamIdleSec * 1000, MaxResponseBytes: cfg.LLM.MaxResponseBytes})
+		if oc, ok := client.(*llm.OpenAiClient); ok {
+			oc.SetLogger(log) // 协议层异常（畸形帧等）要进 okhuman.log，否则无从查起
+		}
 	}
 
 	// 提示词：命令行目录 > config 的 system_prompt.dir（相对项目根）
@@ -218,13 +221,10 @@ func main() {
 			_ = p.SaveSession(&persist.Snapshot{No: int(a.SessionNo.Load()), Seq: a.CM().GetSeq(), State: a.CM().Session()})
 			log(fmt.Sprintf("[OkHuman] 会话已重置 #%d，落盘监听已重挂（空会话已落盘）", int(a.SessionNo.Load())))
 		},
-		OnConfigSaved: func(patch map[string]interface{}) {
-			saveGlobalConfigPatch(root, patch)
-			keys := make([]string, 0, len(patch))
-			for k := range patch {
-				keys = append(keys, k)
-			}
-			log(fmt.Sprintf("[config] 全局配置已保存并即时生效（落盘 config/user.json）：%s", strings.Join(keys, ", ")))
+		// 只负责写盘并把错误如实返回；留痕与响应由 server 层统一做（见 handleConfigPost），
+		// 否则日志取决于 hook 实现，测试与真实路径会不一致（2026-10-18 复查修 1）。
+		OnConfigSaved: func(patch map[string]interface{}) error {
+			return saveGlobalConfigPatch(root, patch)
 		},
 	})
 
@@ -322,7 +322,9 @@ func newPersistSave(p *persist.Persistence, currentNo func() int, bornNo int, lo
 	}
 }
 
-func saveGlobalConfigPatch(root string, patch map[string]interface{}) {
+// saveGlobalConfigPatch 把补丁合并进 config/user.json。返回写盘错误（调用方必须
+// 如实上报，不能只说"已保存"——见 OnConfigSaved）。
+func saveGlobalConfigPatch(root string, patch map[string]interface{}) error {
 	cfgSaveMu.Lock()
 	defer cfgSaveMu.Unlock()
 	file := filepath.Join(root, "config", "user.json")
@@ -368,5 +370,5 @@ func saveGlobalConfigPatch(root string, patch map[string]interface{}) {
 		}
 	}
 	out, _ := json.MarshalIndent(next, "", "  ")
-	_ = persist.AtomicWriteFile(file, string(out))
+	return persist.AtomicWriteFile(file, string(out))
 }

@@ -127,6 +127,10 @@ type Response struct {
 	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 	FinishReason     *string    `json:"finish_reason,omitempty"`
 	Usage            Usage      `json:"usage"`
+	// BadFrames：流式响应里解析不出来的帧数（2026-10-18 复查修 2）。旧实现把畸形帧
+	// 直接跳过、不留任何痕迹 → 回复少了一截无从查起。现在计数随响应带出，并在
+	// 客户端日志里留痕；超阈值直接报错终止本轮（见 llm.MalformedStreamError）。
+	BadFrames int `json:"bad_frames,omitempty"`
 }
 
 // Delta 流式增量

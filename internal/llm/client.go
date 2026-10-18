@@ -39,7 +39,11 @@ type ClientConfig struct {
 type OpenAiClient struct {
 	cfg  ClientConfig
 	http *http.Client
+	logf func(string) // 可观测事件（畸形帧等）落日志；未注入则只计数不打印
 }
+
+// SetLogger 注入日志通道（畸形帧等协议层异常需要留痕，否则"回复少了一截"无从查起）。
+func (c *OpenAiClient) SetLogger(fn func(string)) { c.logf = fn }
 
 func NewOpenAiClient(cfg ClientConfig) *OpenAiClient {
 	return &OpenAiClient{cfg: cfg, http: &http.Client{}}
@@ -116,6 +120,30 @@ func (c *OpenAiClient) maxRespBytes() int64 {
 
 // HTTPError LLM 返回非 2xx。Error() 串格式 "LLM <status>: <body前500>"
 // （与 TS 版一致，日志口径不变）
+// MalformedStreamError 流式响应里畸形帧过多（2026-10-18 复查修 2）：少量畸形帧
+// （代理截断、半行、非标准实现）记日志 + 计数后继续；多到这个量级说明上游在持续
+// 吐我们读不懂的东西，继续跑只会得到一条"少了不知道多少"的回复 → 明确报错。
+type MalformedStreamError struct {
+	Count int
+	Bytes int
+}
+
+func (e *MalformedStreamError) Error() string {
+	return fmt.Sprintf("流式响应畸形帧过多（%d 帧 / %d 字节解析失败）", e.Count, e.Bytes)
+}
+
+const (
+	maxMalformedFrames = 200 // 超过即判定上游异常，终止本轮
+	malformedLogLimit  = 5   // 明细日志最多打几条，防刷屏
+)
+
+func snippetForLog(s string) string {
+	if len(s) > 120 {
+		return s[:120] + "…"
+	}
+	return s
+}
+
 type HTTPError struct {
 	Status int
 	Body   string
@@ -336,6 +364,11 @@ func (c *OpenAiClient) idleFallback() time.Duration {
 }
 
 func (c *OpenAiClient) CompleteStream(ctx context.Context, messages []types.Message, tools []types.ToolSpec, onDelta func(types.Delta), idleMs int) (*types.Response, error) {
+	// 测试里发现的真隐患：processFrame 无条件调 onDelta，调用方传 nil 就 panic
+	//（生产里 agent 总传闭包所以没炸过）。归一化一次，下游不必处处防。
+	if onDelta == nil {
+		onDelta = func(types.Delta) {}
+	}
 	data, err := c.buildBody(messages, tools, true)
 	if err != nil {
 		return nil, err
@@ -387,6 +420,7 @@ func (c *OpenAiClient) CompleteStream(ctx context.Context, messages []types.Mess
 
 	content := ""
 	reasoning := ""
+	badFrames, badBytes := 0, 0
 	finishReason := new(string)
 	usage := types.Usage{}
 	tcAcc := map[int]*tcBuilder{}
@@ -406,6 +440,20 @@ func (c *OpenAiClient) CompleteStream(ctx context.Context, messages []types.Mess
 						if len(tcAcc) > maxToolCallSlots {
 							return nil, &ResponseTooLargeError{LimitBytes: maxToolCallSlots,
 								GotBytes: int64(len(tcAcc)), What: "tool_call_slots"}
+						}
+					} else {
+						// 畸形帧：旧实现是 if err == nil { 处理 }，失败侧什么都没有 →
+						// 那一帧内容静默蒸发，回复短了一截却查不到原因。
+						badFrames++
+						badBytes += len(payload)
+						if c.logf != nil && badFrames <= malformedLogLimit {
+							c.logf(fmt.Sprintf("[llm] 畸形帧 #%d（%d 字节，解析失败）：%s", badFrames, len(payload), snippetForLog(payload)))
+						}
+						if badFrames >= maxMalformedFrames {
+							if c.logf != nil {
+								c.logf(fmt.Sprintf("[llm] 畸形帧已达 %d 帧 → 终止本轮（上游在持续吐读不懂的内容）", badFrames))
+							}
+							return nil, &MalformedStreamError{Count: badFrames, Bytes: badBytes}
 						}
 					}
 				}
@@ -444,6 +492,7 @@ func (c *OpenAiClient) CompleteStream(ctx context.Context, messages []types.Mess
 		ToolCalls:    toolCalls,
 		FinishReason: finishReason,
 		Usage:        usage,
+		BadFrames:    badFrames, // 少量畸形帧时照常返回，但把"丢了几帧"带出来
 	}
 	if reasoning != "" {
 		respOut.ReasoningContent = &reasoning
