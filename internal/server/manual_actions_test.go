@@ -5,6 +5,7 @@ package server
 // 处置由人按 WebUI 按钮（重置会话右边两个）。
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"okhuman/internal/config"
 	"okhuman/internal/llm"
@@ -26,7 +28,10 @@ func TestStripInjectsAndManualCompress(t *testing.T) {
 	cfg.Context.KeepRecentChars = 40 // 保留预算压到极小 → 老消息可压，手动压缩有活干
 	fake := llm.NewFakeLLM([]llm.FakeStep{
 		{Type: "text", Text: "收到附件"},
-		{Type: "compress", Text: "手动压缩的总结"},
+		{Type: "compress", Text: "手动压缩的总结", Deltas: []types.Delta{
+			{Thinking: "先扫最旧一批"},
+			{Text: "手动压缩的总结"},
+		}},
 	})
 	a := CreateAgentState(cfg, fake, "sys", []PromptFileInfo{}, true, "")
 	st := NewAppState(cfg, t.TempDir(), a)
@@ -104,11 +109,65 @@ func TestStripInjectsAndManualCompress(t *testing.T) {
 		t.Fatalf("/chat code=%d body=%v", code, chat)
 	}
 
-	// 4) 手动压缩：不等阈值，立刻压最旧一批
-	var cmp map[string]interface{}
-	if code := do(http.MethodPost, "/compress", map[string]interface{}{}, &cmp); code != 200 {
-		t.Fatalf("/compress code=%d body=%v", code, cmp)
+	// 4) 手动压缩：不等阈值，立刻压最旧一批。
+	//    同时订阅 /events —— 点按钮后聊天区必须像自动压缩那样流式出现压缩思考/正文
+	//    （此前手动压缩没人订阅压缩事件，界面全程无输出）。
+	evConn, err := srv.Client().Get(srv.URL + "/events")
+	if err != nil {
+		t.Fatalf("订阅 /events: %v", err)
 	}
+	defer evConn.Body.Close()
+	br := bufio.NewReader(evConn.Body)
+	seenDeltaThinking, sawCompressFrame := "", false
+	// 兜底：读不到最终 compress 帧时别把测试挂死
+	time.AfterFunc(20*time.Second, func() { _ = evConn.Body.Close() })
+
+	// 压缩在另一个 goroutine 打（主线程读事件流），结果经 channel 取回——
+	// 不再补打第二次 /compress（第二次可能因"已压完无可压"返回 did=false → 测试不稳）
+	type compressRes struct {
+		code int
+		body map[string]interface{}
+	}
+	resCh := make(chan compressRes, 1)
+	go func() {
+		var c map[string]interface{}
+		resCh <- compressRes{do(http.MethodPost, "/compress", map[string]interface{}{}, &c), c}
+	}()
+
+	var cmp map[string]interface{}
+	for {
+		line, rerr := br.ReadString('\n')
+		if rerr != nil {
+			t.Fatalf("读 /events 帧失败（未看到 compress 帧）：%v；已见 delta 思考=%q", rerr, seenDeltaThinking)
+		}
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "event: ") {
+			continue
+		}
+		evName := strings.TrimPrefix(line, "event: ")
+		data, _ := br.ReadString('\n')
+		if evName == "compress_delta" && strings.Contains(data, "先扫最旧一批") {
+			seenDeltaThinking = strings.TrimSpace(data)
+		}
+		if evName == "compress" {
+			sawCompressFrame = true
+			if seenDeltaThinking == "" {
+				t.Errorf("手动压缩期间没收到 compress_delta 思考流帧")
+			}
+			if !strings.Contains(data, "手动压缩的总结") {
+				t.Errorf("compress 帧应带压缩后正文：%s", data)
+			}
+			break
+		}
+	}
+	if !sawCompressFrame {
+		t.Fatalf("未在 /events 上看到 compress 帧")
+	}
+	res := <-resCh
+	if res.code != 200 {
+		t.Fatalf("/compress code=%d body=%v", res.code, res.body)
+	}
+	cmp = res.body
 	if did, _ := cmp["did"].(bool); !did {
 		t.Fatalf("/compress 应真的压了: %v", cmp)
 	}

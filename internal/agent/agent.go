@@ -142,6 +142,63 @@ func (a *Agent) Stop() {
 	}
 }
 
+// CompressNowWithEvents 手动压缩（WebUI「手动压缩上下文」按钮 / POST /compress，
+// 2026-10-18）。与 run 内自动压缩的差别只在"谁触发"：压缩事件走与 run 同一条 emit
+// 通道（compress_delta / compress）→ 前端聊天区能看到压缩思考与正文的流式活卡。
+// 此前只有 run 注册了压缩监听（run 结束即注销），手动压缩时没人订阅 → 点完按钮
+// 界面全程无输出，只能等 HTTP 响应。
+// 压缩流挂新建的 runCtx 并登记 a.runCancel → /stop 能中断它（与 run 内压缩同一条中止
+// 路径；中断后 session 不变）。调用方须持 RunLock（server 侧 a.Lock.Run），否则新 run
+// 会与压缩并发改会话结构。
+func (a *Agent) CompressNowWithEvents(emit func(types.AgentEvent)) (string, bool) {
+	if emit == nil {
+		emit = func(types.AgentEvent) {}
+	}
+	runCtx, runCancel := context.WithCancel(context.Background())
+	a.mu.Lock()
+	a.runCancel = runCancel
+	a.mu.Unlock()
+	a.cm.SetRunSignal(&runCtx)
+
+	offDelta := a.cm.AddCompressDeltaListener(func(scope string, d types.Delta) {
+		if d.Thinking != "" || d.Text != "" {
+			ev := types.AgentEvent{"type": "compress_delta", "scope": scope}
+			if d.Thinking != "" {
+				ev["thinking"] = d.Thinking
+			}
+			if d.Text != "" {
+				ev["text"] = d.Text
+			}
+			emit(ev)
+		}
+	})
+	offCompress := a.cm.AddCompressListener(func(e ctxmgr.CompressEvent) {
+		ev := types.AgentEvent{
+			"type":         "compress",
+			"scope":        e.Scope,
+			"detail":       e.Detail,
+			"before_chars": e.BeforeChars,
+			"after_chars":  e.AfterChars,
+			"rounds":       e.Rounds,
+			"text":         e.Text,
+		}
+		if e.Thinking != nil {
+			ev["thinking"] = *e.Thinking
+		}
+		emit(ev)
+	})
+	defer func() {
+		offDelta()
+		offCompress()
+		a.cm.SetRunSignal(nil)
+		a.mu.Lock()
+		a.runCancel = nil
+		a.mu.Unlock()
+		runCancel()
+	}()
+	return a.cm.CompressNow()
+}
+
 // Run 处理一条用户消息（HTTP /chat 入口）：跑完整轮工具循环，返回最终文本。
 // 调用方必须持有运行锁（同 agent 内串行）。
 func (a *Agent) Run(ctx context.Context, userText string, opt RunOptions) (string, error) {
