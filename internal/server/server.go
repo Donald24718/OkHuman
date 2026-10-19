@@ -807,7 +807,7 @@ var noisyGetPaths = map[string]bool{
 	"/queue": true, "/status": true, "/health": true, "/history": true, "/events/poll": true,
 }
 
-// noisyLogWindow 高频端点汇总行的最小间隔（2026-10-19 主人定：一小时一行）。
+// noisyLogWindow 高频端点汇总行的最小间隔（2026-10-19 定案：一小时一行）。
 // 按时间窗而不是按次数：按次数（曾定 3000）依赖速率恒定，WebUI 多开一个标签页
 // 或关掉，换算就失真；按时间窗则与速率无关，且每行报的是这一小时内的次数，
 // 速率涨跌一眼能看出来。每个端点独立计时，互不影响。
