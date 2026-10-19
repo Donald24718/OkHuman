@@ -29,12 +29,16 @@ func TestAccessLogRecordsEndpoints(t *testing.T) {
 	srv := httptest.NewServer(ap)
 	defer srv.Close()
 
-	for _, p := range []string{"/queue", "/status", "/health", "/history", "/events/poll?since=-1"} {
-		res, err := srv.Client().Get(srv.URL + p)
-		if err != nil {
-			t.Fatal(err)
+	// 高频端点连打 200 次：汇总行按时间窗（一小时）触发，不看次数，所以这里
+	// 一行都不该出现（证明不是"每 N 次一行"那种按次数的老写法）。
+	for i := 0; i < 200; i++ {
+		for _, p := range []string{"/queue", "/status", "/health", "/history", "/events/poll?since=-1"} {
+			res, err := srv.Client().Get(srv.URL + p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			res.Body.Close()
 		}
-		res.Body.Close()
 	}
 	// 非轮询 GET（/config）与 404 必须逐条记
 	for _, p := range []string{"/config", "/no-such-endpoint"} {

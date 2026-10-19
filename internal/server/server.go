@@ -139,10 +139,10 @@ type drainResult struct {
 type AppState struct {
 	Root         string // 项目根（webui 静态文件 / config/user.json 落盘用）
 	Agent        *AgentState
-	mu           sync.Mutex        // 保护下面全部字段
-	Evt          *eventLog         // 事件批次缓冲（发车机制内核，见 eventlog.go）
-	reqMu        sync.Mutex        // 保护 reqCounts
-	reqCounts    map[string]*int64 // 高频轮询端点累计次数（访问日志汇总用，不逐条记）
+	mu           sync.Mutex               // 保护下面全部字段
+	Evt          *eventLog                // 事件批次缓冲（发车机制内核，见 eventlog.go）
+	reqMu        sync.Mutex               // 保护 reqCounts
+	reqCounts    map[string]*noisyCounter // 高频轮询端点计数（访问日志汇总用，不逐条记）
 	MessageQueue []string
 	ActiveDrain  *drainHandle
 	RoundBuf     *roundBuf
@@ -176,7 +176,7 @@ func NewAppState(cfg *config.Config, root string, agent *AgentState) *AppState {
 		Root:         root,
 		Agent:        agent,
 		Evt:          newEventLog(),
-		reqCounts:    map[string]*int64{},
+		reqCounts:    map[string]*noisyCounter{},
 		MessageQueue: []string{},
 		Injects:      []InjectInfo{},
 	}
@@ -807,26 +807,42 @@ var noisyGetPaths = map[string]bool{
 	"/queue": true, "/status": true, "/health": true, "/history": true, "/events/poll": true,
 }
 
-// noisyLogEvery 高频端点每累计这么多次才打一行汇总（2026-10-19 主人定 3000，
-// 把噪音压到最低）。按实际速率换算成时间：/events/poll（200ms）约 10 分钟一行，
-// /queue（1s）约 50 分钟一行，/status、/health、/history 更久。
-// 权衡：阈值越高越安静，但"某端点被异常高频调用"这件事留痕也越晚——真要查异常，
+// noisyLogWindow 高频端点汇总行的最小间隔（2026-10-19 主人定：一小时一行）。
+// 按时间窗而不是按次数：按次数（曾定 3000）依赖速率恒定，WebUI 多开一个标签页
+// 或关掉，换算就失真；按时间窗则与速率无关，且每行报的是这一小时内的次数，
+// 速率涨跌一眼能看出来。每个端点独立计时，互不影响。
+// 权衡：一小时一行意味着"某端点被异常高频调用"最晚一小时后才留痕——真要查异常，
 // 靠的是逐条记的写操作与非 2xx，不是这些汇总行。
-const noisyLogEvery = 3000
+const noisyLogWindow = time.Hour
 
-// countNoisyReq 累计一次高频请求；每满 noisyLogEvery 次打一行汇总。
+// noisyCounter 单个高频端点的计数与上次汇总时刻。
+type noisyCounter struct {
+	count    int64     // 累计次数
+	loggedAt int64     // 上次打汇总时的 count
+	lastLog  time.Time // 上次打汇总的时刻
+}
+
+// countNoisyReq 累计一次高频请求；距上次汇总满 noisyLogWindow 才打一行。
+// 新建计数时把 lastLog 记为当下：启动后第一小时内不打（既然不逐条记，
+// 开机那行也没有诊断价值），之后每小时最多一行。
 func (ap *App) countNoisyReq(path string) {
 	ap.state.reqMu.Lock()
 	c := ap.state.reqCounts[path]
 	if c == nil {
-		c = new(int64)
+		c = &noisyCounter{lastLog: time.Now()}
 		ap.state.reqCounts[path] = c
 	}
-	*c++
-	n := *c
+	c.count++
+	due := time.Since(c.lastLog) >= noisyLogWindow
+	var inWindow, total int64
+	if due {
+		inWindow, total = c.count-c.loggedAt, c.count
+		c.loggedAt = c.count
+		c.lastLog = time.Now()
+	}
 	ap.state.reqMu.Unlock()
-	if n%noisyLogEvery == 0 {
-		ap.state.logf("[http] GET %s 累计 %d 次（高频轮询，不逐条记；每 %d 次一行）", path, n, noisyLogEvery)
+	if due {
+		ap.state.logf("[http] GET %s 近 %v 被调 %d 次（累计 %d；高频轮询，不逐条记）", path, noisyLogWindow, inWindow, total)
 	}
 }
 
