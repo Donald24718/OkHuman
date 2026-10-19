@@ -807,7 +807,14 @@ var noisyGetPaths = map[string]bool{
 	"/queue": true, "/status": true, "/health": true, "/history": true, "/events/poll": true,
 }
 
-// countNoisyReq 累计一次高频请求；每满 1000 次打一行汇总。
+// noisyLogEvery 高频端点每累计这么多次才打一行汇总（2026-10-19 主人定 3000，
+// 把噪音压到最低）。按实际速率换算成时间：/events/poll（200ms）约 10 分钟一行，
+// /queue（1s）约 50 分钟一行，/status、/health、/history 更久。
+// 权衡：阈值越高越安静，但"某端点被异常高频调用"这件事留痕也越晚——真要查异常，
+// 靠的是逐条记的写操作与非 2xx，不是这些汇总行。
+const noisyLogEvery = 3000
+
+// countNoisyReq 累计一次高频请求；每满 noisyLogEvery 次打一行汇总。
 func (ap *App) countNoisyReq(path string) {
 	ap.state.reqMu.Lock()
 	c := ap.state.reqCounts[path]
@@ -818,8 +825,8 @@ func (ap *App) countNoisyReq(path string) {
 	*c++
 	n := *c
 	ap.state.reqMu.Unlock()
-	if n%1000 == 0 {
-		ap.state.logf("[http] GET %s 累计 %d 次（高频轮询，不逐条记）", path, n)
+	if n%noisyLogEvery == 0 {
+		ap.state.logf("[http] GET %s 累计 %d 次（高频轮询，不逐条记；每 %d 次一行）", path, n, noisyLogEvery)
 	}
 }
 
