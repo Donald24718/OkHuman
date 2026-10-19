@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"okhuman/internal/types"
@@ -85,21 +86,62 @@ func AtomicWriteFile(file string, data string) error {
 // Persistence 单实例落盘器
 type Persistence struct {
 	dir   string
-	logMu sync.Mutex
+	logMu sync.Mutex // 只保护文件写
+	// enqMu 保证入队顺序 = 调用顺序；logCh 由唯一一个 writer 消费，
+	// 于是落盘顺序 = 入队顺序 = 调用顺序。
+	enqMu   sync.Mutex
+	logCh   chan string
+	dropped atomic.Int64
 }
+
+// logQueueSize 日志队列深度。有界是故意的：日志绝不能把主流程拖住，
+// 也绝不能无界吃内存（磁盘慢/满时队列会堆）。
+const logQueueSize = 4096
 
 func Init(dir string) (*Persistence, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	return &Persistence{dir: dir}, nil
+	p := &Persistence{dir: dir, logCh: make(chan string, logQueueSize)}
+	go p.logWriter()
+	return p, nil
 }
 
-// Log 控制台 + 文件追加（>5MB 轮转 .old）；日志失败不影响主流程
+// Log 控制台 + 文件追加（>5MB 轮转 .old）；日志失败不影响主流程。
+//
+// 2026-10-19 修：以前每条日志 go appendLogLine —— 取锁顺序随机，实测 400 条
+// 并发日志里 182 行乱序（45%）。okhuman.log 是审计时间线（谁什么时候 reset、
+// 后端什么时候消失），全靠行的先后推断；行内时间戳只到毫秒，同毫秒内无法定序，
+// 因果可能被写反。改成单写手 + 有界队列：顺序 = 调用顺序，写文件不挡主流程，
+// 队列满则丢日志并留一行痕迹（丢日志好过丢请求）。
 func (p *Persistence) Log(msg string) {
 	line := fmt.Sprintf("[%s] %s", time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), msg)
 	fmt.Println(line)
-	go p.appendLogLine(line)
+	p.enqMu.Lock()
+	select {
+	case p.logCh <- line:
+	default:
+		p.dropped.Add(1)
+	}
+	p.enqMu.Unlock()
+}
+
+// logWriter 唯一的日志写手：串行消费队列，保证落盘顺序。
+func (p *Persistence) logWriter() {
+	for line := range p.logCh {
+		if d := p.dropped.Swap(0); d > 0 {
+			p.appendLogLine(fmt.Sprintf("[log] 日志队列已满，丢弃 %d 行（保主流程，不阻塞）", d))
+		}
+		p.appendLogLine(line)
+	}
+}
+
+// FlushLog 等队列排空（进程退出/被重启前调用，避免丢最后几行）。
+// 只等不关：关了之后的 Log 会 panic。
+func (p *Persistence) FlushLog() {
+	for i := 0; len(p.logCh) > 0 && i < 500; i++ {
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 func (p *Persistence) appendLogLine(line string) {

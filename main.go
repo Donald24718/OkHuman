@@ -18,10 +18,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"okhuman/internal/config"
@@ -174,6 +176,18 @@ func main() {
 	a := server.CreateAgentState(cfg, client, loaded.Prompt, promptFiles, loaded.Fallback, promptDir)
 
 	// 恢复落盘会话（重启续接）
+	// 退出前把日志队列排空（2026-10-19）：日志改为异步单写手后，进程被 kill 时
+	// 队列里未落盘的行会丢——丢的恰恰是"最后一次 run / 最后一次请求"的记录，
+	// 也就是排查死因最需要的部分。收到 SIGTERM/SIGINT 先 flush 再退。
+	// 会话本身每次消息后已同步原子落盘，不靠这里。
+	go func() {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
+		<-ch
+		p.FlushLog()
+		os.Exit(0)
+	}()
+
 	sessSnap, _ := persist.LoadSessionFile(dataDir)
 	if sessSnap != nil {
 		a.SessionNo.Store(int32(sessSnap.No))
@@ -199,6 +213,9 @@ func main() {
 		promptSrc = fmt.Sprintf("%s/（%s）", promptDirRel, strings.Join(fileNames, ", "))
 	default:
 		promptSrc = fmt.Sprintf("%s/（%s）", cfg.SystemPrompt.Dir, strings.Join(fileNames, ", "))
+	}
+	if len(loaded.Unreadable) > 0 {
+		log(fmt.Sprintf("[prompt] ⚠ %d 个 .md 读不了（权限/IO）：%s", len(loaded.Unreadable), strings.Join(loaded.Unreadable, ", ")))
 	}
 	restored := "（新建）"
 	if sessSnap != nil {
@@ -329,20 +346,34 @@ func saveGlobalConfigPatch(root string, patch map[string]interface{}) error {
 	defer cfgSaveMu.Unlock()
 	file := filepath.Join(root, "config", "user.json")
 	var cur map[string]interface{}
-	if s, err := os.ReadFile(file); err == nil {
-		var d interface{}
-		if json.Unmarshal(s, &d) == nil {
-			if m, ok := d.(map[string]interface{}); ok {
-				cur = m
-			}
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("config/user.json 读不了，拒绝保存（以免覆盖原配置）：%w", err)
 		}
+		// 文件不存在 = 首次保存，空基线是对的
+	} else {
+		var d interface{}
+		if uerr := json.Unmarshal(raw, &d); uerr != nil {
+			// 2026-10-19 修：以前解析失败静默把 cur 留空继续合并写回 →
+			// 半截 JSON（外部编辑中断/掉电写一半）会让主人原有的全部配置
+			// （端口、模型、上下文上限）被一次无关的保存清空，下次重启就变成
+			// 默认端口/默认模型——正是此前发生过的那类"端口被偷"事故形态。
+			// 读不懂就不写：让调用方如实报错，人去查文件，比机器猜着覆盖安全。
+			return fmt.Errorf("config/user.json 解析失败（%v），拒绝在看不懂的配置上合并写入：%s", uerr, file)
+		}
+		m, ok := d.(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("config/user.json 顶层不是对象，拒绝写入：%s", file)
+		}
+		cur = m
 	}
 	next := deepMergeMaps(cur, patch)
 
 	// 清理"冗余"的叶子键，文件保持最小。
 	// 基线 = 不含 user.json 的生效值（DEFAULTS+default.json），不是裸 DEFAULTS（2026-09-15 修）：
 	// default.json 覆盖过的键，user 里"等于出厂默认"的值正是把它掰回来的覆盖，删掉即静默
-	// 改变生效配置（8451 事故：user.json 的 server.port:8451 被删，实例身份被 default.json
+	// 改变生效配置（曾发生过：user.json 里的 server.port 被删，实例身份被 default.json
 	// 偷成别的实例的端口，下次重启撞端口崩死）。
 	var base map[string]interface{}
 	if b, err := json.Marshal(config.Default()); err == nil {

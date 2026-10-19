@@ -7,6 +7,7 @@
 <!-- marked：本地化 markdown 渲染库（2026-09-09，webui/marked.min.js 由 /marked.min.js 路由
      静态服务，不依赖 CDN——本地工具断网也能渲染）。加载失败不阻塞：md() 自动回退纯文本。 -->
 <script src="/marked.min.js"></script>
+<script src="/sanitize.js"></script>
 <style>
   :root {
     --bg: #0e1116;
@@ -464,7 +465,11 @@ function md(text) {
   const parse = m && (typeof m.parse === "function" ? m.parse : typeof m.marked === "function" ? m.marked : null);
   if (!parse) return esc(raw);
   try {
-    return parse(raw, { gfm: true, breaks: true });
+    // marked 原样放行原始 HTML（实测块级 <img onerror>、<svg onload>、
+    // <iframe src=data:>、[x](javascript:) 都直通）→ 必须先净化再进 innerHTML。
+    // sanitize.js 缺失时退回纯文本，不裸奔。
+    const h = parse(raw, { gfm: true, breaks: true });
+    return typeof window.sanitizeHtml === "function" ? window.sanitizeHtml(h) : esc(raw);
   } catch (e) {
     return esc(raw);
   }

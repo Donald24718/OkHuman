@@ -17,7 +17,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -864,6 +866,43 @@ type noisyCounter struct {
 	lastLog  time.Time // 上次打汇总的时刻
 }
 
+// writeOriginOK 写请求的来源校验：0 表示放行，否则返回状态码与理由。
+//
+// 为什么要（2026-10-19）：API 没有任何鉴权，监听 127.0.0.1 时唯一的屏障是浏览器
+// 同源策略——而那道屏障对"简单请求"不设防：POST + Content-Type: text/plain 不触发
+// preflight，任何网页上的 JS 都能把 /enqueue、/config、/reset、/inject 打到
+// http://127.0.0.1:8451，服务器照样执行（响应读不到，副作用已经发生）。本机 agent
+// 有 bash 能力，于是"主人打开了一个恶意网页"可以直接变成"实例被人下指令"。
+// DNS rebinding 还能把 Host 变成 evil.example 指到本机。
+//
+// 规则：Host 必须是本机地址（挡住 rebinding）；带 Origin 的请求必须来自本机同源
+// （挡住跨站页面）。curl / 脚本 / 本机插件不带 Origin，照常放行——不改变任何
+// 现有本机调用方的用法。
+func (ap *App) writeOriginOK(r *http.Request) (int, string) {
+	allowed := map[string]bool{"127.0.0.1": true, "localhost": true, "::1": true, "": true}
+	if h := ap.state.Agent.Cfg().Server.Host; h != "" {
+		allowed[h] = true
+	}
+	name := r.Host
+	if h, _, err := net.SplitHostPort(r.Host); err == nil {
+		name = h
+	}
+	name = strings.Trim(name, "[]")
+	if !allowed[name] {
+		return 403, fmt.Sprintf("Host %q 不是本机地址（疑似 DNS rebinding 或端口转发）", r.Host)
+	}
+	if o := strings.TrimSpace(r.Header.Get("Origin")); o != "" {
+		u, err := url.Parse(o)
+		if err != nil {
+			return 403, fmt.Sprintf("Origin %q 无法解析", o)
+		}
+		if !allowed[strings.Trim(u.Hostname(), "[]")] {
+			return 403, fmt.Sprintf("Origin %q 不是本机同源（浏览器跨站写请求）", o)
+		}
+	}
+	return 0, ""
+}
+
 // countNoisyReq 累计一次高频请求；距上次汇总满 noisyLogWindow 才打一行。
 // 新建计数时把 lastLog 记为当下：启动后第一小时内不打（既然不逐条记，
 // 开机那行也没有诊断价值），之后每小时最多一行。
@@ -900,6 +939,15 @@ func (ap *App) countNoisyReq(path string) {
 // 的连接在日志里完全不存在（实测 QQ 桥明明连着，/events 却是 0 条，只能靠 ss 确认）。
 func (ap *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
+	// 写操作的来源守卫（2026-10-19）：见 writeOriginOK。GET 不拦——没有 CORS 头时
+	// 跨源脚本读不到响应体，而副作用全在写端点上。
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		if code, why := ap.writeOriginOK(r); code != 0 {
+			ap.state.logf("[http] %s %s → %d 拒绝（来源不可信）：%s", r.Method, path, code, why)
+			writeJSON(w, code, map[string]interface{}{"error": why})
+			return
+		}
+	}
 	if path == "/events" {
 		ap.state.logf("[http] %s %s → 连接建立", r.Method, path)
 		start := time.Now()
@@ -971,7 +1019,9 @@ func (ap *App) route(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && path == "/":
 		ap.handleIndex(w, r)
 	case r.Method == http.MethodGet && path == "/marked.min.js":
-		ap.handleMarked(w, r)
+		ap.handleWebuiAsset(w, r, "marked.min.js")
+	case r.Method == http.MethodGet && path == "/sanitize.js":
+		ap.handleWebuiAsset(w, r, "sanitize.js")
 	default:
 		http.NotFound(w, r)
 	}
@@ -1892,13 +1942,18 @@ func (ap *App) handleIndex(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
-// marked.min.js：markdown 渲染库（2026-09-09）。本地化随 webui/ 部署，不依赖 CDN；
-// 文件缺失时返回 404（前端 md() 会回退纯文本，页面不崩）。
-func (ap *App) handleMarked(w http.ResponseWriter, r *http.Request) {
-	data, err := os.ReadFile(filepath.Join(ap.state.Root, "webui", "marked.min.js"))
+// webui 静态脚本（2026-09-09 marked；2026-10-19 加 sanitize）：本地化随 webui/ 部署，
+// 不依赖 CDN；文件缺失时返回 404（前端 md() 会回退纯文本，页面不崩）。
+func (ap *App) handleWebuiAsset(w http.ResponseWriter, r *http.Request, name string) {
+	// name 是代码里的常量（不是请求参数），不存在穿越；safeName 再挡一道以防将来改成动态
+	if !safeName(name) {
+		http.NotFound(w, r)
+		return
+	}
+	data, err := os.ReadFile(filepath.Join(ap.state.Root, "webui", name))
 	if err != nil {
 		w.WriteHeader(404)
-		_, _ = io.WriteString(w, "marked.min.js 未部署")
+		_, _ = io.WriteString(w, name+" 未部署")
 		return
 	}
 	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")

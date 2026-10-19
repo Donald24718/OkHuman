@@ -31,6 +31,10 @@ type Loaded struct {
 	Prompt   string
 	Files    []File
 	Fallback bool
+	// Unreadable 是目录里存在但读不出来的 .md 名（2026-10-19 修）：以前读失败
+	// 直接 continue，全部读不了时交出一个空提示词且 Fallback 仍为 false——
+	// agent 带着零规则上线，日志里只看到"prompt=…（0 字符）"，没人会追问为什么。
+	Unreadable []string
 }
 
 // NaturalCompare 文件名自然排序："02-x.md" < "10-x.md"（按数字段比较，其余字典序）
@@ -133,14 +137,21 @@ func LoadPromptDir(dir string) *Loaded {
 	}
 	files := make([]File, 0, len(mdFiles))
 	chunks := make([]string, 0, len(mdFiles))
+	var unreadable []string
 	for _, name := range mdFiles {
 		data, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
+			unreadable = append(unreadable, name)
 			continue
 		}
 		text := string(data)
 		files = append(files, File{Name: name, Chars: len([]rune(text))})
 		chunks = append(chunks, text)
 	}
-	return &Loaded{Prompt: strings.Join(chunks, "\n\n"), Files: files, Fallback: false}
+	// 一个都没读到：回退内置默认，而不是交出空串。空提示词 = agent 没有身份、
+	// 没有工具规则、没有隐私铁律，却照样能跑、能调工具。
+	if len(chunks) == 0 {
+		return &Loaded{Prompt: DefaultSystemPrompt, Fallback: true, Unreadable: unreadable}
+	}
+	return &Loaded{Prompt: strings.Join(chunks, "\n\n"), Files: files, Fallback: false, Unreadable: unreadable}
 }
