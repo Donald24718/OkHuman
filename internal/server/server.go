@@ -139,9 +139,10 @@ type drainResult struct {
 type AppState struct {
 	Root         string // 项目根（webui 静态文件 / config/user.json 落盘用）
 	Agent        *AgentState
-	mu           sync.Mutex   // 保护下面全部字段
-	Evt          *eventLog    // 事件批次缓冲（发车机制内核，见 eventlog.go）
-	pollReqs     atomic.Int64 // /events/poll 累计次数（访问日志汇总用，不逐条记）
+	mu           sync.Mutex        // 保护下面全部字段
+	Evt          *eventLog         // 事件批次缓冲（发车机制内核，见 eventlog.go）
+	reqMu        sync.Mutex        // 保护 reqCounts
+	reqCounts    map[string]*int64 // 高频轮询端点累计次数（访问日志汇总用，不逐条记）
 	MessageQueue []string
 	ActiveDrain  *drainHandle
 	RoundBuf     *roundBuf
@@ -175,6 +176,7 @@ func NewAppState(cfg *config.Config, root string, agent *AgentState) *AppState {
 		Root:         root,
 		Agent:        agent,
 		Evt:          newEventLog(),
+		reqCounts:    map[string]*int64{},
 		MessageQueue: []string{},
 		Injects:      []InjectInfo{},
 	}
@@ -798,26 +800,56 @@ func (s *statusRecorder) Flush() {
 	}
 }
 
-// ServeHTTP 访问日志（2026-10-18 复查修 3）：以前实例根本不记请求路径，
-// 于是"有没有人在用某个端点"这类问题永远无法回答（判断 /chat/stream 能不能删、
-// 外部插件有没有按旧文档调用，都卡在这）。只记 method/path/status/耗时——
+// noisyGetPaths 高频轮询的只读端点：WebUI / QQ 桥 / 语音每秒甚至每 200ms 打一次，
+// 逐条记会把日志刷爆（实测启动 4 分钟就 196 行访问日志，把真正要查的东西冲掉）
+// —— 这类只按端点累计次数，每 1000 次一行汇总。
+var noisyGetPaths = map[string]bool{
+	"/queue": true, "/status": true, "/health": true, "/history": true, "/events/poll": true,
+}
+
+// countNoisyReq 累计一次高频请求；每满 1000 次打一行汇总。
+func (ap *App) countNoisyReq(path string) {
+	ap.state.reqMu.Lock()
+	c := ap.state.reqCounts[path]
+	if c == nil {
+		c = new(int64)
+		ap.state.reqCounts[path] = c
+	}
+	*c++
+	n := *c
+	ap.state.reqMu.Unlock()
+	if n%1000 == 0 {
+		ap.state.logf("[http] GET %s 累计 %d 次（高频轮询，不逐条记）", path, n)
+	}
+}
+
+// ServeHTTP 访问日志（2026-10-18 复查修 3，同日补两条实测缺陷）：以前实例根本不
+// 记请求路径，"有没有人在用某个端点"永远无法回答（判断 /chat/stream 能不能删、
+// 外部插件有没有按已发出去的旧文档调用，都卡在这）。只记 method/path/status/耗时，
 // **绝不记 body 与 query**：body 里是会话内容与附件路径，query 里也无必要信息。
 //
-// /events/poll 例外：WebUI 每 200ms 一次，逐条记会把日志刷爆 → 只累计数，
-// 每 1000 次打一行汇总。/events（SSE）逐条记：一行 = 一条长连接的建立到关闭，
-// 耗时即连接存活时长，正好是 QQ 桥 / 语音重连痕迹。
+// 逐条记：所有非 GET（写操作、队列、重置、注入、配置改动）、任何非 2xx（404/400
+// 正是"有人在调我们不知道的东西"的信号）、以及不在轮询清单里的 GET。
+// 只计数：轮询类 GET 且状态正常（见 noisyGetPaths）。
+// /events（SSE）特殊：建立与结束各记一行——只在 handler 返回后记的话，一条活着
+// 的连接在日志里完全不存在（实测 QQ 桥明明连着，/events 却是 0 条，只能靠 ss 确认）。
 func (ap *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
-	if path == "/events/poll" {
-		ap.route(w, r)
-		if n := ap.state.pollReqs.Add(1); n%1000 == 0 {
-			ap.state.logf("[http] GET /events/poll 累计 %d 次（WebUI 短轮询，不逐条记）", n)
-		}
+	if path == "/events" {
+		ap.state.logf("[http] %s %s → 连接建立", r.Method, path)
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: 200}
+		ap.route(rec, r)
+		ap.state.logf("[http] %s %s → 连接结束 %d (%dms)", r.Method, path, rec.status, time.Since(start).Milliseconds())
 		return
 	}
 	start := time.Now()
 	rec := &statusRecorder{ResponseWriter: w, status: 200}
 	ap.route(rec, r)
+	if r.Method == http.MethodGet && rec.status < 400 && noisyGetPaths[path] {
+		ap.countNoisyReq(path)
+		return
+	}
 	ap.state.logf("[http] %s %s → %d (%dms)", r.Method, path, rec.status, time.Since(start).Milliseconds())
 }
 

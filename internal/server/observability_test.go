@@ -8,14 +8,15 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"okhuman/internal/config"
 	"okhuman/internal/llm"
 )
 
-// TestAccessLogRecordsEndpoints（2026-10-18 复查修 3）：实例以前根本不记请求路径，
-// "有没有人在用某个端点"这类问题无法回答。现在只读端点必须留痕；高频的
-// /events/poll（WebUI 每 200ms 一次）不得逐条记，否则日志被刷爆。
+// TestAccessLogRecordsEndpoints（2026-10-18 复查修 3 + 同日实测修正）：写操作、
+// 非 2xx、非轮询 GET 必须逐条留痕；高频轮询（/queue /status /health /events/poll）
+// 不得逐条记——实测启动 4 分钟就有 196 行访问日志，把要查的东西全冲掉了。
 func TestAccessLogRecordsEndpoints(t *testing.T) {
 	cfg := config.Default()
 	cfg.Data.Dir = t.TempDir()
@@ -28,31 +29,83 @@ func TestAccessLogRecordsEndpoints(t *testing.T) {
 	srv := httptest.NewServer(ap)
 	defer srv.Close()
 
-	for _, p := range []string{"/health", "/status", "/queue"} {
+	for _, p := range []string{"/queue", "/status", "/health", "/history", "/events/poll?since=-1"} {
 		res, err := srv.Client().Get(srv.URL + p)
 		if err != nil {
 			t.Fatal(err)
 		}
 		res.Body.Close()
 	}
-	for i := 0; i < 3; i++ {
-		res, err := srv.Client().Get(srv.URL + "/events/poll?since=-1")
+	// 非轮询 GET（/config）与 404 必须逐条记
+	for _, p := range []string{"/config", "/no-such-endpoint"} {
+		res, err := srv.Client().Get(srv.URL + p)
 		if err != nil {
 			t.Fatal(err)
 		}
 		res.Body.Close()
 	}
+	// 写操作必须逐条记（哪怕状态正常）
+	res, err := srv.Client().Post(srv.URL+"/enqueue", "application/json", strings.NewReader(`{"bad":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+
 	mu.Lock()
 	defer mu.Unlock()
 	joined := strings.Join(lines, "\n")
-	for _, want := range []string{"[http] GET /health → 200", "[http] GET /status → 200", "[http] GET /queue → 200"} {
+	for _, want := range []string{
+		"[http] GET /config → 200", "[http] GET /no-such-endpoint → 404", "[http] POST /enqueue → 400",
+	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("访问日志缺 %q，实得：\n%s", want, joined)
 		}
 	}
-	if strings.Contains(joined, "/events/poll") {
-		t.Fatalf("高频 /events/poll 不该逐条进日志：\n%s", joined)
+	for _, bad := range []string{"/queue", "/status", "/health", "/history", "/events/poll"} {
+		if strings.Contains(joined, bad) {
+			t.Fatalf("高频轮询 %s 不该逐条进日志：\n%s", bad, joined)
+		}
 	}
+}
+
+// TestAccessLogSSEOpenAndClose（同日实测缺陷二）：只在 handler 返回后记日志的话，
+// 一条活着的 SSE 连接在日志里完全不存在——实测 QQ 桥明明连着，/events 却是 0 条。
+// 现在建立与结束各一行。
+func TestAccessLogSSEOpenAndClose(t *testing.T) {
+	cfg := config.Default()
+	cfg.Data.Dir = t.TempDir()
+	a := CreateAgentState(cfg, llm.NewFakeLLM(nil), "sys", []PromptFileInfo{}, true, "")
+	st := NewAppState(cfg, t.TempDir(), a)
+	var mu sync.Mutex
+	var lines []string
+	st.Log = func(m string) { mu.Lock(); lines = append(lines, m); mu.Unlock() }
+	ap := New(st, nil)
+	srv := httptest.NewServer(ap)
+	defer srv.Close()
+
+	res, err := srv.Client().Get(srv.URL + "/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor := func(want string) string {
+		t.Helper()
+		for i := 0; i < 40; i++ {
+			mu.Lock()
+			j := strings.Join(lines, "\n")
+			mu.Unlock()
+			if strings.Contains(j, want) {
+				return j
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		t.Fatalf("等不到 %q，日志：\n%s", want, strings.Join(lines, "\n"))
+		return ""
+	}
+	waitFor("[http] GET /events → 连接建立")
+	res.Body.Close() // 客户端断开 → handler 返回 → 记"连接结束"
+	waitFor("[http] GET /events → 连接结束")
 }
 
 // TestConfigSaveFailureIsReported（2026-10-18 复查修 1）：落盘失败时不能再说"已保存"。
