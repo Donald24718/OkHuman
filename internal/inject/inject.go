@@ -10,6 +10,7 @@ package inject
 // （文本由 id+原因固定生成，无时间戳无随机数，按 id 缓存）→ LLM 看到报错。
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -116,12 +117,18 @@ func (r *Resolver) ClearCache(id string) {
 // 返回侧车是否存在并被改写。
 func StripSidecar(dir, id string) bool {
 	p := filepath.Join(dir, id+".json")
-	if _, err := os.Stat(p); err != nil {
+	old, err := os.ReadFile(p)
+	if err != nil {
 		return false
 	}
 	stub := []types.ContentPart{types.TextPart(fmt.Sprintf("附件 %s 已按用户手动指令剥离，原附件内容不再发送", id))}
 	b, err := json.Marshal(stub)
 	if err != nil {
+		return false
+	}
+	// 幂等（2026-10-19）：已经是剥离提示的侧车不再算"剥了一个"，
+	// 否则连点两次按钮日志里每次都报全量，看不出到底剥了几个。
+	if bytes.Equal(old, b) {
 		return false
 	}
 	// 原子写（C2）：侧车是"下次 compose 才读"的文件，半截 JSON = 附件静默消失或加载失败

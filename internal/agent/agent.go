@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -396,7 +397,7 @@ func (a *Agent) writeToolLog(opt RunOptions, full string) string {
 // AgentStoppedError 抛出（由 runUserMessage 收尾）。
 //
 // 2026-10-18：删掉"LLM 4xx 三级回退阶梯"（4xx→降级最近附件→全部附件→硬截断）。
-// 理由：触发条件写死 400/413/415，是按 llama.cpp 的行为定的；换后端（现 strata）
+// 理由：触发条件写死 400/413/415，是按 llama.cpp 的行为定的；换后端
 // 同一件事可能报 503/500/别的码，阶梯既不触发也拦不住，等于把猜测固化进控制流。
 // 现在 LLM 报错就原样抛出、本轮终止。附件出问题的处置改由人显式做：
 // WebUI「剥离全部注入附件」按钮（POST /strip-injects，永久回写侧车）+
@@ -437,6 +438,21 @@ func (a *Agent) llmCall(ctx context.Context, emit func(types.AgentEvent), totals
 	if err != nil {
 		if a.stopRequested.Load() || callCtx.Err() != nil {
 			return nil, &AgentStoppedError{Partial: partial}
+		}
+		// 非停止类错误（空闲超时 / 畸形帧达上限 / 网络断 / 上游 5xx）：
+		// 修（2026-10-19）——旧行为把已生成的正文整段丢掉：delta 已经逐块推给前端
+		// （用户确实看见过），会话里却一条 assistant 消息都没有 → 刷新后那半截
+		// 消失，模型下一轮也不知道自己写过什么（已用测试复现）。
+		// 现在把中断前的正文入账为 assistant 消息并明确标注中断；只有思考没有正文
+		// 时不入（与 /stop 的 finishStopped 口径一致）。错误照原样上抛，本轮仍终止。
+		if partial.Text != "" {
+			body := partial.Text + "\n\n（以上为本轮中断前已生成的部分：调用在此中断，未收到完整回复）"
+			var rc *string
+			if partial.Thinking != "" {
+				rc = &partial.Thinking
+			}
+			a.cm.AddMessage(&types.RawEntry{Role: "assistant", Content: body, ReasoningContent: rc})
+			emit(types.AgentEvent{"type": "partial_kept", "chars": utf16Len(partial.Text)})
 		}
 		return nil, err // 不猜、不降级、不重试：原样抛出，本轮终止
 	}
@@ -523,14 +539,7 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 
 			emit(types.AgentEvent{"type": "tool_call", "name": tc.Function.Name, "args": args, "call_id": tc.ID})
 			execDone := make(chan string, 1)
-			go func() {
-				r, err := tools.ExecuteTool(tc.Function.Name, args)
-				if err != nil {
-					execDone <- tools.ToolFailPrefix + err.Error()
-				} else {
-					execDone <- r
-				}
-			}()
+			go func() { execDone <- execToolSafe(tc.Function.Name, args) }()
 			// §7.3 前台赛跑：超时前完成 → 正常回填；超时 → 转后台，回填"已转后台"通知
 			select {
 			case outcome := <-execDone:
@@ -638,6 +647,34 @@ func (a *Agent) isSameRunLocked(n int) bool {
 }
 
 // ---------- 辅助 ----------
+
+// execToolSafe 执行元工具并把内部 panic 兜住。
+//
+// 为什么要兜（2026-10-19）：工具跑在**独立 goroutine** 里，而 drain 层的 panic
+// 隔离只覆盖它自己那条调用链——抓不到别的 goroutine 的 panic。Go 里未 recover 的
+// panic 在任何 goroutine 都会终止整个进程 → 工具内部一次意外出错 = 整个实例当场暴毙
+// （不是本轮失败，是进程死、要重启）。这里兜住，转成工具失败字符串回填给模型，
+// 实例继续活着。当前工具路径没有已知可 panic 的分支，这是纯预防的保险。
+func execToolSafe(name string, args map[string]interface{}) string {
+	return guardToolPanic(name, func() string {
+		r, err := tools.ExecuteTool(name, args)
+		if err != nil {
+			return tools.ToolFailPrefix + err.Error()
+		}
+		return r
+	})
+}
+
+// guardToolPanic 兜 panic（抽出来便于测试：夹具直接喂一个会摔的 fn）。
+func guardToolPanic(name string, fn func() string) (out string) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("[agent] 工具 %s 内部 panic（已隔离，实例未崩）：%v\n%s\n", name, r, debug.Stack())
+			out = tools.ToolFailPrefix + fmt.Sprintf("工具内部错误（已隔离，实例未崩）：%v", r)
+		}
+	}()
+	return fn()
+}
 
 // parseArgs arguments JSON 字符串 → 对象；解析失败兜底为原始字符串
 func parseArgs(s string) map[string]interface{} {

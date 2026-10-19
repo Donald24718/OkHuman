@@ -182,7 +182,49 @@ func NewAppState(cfg *config.Config, root string, agent *AgentState) *AppState {
 	}
 	// 启动即视为"刚 run 完"：空闲计时从此刻开始，不会一启动就发心跳
 	st.LastRunEnd.Store(time.Now().UnixMilli())
+	// 重启续接修（2026-10-19）：侧车活在磁盘上，InjectSeq 活在内存里。重启后
+	// InjectSeq 归零，而恢复的旧会话里 inject_ref 还指着 inj-1、inj-2…
+	// → 新注入拿到同一个 id，AtomicWriteFile 直接盖掉旧侧车：旧消息里
+	// "昨天那张图"悄悄变成今天新注入的内容，全程无报错（已用测试复现）。
+	// 修法：启动时把 InjectSeq 抬到磁盘上已有的最大序号（/reset 会连目录一起
+	// RemoveAll 并归零，两条路径不冲突）。
+	dir := filepath.Join(cfg.Data.Dir, "inject")
+	st.InjectSeq = maxInjectSeq(dir)
+	// 顺带修可见性：会话里仍被引用的旧附件回填附件列表。此前重启后列表是空的，
+	// 但 compose 每轮照样把它们发出去——侧栏看不见，用户也就删不掉/剥不掉。
+	if agent != nil && agent.CM() != nil {
+		seen := map[string]bool{}
+		for _, m := range agent.CM().Session().Messages {
+			for _, pt := range types.AsParts(m.Content) {
+				if pt.Type != "inject_ref" || pt.Ref == "" || seen[pt.Ref] || !injIDRe.MatchString(pt.Ref) {
+					continue
+				}
+				seen[pt.Ref] = true
+				var created int64
+				if fi, err := os.Stat(filepath.Join(dir, pt.Ref+".json")); err == nil {
+					created = fi.ModTime().UnixMilli()
+				}
+				st.Injects = append(st.Injects, InjectInfo{ID: pt.Ref, Bytes: inject.InjectFileSize(dir, pt.Ref), CreatedAt: created})
+			}
+		}
+	}
 	return st
+}
+
+// maxInjectSeq 返回 inject 目录里 inj-<n>.json 的最大 n（无文件/无匹配 → 0）。
+func maxInjectSeq(dir string) int {
+	files, _ := filepath.Glob(filepath.Join(dir, "inj-*.json"))
+	max := 0
+	for _, f := range files {
+		id := strings.TrimSuffix(filepath.Base(f), ".json")
+		if !injIDRe.MatchString(id) {
+			continue
+		}
+		if n, err := strconv.Atoi(strings.TrimPrefix(id, "inj-")); err == nil && n > max {
+			max = n
+		}
+	}
+	return max
 }
 
 // ---------- agent 运行时构建（对应 TS createAgentState / makeCm） ----------
@@ -807,7 +849,7 @@ var noisyGetPaths = map[string]bool{
 	"/queue": true, "/status": true, "/health": true, "/history": true, "/events/poll": true,
 }
 
-// noisyLogWindow 高频端点汇总行的最小间隔（2026-10-19 定案：一小时一行）。
+// noisyLogWindow 高频端点汇总行的最小间隔（2026-10-19 主人定：一小时一行）。
 // 按时间窗而不是按次数：按次数（曾定 3000）依赖速率恒定，WebUI 多开一个标签页
 // 或关掉，换算就失真；按时间窗则与速率无关，且每行报的是这一小时内的次数，
 // 速率涨跌一眼能看出来。每个端点独立计时，互不影响。
@@ -1181,7 +1223,7 @@ func (c *sseConn) close() {
 	close(c.done)
 }
 
-// /chat/stream 已删除（2026-10-18 健壮性复查，定案）：它是"同步流式"端点——
+// /chat/stream 已删除（2026-10-18 健壮性复查，主人定）：它是"同步流式"端点——
 // run 每产生一个事件就在 **run 自己的 goroutine 里**往该连接的 socket 写一帧，
 // 而 sseConn.write 无 deadline。对端不读 → 内核缓冲填满 → write 挂住 → run 回不到
 // "读 LLM 下一批字节"那一步：轻则空闲计时器误判"模型没响应"把本轮判死，重则本轮
@@ -1459,7 +1501,7 @@ func (ap *App) handleAttachments(w http.ResponseWriter, r *http.Request) {
 // ---------- 手动压缩 / 手动剥离附件（2026-10-18，取代旧"LLM 4xx 三级回退"）----
 //
 // 旧阶梯靠硬编码 400/413/415 猜"请求体被拒"，是按 llama.cpp 行为定的，换后端
-// 就不成立（strata 同一件事可能报别的码）。现在机器不猜，两个动作都由人按按钮。
+// 就不成立（别的后端同一件事可能报别的码）。现在机器不猜，两个动作都由人按按钮。
 
 // handleCompressNow 手动压缩上下文：不等 token 阈值，按常规分批口径立刻压最旧一批。
 // run 进行中拒绝（409）——压缩会换掉会话结构（旧消息出列 + summary 替换），与在飞
