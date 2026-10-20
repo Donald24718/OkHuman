@@ -484,6 +484,33 @@ async function api(path, opt) {
 function apiPost(path, body) {
   return api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 }
+/* 上下文用量显示（2026-10-20）：每轮结束报的是"上下文已用 / 上限"，而不是只报
+   本轮 token。已用取 GET /status 的 context.total_tokens（与自动压缩同一套估算口径，
+   所以这个数就是"离触发压缩还剩多少"的那个数）；上限取 GET /config 的
+   context.max_tokens，缓存一次，保存配置后清掉重取。 */
+let ctxLimit = null;
+async function getCtxLimit() {
+  if (ctxLimit != null) return ctxLimit;
+  try {
+    const c = await api("/config");
+    // /config 返回 { effective, global, ... }：取 effective（运行时真正生效的值，
+    // 含默认值与热更新结果），退回 global 只是防旧版结构。
+    const seg = (c.effective && c.effective.context) || (c.global && c.global.context) || c.context;
+    ctxLimit = (seg && seg.max_tokens) || null;
+  } catch (e) {}
+  return ctxLimit;
+}
+function ctxLimitHint(used) {
+  if (ctxLimit == null || used == null) return "";
+  return ` / 上限 ${ctxLimit}（已用 ${Math.round(used / ctxLimit * 100)}%）`;
+}
+function usageLine(st, limit) {
+  const used = st ? st.total_tokens : null;
+  if (used == null) return "📊 上下文：读取失败";
+  if (!limit) return `📊 上下文：已用 ${used}`;
+  const left = limit - used;
+  return `📊 上下文：已用 ${used} / 上限 ${limit}（${Math.round(used / limit * 100)}%${left >= 0 ? `，剩 ${left}` : `，已超 ${-left}`}）`;
+}
 function toast(msg, isErr) {
   const d = document.createElement("div");
   d.className = "toast" + (isErr ? " err" : "");
@@ -884,10 +911,21 @@ function handleChatEvent(type, data) {
       streamEnd();
       chatAddHtml(evCard("doom", "❌", "运行出错", data.message));
       break;
-    case "done":
+    case "done": {
       streamEnd();
-      chatAddHtml(`<div class="ev usage">📊 本轮 token：prompt ${data.usage.prompt_tokens} / completion ${data.usage.completion_tokens} / 缓存命中 ${data.usage.cached_tokens}</div>`);
+      // 先插占位再异步填：/status 与 /config 都是本地请求，但别把渲染卡住。
+      // 若后端哪天在 done 事件里直接带 context，就优先用它，省掉这次请求。
+      const uid = "ctxu" + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36);
+      chatAddHtml(`<div class="ev usage" id="${uid}">📊 上下文：读取中…</div>`);
+      (async () => {
+        let st = data.context || null, lim = st ? st.max_tokens : null;
+        if (!st) { try { st = (await api("/status")).context; } catch (e) {} }
+        if (!lim) lim = await getCtxLimit();
+        const el = document.getElementById(uid);
+        if (el) el.innerHTML = usageLine(st, lim);
+      })();
       break;
+    }
   }
 }
 function syncUi(running) {
@@ -1117,10 +1155,11 @@ async function loadStatus() {
   try { s = await api("/status"); }
   catch (e) { $("stMeta").textContent = "加载失败：" + e.message; return; }
   $("stMeta").textContent = `会话 #${s.session} · ${s.running ? "运行中" : "空闲"}`;
+  await getCtxLimit();
   $("stContext").innerHTML = `
     <div class="kv"><b>消息</b><span>${s.context.messages} 条（${fmtBytes(s.context.msg_chars)}）</span></div>
     <div class="kv"><b>滚动总结</b><span>${s.context.summary ? `1 条（${fmtBytes(s.context.summary_chars)}）` : "无"}</span></div>
-    <div class="kv"><b>总 token（估算）</b><span class="mono">${s.context.total_tokens}（消息 ${s.context.msg_tokens} + 总结 ${s.context.summary_tokens}）</span></div>
+    <div class="kv"><b>总 token（估算）</b><span class="mono">${s.context.total_tokens}${ctxLimitHint(s.context.total_tokens)}（消息 ${s.context.msg_tokens} + 总结 ${s.context.summary_tokens}）</span></div>
     <div class="kv"><b>上下文构成</b><span class="mono" style="font-size:12px">[summary ×${s.context.summary}] → [messages ×${s.context.messages}]</span></div>`;
   $("stPrompt").innerHTML = `
     <div class="kv"><b>来源</b><span>${s.system_prompt.fallback ? '<span class="tag pause">内置默认（目录缺失）</span>' : esc(s.system_prompt.files.map((f) => f.name).join(", "))}</span></div>
@@ -1334,6 +1373,7 @@ async function saveConfig() {
       (j.applied || []).map((x) => `<div class="ok-line">✓ ${esc(x)}</div>`).join("") +
       (j.restart || []).map((x) => `<div class="rs-line">⚠ ${esc(x)}</div>`).join("");
     toast("配置已保存" + (j.restart?.length ? "（部分项需重启进程生效）" : "（全部即时生效）"));
+    ctxLimit = null; // 上限可能刚被改过，下次重新取
     await loadConfig({ keepResult: true });
     pullHeartbeat(); // 改了开关/间隔 → 倒计时立即反映新值
   } catch (e) {
