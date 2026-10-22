@@ -42,20 +42,19 @@ func TestHeartbeatDueTable(t *testing.T) {
 		cfg    config.HeartbeatCfg
 		run    bool
 		expect bool
-		streak int // 空转避让：连续"纯心跳零工具调用"轮数（既有用例一律 0）
 	}{
-		{"到点触发", B + 30*min, B, config.HeartbeatCfg{Enabled: true, IntervalMin: 30}, false, true, 0},
-		{"差一分钟不触发", B + 30*min - 1, B, config.HeartbeatCfg{Enabled: true, IntervalMin: 30}, false, false, 0},
-		{"正在 run 不计时", B + 90*min, B, config.HeartbeatCfg{Enabled: true, IntervalMin: 30}, true, false, 0},
-		{"开关关不触发", B + 999*min, B, config.HeartbeatCfg{Enabled: false, IntervalMin: 30}, false, false, 0},
-		{"run 刚结束即重置", B + 31*min, B + 30*min, config.HeartbeatCfg{Enabled: true, IntervalMin: 30}, false, false, 0},
-		{"间隔可配成 1 分钟", B + 2*min, B, config.HeartbeatCfg{Enabled: true, IntervalMin: 1}, false, true, 0},
-		{"间隔非法退回默认 30", B + 2*min, B, config.HeartbeatCfg{Enabled: true, IntervalMin: 0}, false, false, 0},
-		{"间隔非法但已过 30 分钟", B + 31*min, B, config.HeartbeatCfg{Enabled: true, IntervalMin: -5}, false, true, 0},
-		{"计时基准未初始化不触发", B + 999*min, 0, config.HeartbeatCfg{Enabled: true, IntervalMin: 30}, false, false, 0},
+		{"到点触发", B + 30*min, B, config.HeartbeatCfg{Enabled: true, IntervalMin: 30}, false, true},
+		{"差一分钟不触发", B + 30*min - 1, B, config.HeartbeatCfg{Enabled: true, IntervalMin: 30}, false, false},
+		{"正在 run 不计时", B + 90*min, B, config.HeartbeatCfg{Enabled: true, IntervalMin: 30}, true, false},
+		{"开关关不触发", B + 999*min, B, config.HeartbeatCfg{Enabled: false, IntervalMin: 30}, false, false},
+		{"run 刚结束即重置", B + 31*min, B + 30*min, config.HeartbeatCfg{Enabled: true, IntervalMin: 30}, false, false},
+		{"间隔可配成 1 分钟", B + 2*min, B, config.HeartbeatCfg{Enabled: true, IntervalMin: 1}, false, true},
+		{"间隔非法退回默认 30", B + 2*min, B, config.HeartbeatCfg{Enabled: true, IntervalMin: 0}, false, false},
+		{"间隔非法但已过 30 分钟", B + 31*min, B, config.HeartbeatCfg{Enabled: true, IntervalMin: -5}, false, true},
+		{"计时基准未初始化不触发", B + 999*min, 0, config.HeartbeatCfg{Enabled: true, IntervalMin: 30}, false, false},
 	}
 	for _, c := range cases {
-		if got := heartbeatDue(c.now, c.last, c.cfg, c.run, c.streak); got != c.expect {
+		if got := heartbeatDue(c.now, c.last, c.cfg, c.run); got != c.expect {
 			t.Errorf("%s: heartbeatDue=%v 期望 %v", c.name, got, c.expect)
 		}
 	}
@@ -65,7 +64,7 @@ func TestHeartbeatDueTable(t *testing.T) {
 // 或开关关时给 null（"正在 run 不计时"语义）。
 func TestHeartbeatStatusNextDue(t *testing.T) {
 	cfg := config.HeartbeatCfg{Enabled: true, IntervalMin: 30}
-	st := heartbeatStatus(cfg, 1000, false, 0)
+	st := heartbeatStatus(cfg, 1000, false)
 	if st["next_due_ms"] == nil {
 		t.Fatalf("空闲时应给出下次触发时刻")
 	}
@@ -74,10 +73,10 @@ func TestHeartbeatStatusNextDue(t *testing.T) {
 	}
 	if st["next_due_ms"] = nil; false {
 	}
-	if heartbeatStatus(cfg, 1000, true, 0)["next_due_ms"] != nil {
+	if heartbeatStatus(cfg, 1000, true)["next_due_ms"] != nil {
 		t.Errorf("正在 run 时下次触发时刻应为 null")
 	}
-	if heartbeatStatus(config.HeartbeatCfg{Enabled: false, IntervalMin: 30}, 1000, false, 0)["next_due_ms"] != nil {
+	if heartbeatStatus(config.HeartbeatCfg{Enabled: false, IntervalMin: 30}, 1000, false)["next_due_ms"] != nil {
 		t.Errorf("开关关时下次触发时刻应为 null")
 	}
 }
@@ -209,79 +208,5 @@ func TestHeartbeatConfigTypeGuard(t *testing.T) {
 	hb := a.Cfg().Heartbeat
 	if !hb.Enabled || hb.IntervalMin != 12 || hb.Prompt != "自定义心跳词" {
 		t.Errorf("非法补丁改动了已生效配置：%+v", hb)
-	}
-}
-
-// TestHeartbeatBackoffDue 空转避让（2026-10-22）：连续空转轮数越多，触发间隔
-// 按 2 的幂翻倍并封顶；避让关掉时 streak 再大也不影响；真实 run（streak=0）
-// 回到基准间隔。
-func TestHeartbeatBackoffDue(t *testing.T) {
-	const min = int64(60000)
-	const B = int64(1_000_000_000)
-	hb := func(streak int) config.HeartbeatCfg {
-		return config.HeartbeatCfg{Enabled: true, IntervalMin: 30, Backoff: true, BackoffMaxMin: 240}
-	}
-	cases := []struct {
-		name   string
-		cfg    config.HeartbeatCfg
-		streak int
-		idle   int64 // 距上次 run 结束的分钟数
-		expect bool
-	}{
-		{"空转 0 轮：30 分钟到点", hb(0), 0, 30, true},
-		{"空转 1 轮：30 分钟不再触发", hb(1), 1, 30, false},
-		{"空转 1 轮：60 分钟触发", hb(1), 1, 60, true},
-		{"空转 2 轮：120 分钟触发", hb(2), 2, 120, true},
-		{"空转 3 轮：240 分钟触发（正好封顶）", hb(3), 3, 240, true},
-		{"空转 10 轮：仍封顶 240，不无限拉长", hb(10), 10, 240, true},
-		{"空转 10 轮：239 分钟不触发", hb(10), 10, 239, false},
-		{"避让关闭：空转 10 轮照样 30 分钟触发", config.HeartbeatCfg{Enabled: true, IntervalMin: 30, Backoff: false}, 10, 30, true},
-		{"封顶非法：按默认 240", config.HeartbeatCfg{Enabled: true, IntervalMin: 30, Backoff: true, BackoffMaxMin: 0}, 8, 240, true},
-	}
-	for _, c := range cases {
-		if got := heartbeatDue(B+c.idle*min, B, c.cfg, false, c.streak); got != c.expect {
-			t.Errorf("%s: heartbeatDue=%v 期望 %v", c.name, got, c.expect)
-		}
-	}
-}
-
-// TestHeartbeatIntervalMinTable 生效间隔的数值序列（30→60→120→240→封顶）。
-func TestHeartbeatIntervalMinTable(t *testing.T) {
-	cfg := config.HeartbeatCfg{Enabled: true, IntervalMin: 30, Backoff: true, BackoffMaxMin: 240}
-	want := []int{30, 60, 120, 240, 240, 240}
-	for s, w := range want {
-		if got := heartbeatIntervalMin(cfg, s); got != w {
-			t.Errorf("streak=%d: 生效间隔=%d 期望 %d", s, got, w)
-		}
-	}
-	// 非法基准退回默认 30
-	if got := heartbeatIntervalMin(config.HeartbeatCfg{Enabled: true, IntervalMin: -1, Backoff: true}, 1); got != 60 {
-		t.Errorf("非法基准 streak=1: got=%d 期望 60", got)
-	}
-	// 封顶小于基准：不得把间隔改小到基准以下
-	if got := heartbeatIntervalMin(config.HeartbeatCfg{Enabled: true, IntervalMin: 30, Backoff: true, BackoffMaxMin: 10}, 3); got != 30 {
-		t.Errorf("封顶低于基准时应保持基准: got=%d 期望 30", got)
-	}
-}
-
-// TestHeartbeatStatusExposesBackoff /status 里必须能看到避让开关、当前空转轮数
-// 和生效间隔——否则线上根本没法判断退避有没有在起作用。
-func TestHeartbeatStatusExposesBackoff(t *testing.T) {
-	cfg := config.HeartbeatCfg{Enabled: true, IntervalMin: 30, Backoff: true, BackoffMaxMin: 240}
-	st := heartbeatStatus(cfg, 1_000_000, false, 2)
-	if st["backoff"] != true {
-		t.Errorf("status.backoff=%v 期望 true", st["backoff"])
-	}
-	if st["noop_streak"] != 2 {
-		t.Errorf("status.noop_streak=%v 期望 2", st["noop_streak"])
-	}
-	if st["effective_interval_min"] != 120 {
-		t.Errorf("status.effective_interval_min=%v 期望 120", st["effective_interval_min"])
-	}
-	if st["interval_min"] != 30 {
-		t.Errorf("status.interval_min 应仍是配置基准 30，实际 %v", st["interval_min"])
-	}
-	if due, ok := st["next_due_ms"].(int64); !ok || due != 1_000_000+120*60000 {
-		t.Errorf("next_due_ms 应按生效间隔算，实际 %v", st["next_due_ms"])
 	}
 }

@@ -145,7 +145,7 @@ type AppState struct {
 	Evt          *eventLog                // 事件批次缓冲（发车机制内核，见 eventlog.go）
 	reqMu        sync.Mutex               // 保护 reqCounts
 	reqCounts    map[string]*noisyCounter // 高频轮询端点计数（访问日志汇总用，不逐条记）
-	MessageQueue []queuedMsg
+	MessageQueue []string
 	ActiveDrain  *drainHandle
 	RoundBuf     *roundBuf
 	RunSeq       int
@@ -153,12 +153,8 @@ type AppState struct {
 	// （2026-10-17）。口径由用户定：**只有 run 结束才重置**，正在 run 期间不计时。
 	// 用 atomic 而非 state.mu：心跳只读它，避免与 RunLock→state.mu 锁序纠缠。
 	LastRunEnd atomic.Int64
-	// HbNoopStreak 连续"纯心跳且零工具调用"的轮数（空转避让，2026-10-22）。
-	// 写者只有 runDrain（每批结束判一次），读者是心跳巡检 → 用 atomic，
-	// 与 LastRunEnd 同一理由：避开 RunLock→state.mu 的锁序纠缠。
-	HbNoopStreak atomic.Int64
-	InjectSeq    int
-	Injects      []InjectInfo
+	InjectSeq  int
+	Injects    []InjectInfo
 
 	// Log 落盘日志回调（main 注入 persist.Log）。2026-10-18 健壮性修 D：server 层
 	// 此前没有 logger，关键操作（手动剥离附件、重置会话落盘、附件载入失败）只能
@@ -183,7 +179,7 @@ func NewAppState(cfg *config.Config, root string, agent *AgentState) *AppState {
 		Agent:        agent,
 		Evt:          newEventLog(),
 		reqCounts:    map[string]*noisyCounter{},
-		MessageQueue: []queuedMsg{},
+		MessageQueue: []string{},
 		Injects:      []InjectInfo{},
 	}
 	// 启动即视为"刚 run 完"：空闲计时从此刻开始，不会一启动就发心跳
@@ -320,7 +316,7 @@ func runOpt(a *AgentState, state *AppState) agent.RunOptions {
 			defer state.mu.Unlock()
 			q := state.MessageQueue
 			state.MessageQueue = nil
-			return queuedTexts(q)
+			return q
 		},
 		OnBackgroundStart: func(bg types.BackgroundStartArgs) {
 			// settle → 格式化通知 → push 进消息队列 + 唤醒 drain（2026-09-14：
@@ -432,18 +428,9 @@ func makeOnEvent(state *AppState, a *AgentState) func(types.AgentEvent) {
 // 与后台 settle 通知（同一逻辑）。返回 handle（可等 done 读 res）+ 入队前
 // 队列已有条数。
 func enqueueAndWake(state *AppState, a *AgentState, msg string, onEvent func(types.AgentEvent)) (*drainHandle, int) {
-	return enqueueMsg(state, a, queuedMsg{Text: msg}, onEvent)
-}
-
-// enqueueHeartbeat 空闲心跳入队：打上 Heartbeat 标记（空转避让据此判定）。
-func enqueueHeartbeat(state *AppState, a *AgentState, msg string, onEvent func(types.AgentEvent)) (*drainHandle, int) {
-	return enqueueMsg(state, a, queuedMsg{Text: msg, Heartbeat: true}, onEvent)
-}
-
-func enqueueMsg(state *AppState, a *AgentState, qm queuedMsg, onEvent func(types.AgentEvent)) (*drainHandle, int) {
 	state.mu.Lock()
 	queuedBefore := len(state.MessageQueue)
-	state.MessageQueue = append(state.MessageQueue, qm)
+	state.MessageQueue = append(state.MessageQueue, msg)
 	if state.ActiveDrain != nil {
 		h := state.ActiveDrain
 		state.mu.Unlock()
@@ -489,48 +476,18 @@ func enqueueMsg(state *AppState, a *AgentState, qm queuedMsg, onEvent func(types
 // 不加前缀）；>1 条 = 合并成一条【第 1 条】…【第 2 条】…（kind=merged，
 // label "N 条合并 / M 字符"）。这是「无车」新轮路径的组装；「有车」轮内
 // 搭车走 agent 的 TakePendingUsers，每条独立成 user 消息，不经过本函数。
-// queuedTexts 队列快照的纯文本（/queue、/events 展示与轮内搭车取用）。
-func queuedTexts(q []queuedMsg) []string {
-	out := make([]string, 0, len(q))
-	for _, m := range q {
-		out = append(out, m.Text)
-	}
-	return out
-}
-
-// queuedMsg 队列里的一条待处理消息。
-//
-// Heartbeat 标记"这条是空闲心跳自己入队的，不是用户发的"。空转避让必须按
-// **整批是不是纯心跳**决定退避，不能用全局标志：心跳入队后、drain 启动前，
-// 用户的真实消息可能搭进同一批——那种批必须算真实活动，否则会把用户活动
-// 误判成空转，把间隔越拉越长。
-type queuedMsg struct {
-	Text      string
-	Heartbeat bool
-}
-
-// assembleBatch 把一批待处理消息拼成本轮发给模型的内容。
-// hbOnly = 这一整批全是心跳消息（空转避让据此累加/归零计数）。
-func assembleBatch(msgs []queuedMsg) (message, kind string, label *string, messages int, hbOnly bool) {
-	hbOnly = len(msgs) > 0
-	texts := make([]string, len(msgs))
-	for i, m := range msgs {
-		texts[i] = m.Text
-		if !m.Heartbeat {
-			hbOnly = false
-		}
-	}
+func assembleBatch(msgs []string) (message, kind string, label *string, messages int) {
 	if len(msgs) == 1 {
-		return texts[0], "user", nil, 0, hbOnly
+		return msgs[0], "user", nil, 0
 	}
 	total := 0
 	parts := make([]string, len(msgs))
-	for i, m := range texts {
+	for i, m := range msgs {
 		parts[i] = fmt.Sprintf("【第 %d 条】%s", i+1, m)
 		total += utf16Len(m)
 	}
 	l := fmt.Sprintf("%d 条合并 / %d 字符", len(msgs), total)
-	return strings.Join(parts, "\n"), "merged", &l, len(msgs), hbOnly
+	return strings.Join(parts, "\n"), "merged", &l, len(msgs)
 }
 
 // runDrain 排空消息队列（2026-08-31 厄运定；2026-09-14 竞态修）：
@@ -543,10 +500,8 @@ func runDrain(state *AppState, a *AgentState, h *drainHandle, onEvent func(types
 	started := time.Now()
 	var reply string
 	for {
-		var msgs []queuedMsg
+		var msgs []string
 		var batchErr error
-		var hbOnly bool
-		var toolCalls int
 		// splice + 发送在 RunLock 内原子完成（2026-09-14 审计 H1 修）：/reset 也持同一
 		// 锁清队列+重建 → 两者互斥——要么整批在 reset 前跑完（旧会话），要么 reset
 		// 已清空队列、本 drain 见空即退，不存在"splice 出的旧消息跑上新会话"的窗口。
@@ -562,18 +517,8 @@ func runDrain(state *AppState, a *AgentState, h *drainHandle, onEvent func(types
 			if len(msgs) == 0 {
 				return nil // 防御：空队列不发 LLM 调用
 			}
-			message, kind, label, messages, hb := assembleBatch(msgs)
-			hbOnly = hb
-			// 空转避让（2026-10-22）：数本轮的工具调用次数。一次都没有 = 模型自查后
-			// 判定无事可做（典型就是空闲心跳）。计数只在"整批都是心跳"时才累加，
-			// 批里混了真实消息就归零。
-			counting := func(ev types.AgentEvent) {
-				if t, ok := ev["type"].(string); ok && t == "tool_call" {
-					toolCalls++
-				}
-				onEvent(ev)
-			}
-			r, err := runBatch(a, runOpt(a, state), message, kind, label, messages, counting)
+			message, kind, label, messages := assembleBatch(msgs)
+			r, err := runBatch(a, runOpt(a, state), message, kind, label, messages, onEvent)
 			if err == nil {
 				reply = r
 			}
@@ -583,16 +528,6 @@ func runDrain(state *AppState, a *AgentState, h *drainHandle, onEvent func(types
 		// 心跳计时（2026-10-17）：一批 run 结束（无论成功/出错）即归零空闲计时——
 		// 用户口径"只有 run 结束才重置"。放在 Lock.Run 之后：此刻本轮真的结束了。
 		state.LastRunEnd.Store(time.Now().UnixMilli())
-		// 空转避让计数（放在计时归零之后：两者都是"本轮真的结束了"的收尾）
-		// 空队列的那次迭代（循环靠它 break）不算一轮，绝不能碰计数——
-		// 否则它走 else 分支把刚加上的空转计数又清零（e2e 才抓出来，纯函数测不到）。
-		if len(msgs) > 0 {
-			if hbOnly && toolCalls == 0 {
-				state.HbNoopStreak.Add(1)
-			} else {
-				state.HbNoopStreak.Store(0)
-			}
-		}
 		if len(msgs) == 0 {
 			break // 空队列（ActiveDrain 已在锁内摘除）→ 本 drain 完成
 		}
@@ -613,64 +548,23 @@ func runDrain(state *AppState, a *AgentState, h *drainHandle, onEvent func(types
 // heartbeatStatus /status 里的心跳可观测字段：开关、阈值、上次 run 结束时刻、
 // 当前已空闲多久、下次预计触发时刻（running 时 next_due 按"正在 run 不计时"
 // 语义给 null——真实下次取决于本轮何时结束）。
-func heartbeatStatus(cfg config.HeartbeatCfg, lastRunEndMs int64, running bool, streak int) map[string]interface{} {
-	base := cfg.IntervalMin
-	if base <= 0 {
-		base = config.Default().Heartbeat.IntervalMin
-	}
-	eff := heartbeatIntervalMin(cfg, streak)
-	out := map[string]interface{}{
-		"enabled":                cfg.Enabled,
-		"interval_min":           base,
-		"backoff":                cfg.Backoff,
-		"backoff_max_min":        backoffCap(cfg),
-		"noop_streak":            streak,
-		"effective_interval_min": eff,
-		"last_run_end_ms":        lastRunEndMs,
-		"idle_ms":                time.Now().UnixMilli() - lastRunEndMs,
-	}
-	if running || !cfg.Enabled {
-		out["next_due_ms"] = nil
-	} else {
-		out["next_due_ms"] = lastRunEndMs + int64(eff)*60000
-	}
-	return out
-}
-
-// defaultHeartbeatBackoffMaxMin 退避封顶的出厂默认（分钟）：配置里 <=0 时用它。
-const defaultHeartbeatBackoffMaxMin = 240
-
-// backoffCap 退避封顶（分钟）。
-func backoffCap(cfg config.HeartbeatCfg) int {
-	if cfg.BackoffMaxMin <= 0 {
-		return defaultHeartbeatBackoffMaxMin
-	}
-	return cfg.BackoffMaxMin
-}
-
-// heartbeatIntervalMin 本轮实际生效的心跳间隔（分钟）：空转避让开着且已连续
-// 空转 streak 轮 → 基准间隔翻倍 streak 次，封顶 backoffCap。streak<=0 或避让
-// 关着就是基准。循环用 v<cap 兜住，不会溢出成负数。
-func heartbeatIntervalMin(cfg config.HeartbeatCfg, streak int) int {
+func heartbeatStatus(cfg config.HeartbeatCfg, lastRunEndMs int64, running bool) map[string]interface{} {
 	mins := cfg.IntervalMin
 	if mins <= 0 {
 		mins = config.Default().Heartbeat.IntervalMin
 	}
-	if !cfg.Backoff || streak <= 0 {
-		return mins
+	out := map[string]interface{}{
+		"enabled":         cfg.Enabled,
+		"interval_min":    mins,
+		"last_run_end_ms": lastRunEndMs,
+		"idle_ms":         time.Now().UnixMilli() - lastRunEndMs,
 	}
-	cap := backoffCap(cfg)
-	if cap < mins {
-		cap = mins // 封顶配得比基准还小 → 退让于基准：避让只会拉长间隔，绝不能变本加厉
+	if running || !cfg.Enabled {
+		out["next_due_ms"] = nil
+	} else {
+		out["next_due_ms"] = lastRunEndMs + int64(mins)*60000
 	}
-	v := mins
-	for i := 0; i < streak && v < cap; i++ {
-		v *= 2
-	}
-	if v > cap {
-		return cap
-	}
-	return v
+	return out
 }
 
 // heartbeatTickMS 心跳巡检粒度：30s 一次。间隔本身以分钟配置，30s 粒度足够，
@@ -679,14 +573,18 @@ const heartbeatTickMS = 30000
 
 // heartbeatDue 触发判定（纯函数，可测）：开关关或正在 run → 不触发；
 // 距上次 run 结束 ≥ interval → 触发。interval <=0 退回默认值。
-func heartbeatDue(nowMs, lastRunEndMs int64, cfg config.HeartbeatCfg, running bool, streak int) bool {
+func heartbeatDue(nowMs, lastRunEndMs int64, cfg config.HeartbeatCfg, running bool) bool {
 	if !cfg.Enabled || running {
 		return false
+	}
+	mins := cfg.IntervalMin
+	if mins <= 0 {
+		mins = config.Default().Heartbeat.IntervalMin
 	}
 	if lastRunEndMs <= 0 {
 		return false // 计时基准未初始化（防御）
 	}
-	return nowMs-lastRunEndMs >= int64(heartbeatIntervalMin(cfg, streak))*60000
+	return nowMs-lastRunEndMs >= int64(mins)*60000
 }
 
 // StartHeartbeat 起空闲心跳巡检：每 heartbeatTickMS 检查一次，满足 heartbeatDue
@@ -717,15 +615,13 @@ func startHeartbeat(state *AppState, a *AgentState, tickMS int) func() {
 			running := a.Lock.Running() || state.ActiveDrain != nil
 			last := state.LastRunEnd.Load()
 			state.mu.Unlock()
-			streak := int(state.HbNoopStreak.Load())
-			eff := heartbeatIntervalMin(hb, streak)
-			if !heartbeatDue(now, last, hb, running, streak) {
+			if !heartbeatDue(now, last, hb, running) {
 				continue
 			}
 			state.LastRunEnd.Store(now)
-			fmt.Fprintf(os.Stderr, "[heartbeat] 空闲 %d 分钟无 run → 主动开启一轮（生效阈值 %d 分钟，连续空转 %d 轮，避让=%v）\n",
-				(now-last)/60000, eff, streak, hb.Backoff)
-			enqueueHeartbeat(state, a, hb.Prompt, makeOnEvent(state, a))
+			fmt.Fprintf(os.Stderr, "[heartbeat] 空闲 %d 分钟无 run → 主动开启一轮（阈值 %d 分钟）\n",
+				(now-last)/60000, hb.IntervalMin)
+			enqueueAndWake(state, a, hb.Prompt, makeOnEvent(state, a))
 		}
 	}()
 	return t.Stop
@@ -1220,7 +1116,7 @@ func (ap *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{
 		"session":   int(a.SessionNo.Load()),
 		"running":   running,
-		"heartbeat": heartbeatStatus(cfg.Heartbeat, ap.state.LastRunEnd.Load(), running, int(ap.state.HbNoopStreak.Load())),
+		"heartbeat": heartbeatStatus(cfg.Heartbeat, ap.state.LastRunEnd.Load(), running),
 		"system_prompt": map[string]interface{}{
 			"fallback": fallback,
 			"files":    files,
@@ -1238,7 +1134,7 @@ func (ap *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 func (ap *App) handleQueue(w http.ResponseWriter, r *http.Request) {
 	a := ap.state.Agent
 	ap.state.mu.Lock()
-	queued := queuedTexts(ap.state.MessageQueue)
+	queued := append([]string(nil), ap.state.MessageQueue...)
 	running := a.Lock.Running() || ap.state.ActiveDrain != nil
 	ap.state.mu.Unlock()
 	// 快照取一次（2026-09-14 审计修：旧代码每次迭代都调 Session() 取活引用，
@@ -1427,7 +1323,7 @@ func (ap *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 	a := ap.state.Agent
 	conn := newSSE(w)
 	ap.state.mu.Lock()
-	queued := queuedTexts(ap.state.MessageQueue)
+	queued := append([]string(nil), ap.state.MessageQueue...)
 	running := a.Lock.Running() || ap.state.ActiveDrain != nil
 	session := int(a.SessionNo.Load())
 	bgPending := a.BG().Count()

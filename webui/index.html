@@ -1304,8 +1304,6 @@ const CFG_SCHEMA = [
   { section: "heartbeat", title: "空闲心跳（持续无 run 到点 → 主动发提示词开启一轮）", fields: [
     { key: "enabled", label: "enabled：空闲到点自动开启一轮 run", type: "select", bool: true, options: [{v:"true",l:"开"},{v:"false",l:"关"}] },
     { key: "interval_min", label: "interval_min：空闲多少分钟后触发（run 结束才重置计时，正在 run 期间不计时）", type: "number", step: 1, note: "1–1440" },
-    { key: "backoff", label: "backoff：空转避让——连续几轮心跳一次工具调用都没有，就把触发间隔翻倍（真实 run 或有工具调用的心跳归零）", type: "select", bool: true, options: [{v:"true",l:"开"},{v:"false",l:"关"}] },
-    { key: "backoff_max_min", label: "backoff_max_min：避让封顶（分钟，留空/≤0 按 240）", type: "number", step: 1, note: "1–10080" },
     { key: "prompt", label: "prompt：触发时发给模型的心跳提示词", type: "textarea", rows: 6 },
   ]},
   { section: "data", title: "落盘", fields: [
