@@ -22,10 +22,19 @@ button:hover{background:#37415a}button:disabled{opacity:.35;cursor:default}
 #msg.ok{display:block;background:#17321f;color:#7ee787}
 #msg.err{display:block;background:#3a1d1d;color:#e08585}
 .small{color:#778;font-size:12px}
+#insts{margin-bottom:8px}
+button.tab.on{background:#4c8dd6;color:#fff;border-color:#4c8dd6}
+#ui{width:100%;height:78vh;border:1px solid #2a2f36;border-radius:6px;background:#0e0e12;display:block}
+#uihint{margin:4px 0 0}
 </style>
 </head>
 <body>
 <h1>OkHuman 监控（okmon）<span id="ts" class="small"></span></h1>
+
+<h2>实例界面</h2>
+<div id="insts"></div>
+<iframe id="ui" src="about:blank"></iframe>
+<p id="uihint" class="small">内嵌的是该实例<b>自己的</b> webui（同源，接口全通），功能与直接开 <code>http://127.0.0.1:&lt;端口&gt;/</code> 完全一致——不是复制品，所以 OkHuman 前端更新这里自动跟着更新。切换实例会重载该页。</p>
 
 <h2>显卡</h2>
 <table id="gpus"><tr><th>#</th><th>名称</th><th>利用率</th><th>显存</th><th>温度</th><th>功耗</th></tr></table>
@@ -71,8 +80,32 @@ async function tick(){
       s+=`<tr><td><b>${x.label||x.name}</b>${x.auto?'<span class="small" style="color:#8ab4f8"> 自动追踪</span>':''}<div class="small">${x.name}</div></td><td>${dot}</td><td>${x.pid||'—'}</td><td>${x.port||'—'}</td><td>${up(x.uptime_s)}</td><td>${x.mem_mb?Math.round(x.mem_mb)+' MB':'—'}</td><td>${x.cpu_pct>0.05?x.cpu_pct.toFixed(1)+'%':'—'}</td><td>${btns}</td></tr>`;
     }
     document.getElementById('svcs').innerHTML=s;
+    renderInsts(st.services.filter(x=>x.instance && x.running && x.port>0));
   }catch(e){document.getElementById('ts').textContent='拉取失败: '+e}
 }
+let curUI = localStorage.getItem('okmon.ui') || '';
+
+function renderInsts(list){
+  const box = document.getElementById('insts');
+  const f = document.getElementById('ui');
+  if(!list.length){
+    box.innerHTML = '<span class="small">没有运行中的 okhuman 实例（要有监听端口才算，纯 CLI 的没有界面可嵌）</span>';
+    if(f.src!=='about:blank') f.src='about:blank';
+    return;
+  }
+  // 选中的实例掉了就自动切到第一个，别把 iframe 留在死端口上
+  if(!list.some(x=>String(x.port)===String(curUI))) curUI = list[0].port;
+  let h='';
+  for(const x of list)
+    h += `<button class="tab ${String(x.port)===String(curUI)?'on':''}" onclick="pickUI(${x.port})">${x.label||x.name} <span class="small">:${x.port}</span></button>`;
+  const url = `http://127.0.0.1:${curUI}/`;
+  h += ` <a href="${url}" target="_blank" class="small" style="color:#8ab4f8">在新标签页打开</a>`;
+  box.innerHTML = h;
+  // 只在切换时改 src：每 2 秒刷新会把界面重载一遍，等于没法用
+  if(f.dataset.port !== String(curUI)){ f.dataset.port = String(curUI); f.src = url; }
+}
+function pickUI(p){ curUI = String(p); localStorage.setItem('okmon.ui', curUI); tick(); }
+
 async function act(action,name){
   const r=await fetch('/api/services/'+action,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
   const j=await r.json();

@@ -3,6 +3,9 @@
 两块能力：
 1. **显卡使用**：nvidia-smi 每卡利用率/显存/温度/功耗 + 显存占用进程（自动标注对应 OkHuman 服务）。
 2. **OkHuman 系 Go 常驻进程**：okhuman 实例（默认 8451，多实例各自端口）+ Go 插件（qq-channel/browser/cron…），状态/内存/CPU/运行时长，**webui 里一键启动/停止**。
+3. **实例界面入口**：webui 顶部一排按钮，自动列出全部运行中的 okhuman 实例，点开就在同页
+   iframe 里加载**该实例自己的 webui**——不是复制品，功能 100% 等价，主程序前端更新这里自动
+   跟着更新。选择记在 localStorage，实例掉了自动切到别的。
 3. **自动追踪一切 Go 版 okhuman 进程**：配置表之外出现的 okhuman 进程（如一次性实例，comm 精确 `okhuman`）自动出现在进程表（标注"自动追踪"，带 pid/端口/内存/CPU），**可停止、无启动按钮**；进程退出后自动消失。
 
 Go 单二进制（`main.go`），无外部依赖（标准库），挂掉不影响主进程。
@@ -15,7 +18,7 @@ setsid ./okmon </dev/null > /tmp/okmon.log 2>&1 &
 ```
 
 - webui：http://127.0.0.1:8496/（2 秒自动刷新）
-- API：`GET /api/state`（全量状态 JSON）、`POST /api/services/start`、`POST /api/services/stop`（body `{"name":"<服务名>"}`）
+- API：`GET /api/state`（全量状态 JSON，okhuman 实例条目带 `instance: true`）、`POST /api/services/start`、`POST /api/services/stop`（body `{"name":"<服务名>"}`）
 
 ## 配置（config.json）
 
@@ -47,6 +50,22 @@ setsid ./okmon </dev/null > /tmp/okmon.log 2>&1 &
 | cron | 定时任务 | 端口 8601 |
 | computer | 桌面操作 xusectl | CLI |
 | scout | 语义检索 | 端口 8480 |
+
+## 实例界面的边界（诚实列）
+
+- **一次只看一个实例**（切 iframe 的 src）。**没有**跨实例统一视图/统一搜索/群发——那要在
+  okmon 侧做代理聚合：浏览器跨端口 `fetch` 会被 CORS 挡，因为 **OkHuman 实例不发
+  `Access-Control-Allow-Origin`**（实测）。想做就走 okmon 后端代理，别在前端硬连。
+- 内嵌成立的前提是实例**不发** `X-Frame-Options` / `CSP frame-ancestors`（实测没有），且
+  实例 UI 没有 framebusting JS（实测没有）。**主程序哪天加上这些头，这里就失效。**
+- 只有**有监听端口**的实例才出现在按钮里（纯 CLI 的没有界面可嵌）。
+- 2 秒自动刷新**不会**重载 iframe（`dataset.port` 守卫）——否则界面每 2 秒闪一次，没法用。
+
+## 改 webui.html 必须重编
+
+`webui.html` 是 `//go:embed` 烘进二进制的，**不是**运行时读盘。改完 HTML 不重编，页面还是旧的
+（实测踩过：改完 HTML 只重启进程，浏览器里新加的 `#insts` 根本不存在）。正确顺序：
+改 → `go build -o okmon .` → 重启 → 浏览器实测。
 
 ## 排障
 

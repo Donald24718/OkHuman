@@ -331,6 +331,9 @@ type ServiceState struct {
 	CPUPct  float64 `json:"cpu_pct"`
 	UptimeS int     `json:"uptime_s"`
 	Auto    bool    `json:"auto,omitempty"` // 自动追踪的 okhuman 进程（配置之外，只读+可停止）
+	// Instance：这个 pid 确实是 Go 版 okhuman 主程序（不是同名路径的别的进程）。
+	// webui 据此决定给不给"进入界面"入口——只有 instance && port>0 才有 UI 可嵌。
+	Instance bool `json:"instance,omitempty"`
 }
 
 type State struct {
@@ -343,6 +346,13 @@ type State struct {
 func collectState() State {
 	st := State{TS: time.Now().Format("15:04:05")}
 	st.GPUs, st.GPUApps = queryGPU()
+	// 一次 pgrep 复用两处：标记哪些条目是 okhuman 实例（webui 据此给界面入口），
+	// 以及下面"配置表之外的 okhuman 进程"自动追踪。扫两次会因进程起止出现不一致。
+	okPids := okhumanPids()
+	isOk := map[int]bool{}
+	for _, pid := range okPids {
+		isOk[pid] = true
+	}
 	for _, s := range cfg.Services {
 		ss := ServiceState{Service: s, Running: true}
 		if s.CLI {
@@ -357,6 +367,7 @@ func collectState() State {
 		} else {
 			ss.Pid = pid
 			ss.Cmdline, ss.MemMB, ss.CPUPct, ss.UptimeS = procInfo(pid)
+			ss.Instance = isOk[pid] && s.Port > 0
 		}
 		st.Services = append(st.Services, ss)
 	}
@@ -368,7 +379,7 @@ func collectState() State {
 		}
 	}
 	portOf := portsByPid()
-	for _, pid := range okhumanPids() {
+	for _, pid := range okPids {
 		if covered[pid] {
 			continue
 		}
@@ -378,9 +389,10 @@ func collectState() State {
 				Label: "其他 Go okhuman 实例",
 				Port:  portOf[pid],
 			},
-			Running: true,
-			Pid:     pid,
-			Auto:    true,
+			Running:  true,
+			Pid:      pid,
+			Auto:     true,
+			Instance: true,
 		}
 		ss.Cmdline, ss.MemMB, ss.CPUPct, ss.UptimeS = procInfo(pid)
 		st.Services = append(st.Services, ss)
