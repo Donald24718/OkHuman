@@ -1,0 +1,10 @@
+{
+  "listen": { "host": "0.0.0.0", "port": 8602 },
+  "token": "",
+  "instances": [
+    { "id": "8451", "url": "http://127.0.0.1:8451" },
+    { "id": "8452", "url": "http://127.0.0.1:8452" }
+  ],
+  "default_instance": "8451",
+  "allow_config_write": false
+}

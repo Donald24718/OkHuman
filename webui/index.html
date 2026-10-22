@@ -250,6 +250,43 @@
   .row > * { flex: none; }
   .grow { flex: 1 !important; min-width: 120px; }
   hr.sep { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+
+  /* ---------- 移动端适配（2026-10-22）----------
+     桌面版是「左 210px 侧栏 + 右主区」两栏：390px 宽的手机上主区只剩 180px，
+     grid2/grid3 再切两三份完全没法看。这里**只加 @media**，桌面行为一字不改：
+     侧栏收成顶部横条、栅格塌成单列、触控目标加大、输入字号 ≥16px（iOS 聚焦才不整页放大）。*/
+  @media (max-width: 720px) {
+    body { flex-direction: column; }
+    aside {
+      width: auto; min-width: 0; flex-direction: row; flex-wrap: wrap; align-items: center;
+      gap: 10px; padding: 8px 10px; border-right: none; border-bottom: 1px solid var(--border);
+    }
+    .logo { padding: 0 4px; }
+    .logo-text { display: none; }              /* 顶栏紧，留 👌 足够认 */
+    nav { flex-direction: row; flex-wrap: wrap; gap: 4px; }
+    nav a { padding: 7px 10px; font-size: 13px; }
+    .side-foot { margin: 0 0 0 auto; flex-direction: row; align-items: center; gap: 10px; padding: 0; }
+    main { padding: 12px 12px 14px; }
+    .page { max-width: none; }
+    h1 { font-size: 16px; gap: 6px; margin-bottom: 10px; }
+    h1 .sub { flex-basis: 100%; }
+    .card { padding: 12px; border-radius: 10px; margin-bottom: 10px; }
+    .grid2, .grid3 { grid-template-columns: 1fr; gap: 10px; }
+    .bubble { max-width: 92%; }
+    .msg.sys .bubble { max-width: 96%; }
+    /* 聊天可视高度重算：dvh 跟着手机地址栏伸缩，vh 会差一截（先写 vh 兜底，支持 dvh 的浏览器覆盖） */
+    #chatWrap { height: calc(100vh - 150px); height: calc(100dvh - 150px); }
+    #chatInputRow { gap: 6px; }
+    #chatInput { height: 46px; font-size: 16px; }
+    #chatInputRow button { width: 62px; padding: 8px 6px; font-size: 13px; }
+    button { padding: 8px 12px; }
+    button.small { padding: 5px 9px; }
+    input, select, textarea { font-size: 16px; }
+    table { font-size: 12px; }
+    th, td { padding: 5px 6px; }
+    #stBgRun { overflow-x: auto; }             /* 宽表横向滚，不撑破页面 */
+    .to-bottom { bottom: 10px; right: 10px; }
+  }
 </style>
 </head>
 <body>
