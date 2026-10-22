@@ -41,6 +41,9 @@ jobs:
         env: { GOOS: "", GOARCH: "" }
         run: |
           go vet ./...
+          # 前端净化（XSS）回归需要 jsdom：runner 自带 node 但不带 jsdom。
+          # 这里装上，让这条安全测试在 CI 里真跑，而不是被 skip 掩盖。
+          npm install --no-save --silent --no-fund --no-audit jsdom
           go test ./...
 
       - name: build

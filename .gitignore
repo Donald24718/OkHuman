@@ -4,3 +4,4 @@
 /build/
 /okhuman.bak-*
 /okhuman-stdout.log
+/node_modules/

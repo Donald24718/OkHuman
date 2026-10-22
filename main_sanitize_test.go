@@ -18,6 +18,12 @@ func TestWebuiSanitize(t *testing.T) {
 	if jsdom == "" {
 		jsdom = "jsdom"
 	}
+	// 解析不到 jsdom 就 skip，不是 fail。测试的价值是"能跑的环境里真跑"，
+	// 不该因为环境缺依赖把整条流水线判死——GitHub runner 自带 node 但不带
+	// jsdom，v0.6.0 的 Release 就是这么三个平台全挂的（发布物没发出去）。
+	if err := exec.Command(node, "-e", "require.resolve(process.argv[1])", jsdom).Run(); err != nil {
+		t.Skipf("无 jsdom（%s），跳过前端净化测试；装好后用 OKHUMAN_JSDOM 指模块路径即可真跑", jsdom)
+	}
 	cmd := exec.Command(node, filepath.Join("webui", "sanitize_test.mjs"))
 	cmd.Env = append(os.Environ(), "OKHUMAN_JSDOM="+jsdom)
 	out, err := cmd.CombinedOutput()
