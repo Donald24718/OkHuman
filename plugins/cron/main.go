@@ -23,7 +23,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -31,15 +30,15 @@ import (
 // ---------- 类型（同早期 TS 版 cron/types.ts） ----------
 
 type CronJob struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Prompt     string `json:"prompt"`
-	EveryMs    *int64 `json:"every_ms"`
-	At         *int64 `json:"at"`
-	LastRunAt  int64  `json:"last_run_at"`
-	NextRunAt  int64  `json:"next_run_at"`
-	CreatedAt  int64  `json:"created_at"`
-	Catchup    int    `json:"catchup"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Prompt    string `json:"prompt"`
+	EveryMs   *int64 `json:"every_ms"`
+	At        *int64 `json:"at"`
+	LastRunAt int64  `json:"last_run_at"`
+	NextRunAt int64  `json:"next_run_at"`
+	CreatedAt int64  `json:"created_at"`
+	Catchup   int    `json:"catchup"`
 }
 
 type CronJobInput struct {
@@ -54,30 +53,30 @@ type CronRunRecord struct {
 	Name       string `json:"name"`
 	At         int64  `json:"at"`
 	OK         bool   `json:"ok"`
-	ReplyChars int    `json:"reply_chars"`
+	Position   int    `json:"position"` // 入队位置（只管发，不拿回复）
 	DurationMs int64  `json:"duration_ms"`
 	Catchup    bool   `json:"catchup"`
 }
 
 type CronFileData struct {
-	Jobs []CronJob         `json:"jobs"`
-	Runs []CronRunRecord   `json:"runs"`
+	Jobs []CronJob       `json:"jobs"`
+	Runs []CronRunRecord `json:"runs"`
 }
 
 // 任务展示视图（补人类可读的下次触发时间；与核心 cronJobView 同形）
 type cronJobView struct {
-	ID          string  `json:"id"`
-	Name        string  `json:"name"`
-	Prompt      string  `json:"prompt"`
-	Kind        string  `json:"kind"`
-	EveryMs     *int64  `json:"every_ms"`
-	At          *int64  `json:"at"`
-	NextRunAt   int64   `json:"next_run_at"`
-	NextRunIso  *string `json:"next_run_iso"`
-	LastRunAt   int64   `json:"last_run_at"`
-	Paused      bool    `json:"paused"`
-	Catchup     int     `json:"catchup"`
-	CreatedAt   int64   `json:"created_at"`
+	ID         string  `json:"id"`
+	Name       string  `json:"name"`
+	Prompt     string  `json:"prompt"`
+	Kind       string  `json:"kind"`
+	EveryMs    *int64  `json:"every_ms"`
+	At         *int64  `json:"at"`
+	NextRunAt  int64   `json:"next_run_at"`
+	NextRunIso *string `json:"next_run_iso"`
+	LastRunAt  int64   `json:"last_run_at"`
+	Paused     bool    `json:"paused"`
+	Catchup    int     `json:"catchup"`
+	CreatedAt  int64   `json:"created_at"`
 }
 
 func makeView(j CronJob) cronJobView {
@@ -94,8 +93,8 @@ func makeView(j CronJob) cronJobView {
 		ID: j.ID, Name: j.Name, Prompt: j.Prompt, Kind: kind,
 		EveryMs: j.EveryMs, At: j.At, NextRunAt: j.NextRunAt, NextRunIso: iso,
 		LastRunAt: j.LastRunAt,
-		Paused:  j.At == nil && j.NextRunAt == 0,
-		Catchup: j.Catchup, CreatedAt: j.CreatedAt,
+		Paused:    j.At == nil && j.NextRunAt == 0,
+		Catchup:   j.Catchup, CreatedAt: j.CreatedAt,
 	}
 }
 
@@ -107,13 +106,12 @@ type InstanceCfg struct {
 }
 
 type PluginConfig struct {
-	Host           string
-	Port           int
-	TickMs         int
-	CatchupMax     int
-	ChatTimeoutSec int
-	DataDir        string
-	Instances      []InstanceCfg
+	Host       string
+	Port       int
+	TickMs     int
+	CatchupMax int
+	DataDir    string
+	Instances  []InstanceCfg
 }
 
 func parseConfig(root string) PluginConfig {
@@ -133,7 +131,7 @@ func parseConfig(root string) PluginConfig {
 	if !filepath.IsAbs(dataDir) {
 		dataDir = filepath.Join(root, dataDir)
 	}
-	cfg := PluginConfig{Host: "127.0.0.1", Port: 8601, TickMs: 1000, CatchupMax: 3, ChatTimeoutSec: 600, DataDir: dataDir}
+	cfg := PluginConfig{Host: "127.0.0.1", Port: 8601, TickMs: 1000, CatchupMax: 3, DataDir: dataDir}
 	if server, ok := f["server"].(map[string]interface{}); ok {
 		if h, ok := server["host"].(string); ok {
 			cfg.Host = h
@@ -147,9 +145,6 @@ func parseConfig(root string) PluginConfig {
 	}
 	if v, ok := f["catchup_max"].(float64); ok {
 		cfg.CatchupMax = int(v)
-	}
-	if v, ok := f["chat_timeout_sec"].(float64); ok && v > 0 {
-		cfg.ChatTimeoutSec = int(v)
 	}
 	if cfg.TickMs <= 0 {
 		fatalf("tick_ms 需为正整数（毫秒）")
@@ -242,12 +237,12 @@ func loadCronFile(agentDir string) CronFileData {
 		name, _ := r["name"].(string)
 		at, ok1 := r["at"].(float64)
 		ok, ok2 := r["ok"].(bool)
-		replyChars, ok3 := r["reply_chars"].(float64)
+		pos, _ := r["position"].(float64) // 旧文件里是 reply_chars，读不到就是 0（只是展示字段，不因此丢记录）
 		duration, ok4 := r["duration_ms"].(float64)
-		if jobID == "" || name == "" || !ok1 || !ok2 || !ok3 || !ok4 {
+		if jobID == "" || name == "" || !ok1 || !ok2 || !ok4 {
 			continue
 		}
-		rec := CronRunRecord{JobID: jobID, Name: name, At: int64(at), OK: ok, ReplyChars: int(replyChars), DurationMs: int64(duration)}
+		rec := CronRunRecord{JobID: jobID, Name: name, At: int64(at), OK: ok, Position: int(pos), DurationMs: int64(duration)}
 		if c, isBool := r["catchup"].(bool); isBool {
 			rec.Catchup = c
 		}
@@ -411,8 +406,10 @@ func (s *CronStore) resume(id string) bool {
 
 // 启动时重排（补跑决策）：返回需立即触发的任务。
 // 循环任务以 last_run_at 为相位锚点（从未执行则用 next_run_at 锚点）：
-//   missed = 已错过的周期数 → catchup=min(missed, 上限)；
-//   next_run_at = 锚点 + (missed+1) 个周期 → 严格落在现在之后（相位不漂移）。
+//
+//	missed = 已错过的周期数 → catchup=min(missed, 上限)；
+//	next_run_at = 锚点 + (missed+1) 个周期 → 严格落在现在之后（相位不漂移）。
+//
 // 单次任务：已过期 → 补跑一次。
 func (s *CronStore) rescheduleOnBoot() []CronJob {
 	now := time.Now().UnixMilli()
@@ -446,7 +443,7 @@ func (s *CronStore) rescheduleOnBoot() []CronJob {
 				j.NextRunAt = anchor + (missed+1)*period
 			} else {
 				anchor := j.NextRunAt
-				missed = (now - anchor) / period + 1
+				missed = (now-anchor)/period + 1
 				if missed < 1 {
 					missed = 1
 				}
@@ -467,8 +464,9 @@ func (s *CronStore) rescheduleOnBoot() []CronJob {
 }
 
 // 触发执行完成：
-//   advance=true（自然到点触发）→ 循环任务锚点推进 next=now+period；单次任务删除。
-//   advance=false（手动立即执行）→ 循环任务排程相位不动；单次任务仍视为已消费，删除。
+//
+//	advance=true（自然到点触发）→ 循环任务锚点推进 next=now+period；单次任务删除。
+//	advance=false（手动立即执行）→ 循环任务排程相位不动；单次任务仍视为已消费，删除。
 func (s *CronStore) markDone(job CronJob, advance bool) {
 	if job.At != nil {
 		s.remove(job.ID)
@@ -493,20 +491,27 @@ func (s *CronStore) markDone(job CronJob, advance bool) {
 
 // ---------- 触发句柄（同 lib.ts makeHandle） ----------
 
-func makeHandle(instanceURL, id string, timeout time.Duration) func(job CronJob) (string, error) {
+// enqueueTimeoutSec 入队请求本身的超时：入队是瞬时动作（把消息塞进实例队列就返回），
+// 10s 只是防"实例整个 HTTP 卡死"，不是等它跑完那一轮。
+const enqueueTimeoutSec = 10
+
+// makeHandle 只管发：POST /enqueue 把 prompt 投进实例的消息队列，拿到入队位置就返回。
+// **不等那一轮跑完**——所以没有"600s 超时但其实跑了"的误判，也不占任何锁。
+// 要结果是人去管理页看，不是插件一直挂着等。
+func makeHandle(instanceURL, id string) func(job CronJob) (int, error) {
 	base := strings.TrimSuffix(instanceURL, "/")
-	return func(job CronJob) (string, error) {
+	return func(job CronJob) (int, error) {
 		body, _ := json.Marshal(map[string]string{"message": job.Prompt})
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(context.Background(), enqueueTimeoutSec*time.Second)
 		defer cancel()
-		req, _ := http.NewRequestWithContext(ctx, "POST", base+"/chat", strings.NewReader(string(body)))
+		req, _ := http.NewRequestWithContext(ctx, "POST", base+"/enqueue", strings.NewReader(string(body)))
 		req.Header.Set("content-type", "application/json")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			if ctx.Err() == context.DeadlineExceeded {
-				return "", fmt.Errorf("实例 %s /chat 超时（%s 无响应）", id, timeout)
+				return 0, fmt.Errorf("实例 %s /enqueue 无响应（%ds）——实例 HTTP 层卡死", id, enqueueTimeoutSec)
 			}
-			return "", fmt.Errorf("实例 %s /chat 连接失败: %v", id, err)
+			return 0, fmt.Errorf("实例 %s /enqueue 连接失败: %v", id, err)
 		}
 		defer resp.Body.Close()
 		raw, _ := io.ReadAll(resp.Body)
@@ -518,15 +523,15 @@ func makeHandle(instanceURL, id string, timeout time.Duration) func(job CronJob)
 			if json.Unmarshal(raw, &j) == nil && j.Error != "" {
 				detail = j.Error
 			}
-			return "", fmt.Errorf("实例 %s /chat %d：%s", id, resp.StatusCode, detail)
+			return 0, fmt.Errorf("实例 %s /enqueue %d：%s", id, resp.StatusCode, detail)
 		}
 		var j struct {
-			Reply string `json:"reply"`
+			Position int `json:"position"`
 		}
-		if err := json.Unmarshal(raw, &j); err != nil || j.Reply == "" {
-			return "", fmt.Errorf("实例 %s /chat 返回缺 reply 字段", id)
+		if json.Unmarshal(raw, &j) != nil {
+			return 0, fmt.Errorf("实例 %s /enqueue 返回不可解析", id)
 		}
-		return j.Reply, nil
+		return j.Position, nil
 	}
 }
 
@@ -536,7 +541,7 @@ type CronInstance struct {
 	ID     string
 	URL    string
 	Store  *CronStore
-	Handle func(job CronJob) (string, error)
+	Handle func(job CronJob) (int, error)
 }
 
 type Scheduler struct {
@@ -548,8 +553,9 @@ type Scheduler struct {
 }
 
 type instState struct {
-	firing  map[string]bool
-	running int32 // 0/1，CAS 占位：保证同实例串行（bool 的 check-then-set 非原子）
+	firing map[string]bool // 防同一任务被相邻 tick 重复点火
+	// 原先还有个 running int32 的 CAS 忙等锁（同实例串行）——入队是瞬时动作，
+	// 不需要串行；实例自己会排队。锁删掉，自旋也就没了。
 }
 
 func NewScheduler(tickMs int, log func(string)) *Scheduler {
@@ -672,36 +678,30 @@ func (sc *Scheduler) trigger(inst CronInstance, job CronJob, catchup, advance bo
 		return false, "", "实例未注册"
 	}
 	sc.mu.Unlock()
-	// 同实例串行：CAS 占位（旧 check-then-set 非原子：自然到点 + 手动立即执行可并行打同实例）
-	for !atomic.CompareAndSwapInt32(&st.running, 0, 1) {
-		time.Sleep(50 * time.Millisecond)
-	}
 	startedAt := time.Now().UnixMilli()
 	sc.log(fmt.Sprintf("[cron] 触发：inst=%s job=%s（%s）%s", inst.ID, job.ID, job.Name, map[bool]string{true: "（重启补跑）", false: ""}[catchup]))
 	ok := true
-	reply := ""
-	r, err := inst.Handle(job)
+	position := 0
+	pos, err := inst.Handle(job)
 	if err != nil {
 		ok = false
-		reply = ""
-		sc.log(fmt.Sprintf("[cron] 触发失败：inst=%s job=%s：%v", inst.ID, job.ID, err))
+		sc.log(fmt.Sprintf("[cron] 入队失败：inst=%s job=%s：%v", inst.ID, job.ID, err))
 	} else {
-		reply = r
+		position = pos
 	}
 	// 执行完成 → 推进排程（单次删除 / 循环重排）。失败也推进，避免失败任务每 tick 重发。
 	sc.mu.Lock()
 	inst.Store.markDone(job, advance)
 	inst.Store.recordRun(CronRunRecord{
 		JobID: job.ID, Name: job.Name, At: startedAt,
-		OK: ok, ReplyChars: len([]rune(reply)),
+		OK: ok, Position: position,
 		DurationMs: time.Now().UnixMilli() - startedAt, Catchup: catchup,
 	})
-	atomic.StoreInt32(&st.running, 0)
 	sc.mu.Unlock()
 	if !ok {
-		return false, "", "触发失败"
+		return false, "", "入队失败"
 	}
-	return true, reply, ""
+	return true, fmt.Sprintf("已入队（位置 %d）", position), ""
 }
 
 func (sc *Scheduler) RecentRuns(instanceID string, limit int) []CronRunRecord {
@@ -757,7 +757,7 @@ func main() {
 			ID:     it.ID,
 			URL:    it.URL,
 			Store:  newCronStore(filepath.Join(cfg.DataDir, it.ID), cfg.CatchupMax),
-			Handle: makeHandle(it.URL, it.ID, time.Duration(cfg.ChatTimeoutSec)*time.Second),
+			Handle: makeHandle(it.URL, it.ID),
 		})
 	}
 

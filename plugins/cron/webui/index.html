@@ -188,12 +188,12 @@ function jobsTable(jobs) {
 }
 
 function runsTable(runs) {
-  return `<table><tr><th>任务</th><th>时间</th><th>结果</th><th>回复长度</th><th>耗时</th><th>补跑</th></tr>` +
+  return `<table><tr><th>任务</th><th>时间</th><th>结果</th><th>入队位置</th><th>入队耗时</th><th>补跑</th></tr>` +
     runs.map((r) => `<tr>
       <td>${esc(r.name)} <span class="mono" style="color:var(--dim)">${esc(r.job_id)}</span></td>
       <td class="mono">${new Date(r.at).toLocaleString("zh-CN", { hour12: false })}</td>
       <td class="${r.ok ? "ok" : "fail"}">${r.ok ? "✓ 成功" : "✗ 失败"}</td>
-      <td class="mono">${r.reply_chars} 字</td>
+      <td class="mono">#${r.position}</td>
       <td class="mono">${(r.duration_ms / 1000).toFixed(1)}s</td>
       <td>${r.catchup ? "是" : "—"}</td>
     </tr>`).join("") + "</table>";
