@@ -86,6 +86,15 @@ type HeartbeatCfg struct {
 	Enabled     bool   `json:"enabled"`
 	IntervalMin int    `json:"interval_min"` // 空闲多少分钟后触发（<=0 按默认）
 	Prompt      string `json:"prompt"`       // 触发时发给模型的提示词
+
+	// Backoff 空转避让（2026-10-22 定）：连续若干轮**纯心跳** run 一次工具调用
+	// 都没有（= 模型自查后判定无事可做）→ 触发间隔按 2 的幂翻倍，封顶
+	// BackoffMaxMin。任何真实 run、或"有工具调用的心跳"都把计数归零。
+	// 动机：空闲时每一轮心跳都要付一整次 LLM 调用（上下文越大越贵），
+	// 而连续空转的心跳除了往上下文里堆噪声什么都没换来。
+	Backoff bool `json:"backoff"`
+	// BackoffMaxMin 退避封顶（分钟，<=0 按默认 240）。
+	BackoffMaxMin int `json:"backoff_max_min"`
 }
 
 // DefaultHeartbeatPrompt 心跳提示词出厂默认（WebUI 里可改，存 config/user.json）。
@@ -109,7 +118,7 @@ func Default() *Config {
 		Context:      ContextCfg{MaxTokens: 150000, KeepRecentChars: 60000, HardTruncChars: 150000, StreamIdleSec: 90, CharsPerToken: 1.5},
 		Tools:        ToolsCfg{FgTimeoutSec: 30, ResultLimit: 10000, TimeoutSec: 600},
 		Doom:         DoomCfg{WarnAfter: 3},
-		Heartbeat:    HeartbeatCfg{Enabled: false, IntervalMin: 30, Prompt: DefaultHeartbeatPrompt},
+		Heartbeat:    HeartbeatCfg{Enabled: false, IntervalMin: 30, Prompt: DefaultHeartbeatPrompt, Backoff: true, BackoffMaxMin: 240},
 	}
 }
 
