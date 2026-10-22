@@ -127,8 +127,32 @@ func utf16Len(s string) int {
 	return n
 }
 
-// contentChars 内容字符数（string=长度；parts=文本总长 + 每图/每引用固定 1000）
-func contentChars(c types.Content) int {
+// Est 估算口径：字符↔token 比例 + 单个附件的 token 成本。
+// 附件成本在配置里就是按 token 写的（context.attachment_tokens），这里换算成字符
+// 只是为了和"字符预算"（keep_recent_chars / hard_trunc_chars）同一把尺子。
+type Est struct {
+	Cpl          float64
+	AttachTokens int
+}
+
+// NewEst 从配置造估算口径（cpl<=0 退回 1.5，负附件按 0）。
+func NewEst(cpl float64, attachTokens int) Est {
+	if cpl <= 0 {
+		cpl = 1.5
+	}
+	if attachTokens < 0 {
+		attachTokens = 0
+	}
+	return Est{Cpl: cpl, AttachTokens: attachTokens}
+}
+
+// attachChars 一个非文本 part 折算成多少字符。
+func (e Est) attachChars() int {
+	return int(math.Ceil(float64(e.AttachTokens) * e.Cpl))
+}
+
+// contentChars 内容字符数（string=长度；parts=文本总长 + 每个非文本 part 按配置折算）
+func contentChars(c types.Content, e Est) int {
 	if s, ok := c.(string); ok {
 		return utf16Len(s)
 	}
@@ -137,15 +161,15 @@ func contentChars(c types.Content) int {
 		if p.Type == "text" {
 			n += utf16Len(p.Text)
 		} else {
-			n += 1000
+			n += e.attachChars()
 		}
 	}
 	return n
 }
 
 // messageChars 消息字符数（content + tool_calls name+args + reasoning）
-func messageChars(m types.RawEntry) int {
-	n := contentChars(m.Content)
+func messageChars(m types.RawEntry, e Est) int {
+	n := contentChars(m.Content, e)
 	for _, tc := range m.ToolCalls {
 		n += len(tc.Function.Name) + len(tc.Function.Arguments)
 	}
@@ -156,10 +180,10 @@ func messageChars(m types.RawEntry) int {
 }
 
 // sessionChars 会话总字符数（全部消息，含 summary）
-func sessionChars(session *types.SessionState) int {
+func sessionChars(session *types.SessionState, est Est) int {
 	n := 0
 	for _, e := range session.Messages {
-		n += messageChars(e)
+		n += messageChars(e, est)
 	}
 	if session.Summary != nil {
 		n += utf16Len(session.Summary.Content)
@@ -176,8 +200,8 @@ func EstimateTokens(text string, cpl float64) int {
 }
 
 // EstimateMessageTokens 单条消息估算 token（assistant 加 tool_calls name+args 与 reasoning）
-func EstimateMessageTokens(m types.RawEntry, cpl float64) int {
-	chars := contentChars(m.Content)
+func EstimateMessageTokens(m types.RawEntry, e Est) int {
+	chars := contentChars(m.Content, e)
 	if m.Role == "assistant" {
 		for _, tc := range m.ToolCalls {
 			chars += utf16Len(tc.Function.Name) + utf16Len(tc.Function.Arguments)
@@ -186,6 +210,7 @@ func EstimateMessageTokens(m types.RawEntry, cpl float64) int {
 			chars += utf16Len(*m.ReasoningContent)
 		}
 	}
+	cpl := e.Cpl
 	if cpl <= 0 {
 		cpl = 1.5
 	}
@@ -204,12 +229,13 @@ type ContextStats struct {
 }
 
 // ContextStatsOf 会话状态 → /health 统计
-func ContextStatsOf(session *types.SessionState, cpl float64) ContextStats {
+func ContextStatsOf(session *types.SessionState, cpl float64, attachTokens int) ContextStats {
+	est := NewEst(cpl, attachTokens)
 	msgTokens := 0
 	msgChars := 0
 	for _, e := range session.Messages {
-		msgTokens += EstimateMessageTokens(e, cpl)
-		msgChars += messageChars(e)
+		msgTokens += EstimateMessageTokens(e, est)
+		msgChars += messageChars(e, est)
 	}
 	var summaryTokens, summaryChars, summaryCount int
 	if session.Summary != nil {

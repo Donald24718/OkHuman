@@ -62,6 +62,9 @@ type ContextCfg struct {
 	HardTruncChars  int     `json:"hard_trunc_chars"`
 	StreamIdleSec   int     `json:"stream_idle_sec"` // 压缩流空闲超时（秒）
 	CharsPerToken   float64 `json:"chars_per_token"`
+	// AttachmentTokens：一个附件（图片/音频等非文本 part）按多少 token 计。
+	// 直接按 token 记，不再用"固定 1000 字符"那种间接口径。0 = 不计附件。
+	AttachmentTokens int `json:"attachment_tokens"`
 }
 
 type ToolsCfg struct {
@@ -106,7 +109,7 @@ func Default() *Config {
 		LLM:          LLMCfg{BaseURL: "http://127.0.0.1:8080/v1", Model: "local", TimeoutSec: 300, StreamIdleSec: 120, MaxResponseBytes: 256 << 20},
 		SystemPrompt: SystemPromptCfg{Dir: "prompts"},
 		Data:         DataCfg{Dir: filepath.Join(home, ".okhuman")},
-		Context:      ContextCfg{MaxTokens: 150000, KeepRecentChars: 60000, HardTruncChars: 150000, StreamIdleSec: 90, CharsPerToken: 1.5},
+		Context:      ContextCfg{MaxTokens: 150000, KeepRecentChars: 60000, HardTruncChars: 150000, StreamIdleSec: 90, CharsPerToken: 1.5, AttachmentTokens: 500},
 		Tools:        ToolsCfg{FgTimeoutSec: 30, ResultLimit: 10000, TimeoutSec: 600},
 		Doom:         DoomCfg{WarnAfter: 3},
 		Heartbeat:    HeartbeatCfg{Enabled: false, IntervalMin: 30, Prompt: DefaultHeartbeatPrompt},
@@ -265,6 +268,10 @@ func migrateContext(ctx *ContextCfg) {
 	}
 	if ctx.CharsPerToken <= 0 {
 		ctx.CharsPerToken = Default().Context.CharsPerToken
+	}
+	// 附件 token 成本：负数按 0（不计）处理；0 是合法值，不回填默认。
+	if ctx.AttachmentTokens < 0 {
+		ctx.AttachmentTokens = 0
 	}
 }
 

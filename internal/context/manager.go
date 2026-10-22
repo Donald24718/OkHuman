@@ -44,11 +44,12 @@ type CompressEvent struct {
 
 // Cfg 压缩参数（POST /config 热更新，对应 config.context）
 type Cfg struct {
-	MaxTokens       int
-	KeepRecentChars int
-	HardTruncChars  int
-	StreamIdleMS    int
-	CharsPerToken   float64
+	MaxTokens        int
+	KeepRecentChars  int
+	HardTruncChars   int
+	StreamIdleMS     int
+	CharsPerToken    float64
+	AttachmentTokens int // 一个附件按多少 token 计（0=不计）
 }
 
 // Manager 会话状态 + 压缩编排
@@ -60,6 +61,7 @@ type Manager struct {
 	// 下标切错位置可能丢错消息；持锁后压缩串行、下标始终有效。
 	llm llm.LlmClient
 	cfg Cfg
+	est Est // cfg 的估算口径快照（SetCfg 时重算）
 	// 最近一次压缩落盘的两个文件（session-records 全文存档 / session-summaries 总结）。
 	// 手动压缩（CompressNow）把这两个路径报给调用方，UI 才能直接给出文件位置。
 	lastRecordPath, lastSummaryPath string
@@ -80,6 +82,7 @@ func NewManager(client llm.LlmClient, cfg Cfg, systemPrompt string, recordDir st
 	return &Manager{
 		llm:          client,
 		cfg:          cfg,
+		est:          NewEst(cfg.CharsPerToken, cfg.AttachmentTokens),
 		systemPrompt: systemPrompt,
 		session:      &types.SessionState{Messages: []types.RawEntry{}},
 		recordDir:    recordDir,
@@ -90,6 +93,7 @@ func NewManager(client llm.LlmClient, cfg Cfg, systemPrompt string, recordDir st
 func (m *Manager) SetCfg(cfg Cfg) {
 	m.mu.Lock()
 	m.cfg = cfg
+	m.est = NewEst(cfg.CharsPerToken, cfg.AttachmentTokens)
 	m.mu.Unlock()
 }
 
@@ -293,9 +297,9 @@ func (m *Manager) maybeCompress() {
 	}
 	// 字符预算：从最新往前累积 ≤ keep_recent_chars 的最大条数（至少 1）
 	keep := 1
-	acc := messageChars(m.session.Messages[n-1])
+	acc := messageChars(m.session.Messages[n-1], m.est)
 	for i := n - 2; i >= 0; i-- {
-		c := messageChars(m.session.Messages[i])
+		c := messageChars(m.session.Messages[i], m.est)
 		if acc+c > m.cfg.KeepRecentChars {
 			break
 		}
@@ -333,7 +337,7 @@ func (m *Manager) estimateTotalLocked() int {
 		t += EstimateTokens(m.session.Summary.Content, m.cfg.CharsPerToken)
 	}
 	for _, e := range m.session.Messages {
-		t += EstimateMessageTokens(e, m.cfg.CharsPerToken)
+		t += EstimateMessageTokens(e, m.est)
 	}
 	return t
 }
@@ -351,7 +355,7 @@ func (m *Manager) doCompress(batch []types.RawEntry) {
 	if m.session.Summary != nil {
 		oldSummary = m.session.Summary.Content
 	}
-	beforeChars := sessionChars(m.session)
+	beforeChars := sessionChars(m.session, m.est)
 	prefix := m.composeLocked()
 	streamIdleMS := m.cfg.StreamIdleMS
 	m.mu.Unlock()
@@ -464,9 +468,9 @@ func (m *Manager) CompressNow() (string, bool) {
 		return "会话为空，没有可压缩的内容", false
 	}
 	keep := 1
-	acc := messageChars(m.session.Messages[n-1])
+	acc := messageChars(m.session.Messages[n-1], m.est)
 	for i := n - 2; i >= 0; i-- {
-		c := messageChars(m.session.Messages[i])
+		c := messageChars(m.session.Messages[i], m.est)
 		if acc+c > m.cfg.KeepRecentChars {
 			break
 		}
@@ -475,7 +479,7 @@ func (m *Manager) CompressNow() (string, bool) {
 	}
 	batch := m.session.Messages[:n-keep]
 	hasSummary := m.session.Summary != nil
-	before := sessionChars(m.session)
+	before := sessionChars(m.session, m.est)
 	m.mu.Unlock()
 	if len(batch) == 0 && !hasSummary {
 		return fmt.Sprintf("无可压内容（全部 %d 条都在保留预算内，且无旧 summary）", n), false
@@ -498,15 +502,15 @@ func (m *Manager) CompressNow() (string, bool) {
 // 放弃 LLM 压缩，直接保留最近 hard_trunc_chars 字符预算内的原文，其余丢弃
 // （完整内容已在 session-records/ 落盘，数据不丢）。summary 置为记录文件路径引用。
 func (m *Manager) hardTruncateLocked(recordPath string) {
-	before := sessionChars(m.session)
+	before := sessionChars(m.session, m.est)
 	n := len(m.session.Messages)
 	keep := 1
 	acc := 0
 	if n > 0 {
-		acc = messageChars(m.session.Messages[n-1])
+		acc = messageChars(m.session.Messages[n-1], m.est)
 	}
 	for i := n - 2; i >= 0; i-- {
-		c := messageChars(m.session.Messages[i])
+		c := messageChars(m.session.Messages[i], m.est)
 		if acc+c > m.cfg.HardTruncChars {
 			break
 		}

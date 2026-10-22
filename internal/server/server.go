@@ -263,11 +263,12 @@ func makeCm(a *AgentState) *ctxmgr.Manager {
 	sp := a.SystemPrompt
 	a.promptMu.Unlock()
 	m := ctxmgr.NewManager(client, ctxmgr.Cfg{
-		MaxTokens:       cfg.Context.MaxTokens,
-		KeepRecentChars: cfg.Context.KeepRecentChars,
-		HardTruncChars:  cfg.Context.HardTruncChars,
-		StreamIdleMS:    cfg.Context.StreamIdleSec * 1000, // 配置以秒为单位，内部按毫秒计时
-		CharsPerToken:   cfg.Context.CharsPerToken,
+		MaxTokens:        cfg.Context.MaxTokens,
+		KeepRecentChars:  cfg.Context.KeepRecentChars,
+		HardTruncChars:   cfg.Context.HardTruncChars,
+		StreamIdleMS:     cfg.Context.StreamIdleSec * 1000, // 配置以秒为单位，内部按毫秒计时
+		AttachmentTokens: cfg.Context.AttachmentTokens,
+		CharsPerToken:    cfg.Context.CharsPerToken,
 	}, sp, cfg.Data.Dir)
 	m.SetSessionNo(int(a.SessionNo.Load()))
 	m.AddCompressListener(func(e ctxmgr.CompressEvent) { pushCompressLog(a, e) })
@@ -691,11 +692,12 @@ func applyConfigPatch(a *AgentState, patch map[string]interface{}, logf func(for
 	}
 	if has("context") {
 		a.CM().SetCfg(ctxmgr.Cfg{
-			MaxTokens:       nc.Context.MaxTokens,
-			KeepRecentChars: nc.Context.KeepRecentChars,
-			HardTruncChars:  nc.Context.HardTruncChars,
-			StreamIdleMS:    nc.Context.StreamIdleSec * 1000,
-			CharsPerToken:   nc.Context.CharsPerToken,
+			MaxTokens:        nc.Context.MaxTokens,
+			AttachmentTokens: nc.Context.AttachmentTokens,
+			KeepRecentChars:  nc.Context.KeepRecentChars,
+			HardTruncChars:   nc.Context.HardTruncChars,
+			StreamIdleMS:     nc.Context.StreamIdleSec * 1000,
+			CharsPerToken:    nc.Context.CharsPerToken,
 		})
 	}
 	if has("tools") { // 工具超时热更新（2026-10-02）：重建工具表 + 新上限，下条命令生效
@@ -1036,7 +1038,7 @@ func (ap *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{
 		"ok":      true,
 		"session": int(a.SessionNo.Load()),
-		"context": ctxmgr.ContextStatsOf(sess, cfg.Context.CharsPerToken),
+		"context": ctxmgr.ContextStatsOf(sess, cfg.Context.CharsPerToken, cfg.Context.AttachmentTokens),
 		"llm":     cfg.LLM.BaseURL,
 	})
 }
@@ -1122,7 +1124,7 @@ func (ap *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 			"files":    files,
 			"chars":    spChars,
 		},
-		"context":     ctxmgr.ContextStatsOf(sess, cfg.Context.CharsPerToken),
+		"context":     ctxmgr.ContextStatsOf(sess, cfg.Context.CharsPerToken, cfg.Context.AttachmentTokens),
 		"compress":    compress,
 		"doom":        doom,
 		"backgrounds": bgs,

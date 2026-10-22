@@ -62,7 +62,7 @@ func TestContextStatsSummaryCount(t *testing.T) {
 	with := &types.SessionState{
 		Summary: &types.TEntry{Content: "历史总结内容 12345", CreatedAt: 1},
 	}
-	st := ContextStatsOf(with, 2)
+	st := ContextStatsOf(with, 2, 500)
 	if st.Summary != 1 {
 		t.Fatalf("有 summary 时 Summary 应为 1，实得 %d", st.Summary)
 	}
@@ -74,7 +74,7 @@ func TestContextStatsSummaryCount(t *testing.T) {
 	}
 	// 无 summary → Summary=0
 	without := &types.SessionState{}
-	st2 := ContextStatsOf(without, 2)
+	st2 := ContextStatsOf(without, 2, 500)
 	if st2.Summary != 0 || st2.SummaryTokens != 0 || st2.SummaryChars != 0 {
 		t.Fatalf("无 summary 时应全 0：%+v", st2)
 	}
@@ -182,5 +182,43 @@ func TestDumpSessionRecord(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("全文存档缺 %q", want)
 		}
+	}
+}
+
+// TestAttachmentTokensAccounting 附件按配置的 token 计（context.attachment_tokens），
+// 不再是"每个非文本 part 固定 1000 字符"那种写死的间接口径。
+func TestAttachmentTokensAccounting(t *testing.T) {
+	img, err := types.FromPartMap(map[string]interface{}{
+		"type": "image_url", "image_url": map[string]string{"url": "data:image/png;base64,AAAA"},
+	})
+	if err != nil {
+		t.Fatalf("构造 image part: %v", err)
+	}
+	one := types.RawEntry{Role: "user", Content: []types.ContentPart{types.TextPart("abcd"), img}}
+	two := types.RawEntry{Role: "user", Content: []types.ContentPart{types.TextPart("abcd"), img, types.RefPart("r1")}}
+
+	// cpl=2、附件 500 token：文本 "abcd"=4 字符=2 token，附件正好 500 token
+	if got := EstimateMessageTokens(one, NewEst(2, 500)); got != 502 {
+		t.Fatalf("附件 500 token 时单图消息应为 502，实得 %d", got)
+	}
+	if got := EstimateMessageTokens(two, NewEst(2, 500)); got != 1002 {
+		t.Fatalf("两个附件应为 2+2×500=1002，实得 %d", got)
+	}
+	// 配 0 → 附件不计（合法值，不回填默认）
+	if got := EstimateMessageTokens(one, NewEst(2, 0)); got != 2 {
+		t.Fatalf("attachment_tokens=0 时应只剩文本 2 token，实得 %d", got)
+	}
+	// 换 cpl 不改变"按 token 记"的语义：附件仍是 500 token
+	if got := EstimateMessageTokens(one, NewEst(4, 500)); got != 501 {
+		t.Fatalf("cpl=4 时附件仍应计 500 token（文本 1 token），实得 %d", got)
+	}
+	// 字符预算口径（keep_recent_chars / hard_trunc_chars）也要看见附件：
+	// 500 token × cpl 2 = 1000 字符 + 文本 4 字符
+	if got := messageChars(one, NewEst(2, 500)); got != 1004 {
+		t.Fatalf("messageChars 应为 1004，实得 %d", got)
+	}
+	// 负数按 0 处理，不出现负字符
+	if got := messageChars(one, NewEst(2, -7)); got != 4 {
+		t.Fatalf("负 attachment_tokens 应按 0 处理，实得 %d", got)
 	}
 }
