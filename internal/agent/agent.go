@@ -31,7 +31,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,7 +54,7 @@ type RunOptions struct {
 	// 轮内搭车（2026-09-14 统一）：工具循环中每次 LLM 调用前调用，取走运行期间
 	// 入队的全部消息——用户追加消息与已 settle 后台任务的通知（同一消息队列、
 	// 同一 splice 逻辑、取走即消费；纯追加，不加 LLM 调用）
-	TakePendingUsers func() []string
+	TakePendingUsers func() []types.QueuedMessage
 	// 工具转后台时回调（由 server.runOpt 实现：注册任务 + 挂 settle 回调；
 	// settle 时通知自动入消息队列，2026-09-14）
 	OnBackgroundStart func(types.BackgroundStartArgs)
@@ -342,8 +341,9 @@ func (a *Agent) finishStopped(partial PartialContent, emit func(types.AgentEvent
 	emit(types.AgentEvent{"type": "done", "usage": totals})
 }
 
-// bgNoticePrefix 后台完成通知的固定开头——轮内搭车时据此区分"系统通知"与
-// 用户追加消息（不加【用户追加】前缀，2026-09-14）。
+// bgNoticePrefix 后台完成通知的固定开头（2026-10-25 起**只是文案**，不再
+// 参与任何判定——轮内搭车改看 types.QueuedMessage.Kind）。留在这里是为了让
+// FormatBackgroundNotice 的开头只有一处定义，改措辞不会让别处悄悄失配。
 const bgNoticePrefix = "（系统通知：后台任务完成"
 
 // FormatBackgroundNotice 后台完成通知的格式化（settle 入队与轮内搭车共用，
@@ -358,7 +358,7 @@ func (a *Agent) FormatBackgroundNotice(task *types.PendingBackgroundTask, opt Ru
 		status = "已失败"
 	}
 	status = fmt.Sprintf("%s（耗时 %ss）", status, durSec)
-	head := fmt.Sprintf("（系统通知：后台任务完成——你此前调用 %s 时前台等待超时，已转入后台继续执行，现%s。结果如下：\n", task.ToolName, status)
+	head := fmt.Sprintf("%s——你此前调用 %s 时前台等待超时，已转入后台继续执行，现%s。结果如下：\n", bgNoticePrefix, task.ToolName, status)
 	if utf16Len(result) > opt.ResultLimit {
 		logPath := a.writeToolLog(opt, result)
 		tail := fmt.Sprintf("\n[已截断：完整结果 %d 字符在 %s，用 bash 的 cat / grep / tail 查看。]", utf16Len(result), logPath)
@@ -538,12 +538,12 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 			}
 
 			emit(types.AgentEvent{"type": "tool_call", "name": tc.Function.Name, "args": args, "call_id": tc.ID})
-			execDone := make(chan string, 1)
+			execDone := make(chan types.ToolOutcome, 1)
 			go func() { execDone <- execToolSafe(tc.Function.Name, args) }()
 			// §7.3 前台赛跑：超时前完成 → 正常回填；超时 → 转后台，回填"已转后台"通知
 			select {
 			case outcome := <-execDone:
-				raw := outcome
+				raw := outcome.Text
 				totalChars := utf16Len(raw)
 				truncated := false
 				if totalChars > opt.ResultLimit {
@@ -581,12 +581,18 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 		// 前缀；用户消息加前缀——模型明确知道是"追加指令"而非"新任务"（2026-09-09）。
 		if opt.TakePendingUsers != nil {
 			for _, m := range opt.TakePendingUsers() {
-				if strings.HasPrefix(m, bgNoticePrefix) {
-					a.cm.AddMessage(&types.RawEntry{Role: "user", Content: m})
+				// 语义看 Kind 字段（2026-10-25）：旧实现用 HasPrefix(m, bgNoticePrefix)
+				// 猜，用户消息恰好以那句话开头就被当成系统通知（丢掉【用户追加】
+				// 标记 = 把指令降级成事件），通知文案一改判定就静默失效。
+				if m.Kind == types.QueueKindBGNotice {
+					a.cm.AddMessage(&types.RawEntry{Role: "user", Content: m.Text})
 				} else {
-					a.cm.AddMessage(&types.RawEntry{Role: "user", Content: "【用户追加】" + m})
+					a.cm.AddMessage(&types.RawEntry{Role: "user", Content: "【用户追加】" + m.Text})
 				}
-				emit(types.AgentEvent{"type": "user_piggyback", "message": m})
+				// msg_kind = 这条消息的语义类型（2026-10-25 新增字段）：前端据此分
+				// "系统通知 / 用户"气泡，不必再在前端硬编码前缀去猜。message 字段
+				// 不变（外部消费者协议不变）。
+				emit(types.AgentEvent{"type": "user_piggyback", "message": m.Text, "msg_kind": m.Kind})
 			}
 		}
 
@@ -655,25 +661,33 @@ func (a *Agent) isSameRunLocked(n int) bool {
 // panic 在任何 goroutine 都会终止整个进程 → 工具内部一次意外出错 = 整个实例当场暴毙
 // （不是本轮失败，是进程死、要重启）。这里兜住，转成工具失败字符串回填给模型，
 // 实例继续活着。当前工具路径没有已知可 panic 的分支，这是纯预防的保险。
-func execToolSafe(name string, args map[string]interface{}) string {
-	return guardToolPanic(name, func() string {
-		r, err := tools.ExecuteTool(name, args)
-		if err != nil {
-			return tools.ToolFailPrefix + err.Error()
-		}
-		return r
+func execToolSafe(name string, args map[string]interface{}) types.ToolOutcome {
+	return guardToolPanic(name, func() (string, error) {
+		return tools.ExecuteTool(name, args)
 	})
 }
 
-// guardToolPanic 兜 panic（抽出来便于测试：夹具直接喂一个会摔的 fn）。
-func guardToolPanic(name string, fn func() string) (out string) {
+// guardToolPanic 兜 panic（抽出来便于测试：夹具直接喂一个会摔的 fn），并把
+// error / panic 统一转成 ToolOutcome。
+//
+// 这里是 OK 的**唯一出处**（2026-10-25）：工具层出错 → OK=false 且 Text 带
+// ToolFailPrefix；正常返回 → OK=true。前缀只用于给模型看，任何内部判定都不
+// 再回头看文本。
+func guardToolPanic(name string, fn func() (string, error)) (out types.ToolOutcome) {
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf("[agent] 工具 %s 内部 panic（已隔离，实例未崩）：%v\n%s\n", name, r, debug.Stack())
-			out = tools.ToolFailPrefix + fmt.Sprintf("工具内部错误（已隔离，实例未崩）：%v", r)
+			out = types.ToolOutcome{
+				Text: tools.ToolFailPrefix + fmt.Sprintf("工具内部错误（已隔离，实例未崩）：%v", r),
+				OK:   false,
+			}
 		}
 	}()
-	return fn()
+	r, err := fn()
+	if err != nil {
+		return types.ToolOutcome{Text: tools.ToolFailPrefix + err.Error(), OK: false}
+	}
+	return types.ToolOutcome{Text: r, OK: true}
 }
 
 // parseArgs arguments JSON 字符串 → 对象；解析失败兜底为原始字符串

@@ -139,13 +139,16 @@ type drainResult struct {
 
 // AppState 单实例服务状态
 type AppState struct {
-	Root         string // 项目根（webui 静态文件 / config/user.json 落盘用）
-	Agent        *AgentState
-	mu           sync.Mutex               // 保护下面全部字段
-	Evt          *eventLog                // 事件批次缓冲（发车机制内核，见 eventlog.go）
-	reqMu        sync.Mutex               // 保护 reqCounts
-	reqCounts    map[string]*noisyCounter // 高频轮询端点计数（访问日志汇总用，不逐条记）
-	MessageQueue []string
+	Root      string // 项目根（webui 静态文件 / config/user.json 落盘用）
+	Agent     *AgentState
+	mu        sync.Mutex               // 保护下面全部字段
+	Evt       *eventLog                // 事件批次缓冲（发车机制内核，见 eventlog.go）
+	reqMu     sync.Mutex               // 保护 reqCounts
+	reqCounts map[string]*noisyCounter // 高频轮询端点计数（访问日志汇总用，不逐条记）
+	// MessageQueue 待消费消息（2026-10-25 起结构化）：语义在 Kind 上，
+	// 不再靠正文前缀猜"这是用户消息还是系统通知"。对外 JSON 仍投影成
+	// 字符串数组（见 queuedTexts），协议字节级不变。
+	MessageQueue []types.QueuedMessage
 	ActiveDrain  *drainHandle
 	RoundBuf     *roundBuf
 	RunSeq       int
@@ -179,7 +182,7 @@ func NewAppState(cfg *config.Config, root string, agent *AgentState) *AppState {
 		Agent:        agent,
 		Evt:          newEventLog(),
 		reqCounts:    map[string]*noisyCounter{},
-		MessageQueue: []string{},
+		MessageQueue: []types.QueuedMessage{},
 		Injects:      []InjectInfo{},
 	}
 	// 启动即视为"刚 run 完"：空闲计时从此刻开始，不会一启动就发心跳
@@ -312,7 +315,7 @@ func runOpt(a *AgentState, state *AppState) agent.RunOptions {
 		// 携带用户追加消息 + 已 settle 后台任务的通知（同一队列、同一逻辑）。
 		// 安全：本回调只在 lock.Run 内被调用（runLoop 持锁），drain 的下一轮
 		// splice 只会在本轮结束后执行 → 无并发竞态。
-		TakePendingUsers: func() []string {
+		TakePendingUsers: func() []types.QueuedMessage {
 			state.mu.Lock()
 			defer state.mu.Unlock()
 			q := state.MessageQueue
@@ -329,7 +332,7 @@ func runOpt(a *AgentState, state *AppState) agent.RunOptions {
 					ResultLimit: cfg.Tools.ResultLimit,
 					DataDir:     cfg.Data.Dir,
 				})
-				_, _ = enqueueAndWake(state, a, notice, makeOnEvent(state, a))
+				_, _ = enqueueAndWake(state, a, notice, types.QueueKindBGNotice, makeOnEvent(state, a))
 			}
 			a.BG().OnBackgroundStart(bg)
 		},
@@ -422,16 +425,46 @@ func makeOnEvent(state *AppState, a *AgentState) func(types.AgentEvent) {
 	}
 }
 
+// queuedItems 队列条目的结构化投影（text + kind）：webui 据此分"系统通知 /
+// 用户"气泡，不必再在前端硬编码前缀去猜。旧的 queued 字段照旧输出
+// （queuedTexts），外部消费者协议不变——新增字段向后兼容。
+func queuedItems(qs []types.QueuedMessage) []types.QueuedMessage {
+	if len(qs) == 0 {
+		return nil
+	}
+	return append([]types.QueuedMessage(nil), qs...)
+}
+
+// queuedTexts 队列条目的正文投影：对外 JSON（/queue、/events hello）里的
+// queued 一直是字符串数组，这里把内部结构挡住——qq-channel / voice-chat /
+// webui 读到的字节不变。空队列返回 nil（与旧 append([]string(nil), ...) 同
+// 行为，JSON 里是 null 不是 []）。
+func queuedTexts(qs []types.QueuedMessage) []string {
+	if len(qs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(qs))
+	for _, q := range qs {
+		out = append(out, q.Text)
+	}
+	return out
+}
+
 // enqueueAndWake 唯一入队入口（2026-09-14）：在 state.mu 内原子完成
 // "取队列位置 + 入队 + 取/起活动 drain"——入队与 drain 的终止判定同一把锁，
 // 不存在"drain 正要退出时入队落空、消息挂起"的竞态（旧 startDrain 两把锁
 // 判定之间的窗口，2026-09-14 修）。三个调用方：/chat /enqueue
 // 与后台 settle 通知（同一逻辑）。返回 handle（可等 done 读 res）+ 入队前
 // 队列已有条数。
-func enqueueAndWake(state *AppState, a *AgentState, msg string, onEvent func(types.AgentEvent)) (*drainHandle, int) {
+// kind 决定这条消息在轮内搭车时怎么被标记（types.QueueKindUser /
+// QueueKindBGNotice，2026-10-25）——不再由正文前缀反推。
+func enqueueAndWake(state *AppState, a *AgentState, msg string, kind string, onEvent func(types.AgentEvent)) (*drainHandle, int) {
+	if kind == "" {
+		kind = types.QueueKindUser
+	}
 	state.mu.Lock()
 	queuedBefore := len(state.MessageQueue)
-	state.MessageQueue = append(state.MessageQueue, msg)
+	state.MessageQueue = append(state.MessageQueue, types.QueuedMessage{Text: msg, Kind: kind})
 	if state.ActiveDrain != nil {
 		h := state.ActiveDrain
 		state.mu.Unlock()
@@ -477,15 +510,15 @@ func enqueueAndWake(state *AppState, a *AgentState, msg string, onEvent func(typ
 // 不加前缀）；>1 条 = 合并成一条【第 1 条】…【第 2 条】…（kind=merged，
 // label "N 条合并 / M 字符"）。这是「无车」新轮路径的组装；「有车」轮内
 // 搭车走 agent 的 TakePendingUsers，每条独立成 user 消息，不经过本函数。
-func assembleBatch(msgs []string) (message, kind string, label *string, messages int) {
+func assembleBatch(msgs []types.QueuedMessage) (message, kind string, label *string, messages int) {
 	if len(msgs) == 1 {
-		return msgs[0], "user", nil, 0
+		return msgs[0].Text, "user", nil, 0
 	}
 	total := 0
 	parts := make([]string, len(msgs))
 	for i, m := range msgs {
-		parts[i] = fmt.Sprintf("【第 %d 条】%s", i+1, m)
-		total += utf16Len(m)
+		parts[i] = fmt.Sprintf("【第 %d 条】%s", i+1, m.Text)
+		total += utf16Len(m.Text)
 	}
 	l := fmt.Sprintf("%d 条合并 / %d 字符", len(msgs), total)
 	return strings.Join(parts, "\n"), "merged", &l, len(msgs)
@@ -501,7 +534,7 @@ func runDrain(state *AppState, a *AgentState, h *drainHandle, onEvent func(types
 	started := time.Now()
 	var reply string
 	for {
-		var msgs []string
+		var msgs []types.QueuedMessage
 		var batchErr error
 		// splice + 发送在 RunLock 内原子完成（2026-09-14 审计 H1 修）：/reset 也持同一
 		// 锁清队列+重建 → 两者互斥——要么整批在 reset 前跑完（旧会话），要么 reset
@@ -622,7 +655,9 @@ func startHeartbeat(state *AppState, a *AgentState, tickMS int) func() {
 			state.LastRunEnd.Store(now)
 			fmt.Fprintf(os.Stderr, "[heartbeat] 空闲 %d 分钟无 run → 主动开启一轮（阈值 %d 分钟）\n",
 				(now-last)/60000, hb.IntervalMin)
-			enqueueAndWake(state, a, hb.Prompt, makeOnEvent(state, a))
+			// 心跳走 user：它只在空闲时起新轮（heartbeatDue 见 running 直接
+			// 不触发），不会搭车 → 行为与改动前逐字一致。
+			enqueueAndWake(state, a, hb.Prompt, types.QueueKindUser, makeOnEvent(state, a))
 		}
 	}()
 	return t.Stop
@@ -1136,7 +1171,8 @@ func (ap *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 func (ap *App) handleQueue(w http.ResponseWriter, r *http.Request) {
 	a := ap.state.Agent
 	ap.state.mu.Lock()
-	queued := append([]string(nil), ap.state.MessageQueue...)
+	queued := queuedTexts(ap.state.MessageQueue)
+	qItems := queuedItems(ap.state.MessageQueue) // 同一把锁内取快照（锁外读队列 = 竞态）
 	running := a.Lock.Running() || ap.state.ActiveDrain != nil
 	ap.state.mu.Unlock()
 	// 快照取一次（2026-09-14 审计修：旧代码每次迭代都调 Session() 取活引用，
@@ -1148,7 +1184,8 @@ func (ap *App) handleQueue(w http.ResponseWriter, r *http.Request) {
 			userSeq++
 		}
 	}
-	writeJSON(w, 200, map[string]interface{}{"running": running, "user_seq": userSeq, "queued": queued})
+	writeJSON(w, 200, map[string]interface{}{"running": running, "user_seq": userSeq,
+		"queued": queued, "queued_items": qItems})
 }
 
 func (ap *App) handleHistory(w http.ResponseWriter, r *http.Request) {
@@ -1225,7 +1262,7 @@ func (ap *App) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	started := time.Now()
 	// 入队 + 活动 drain（2026-08-31）：运行中发的消息合并成一条一起发
-	h, _ := enqueueAndWake(ap.state, a, message, onEvent)
+	h, _ := enqueueAndWake(ap.state, a, message, types.QueueKindUser, onEvent)
 	<-h.done
 	if h.res.Err != nil {
 		writeJSON(w, 500, map[string]interface{}{"error": h.res.Err.Error(), "events": events, "ms": time.Since(started).Milliseconds()})
@@ -1301,7 +1338,7 @@ func (ap *App) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 	ap.state.mu.Lock()
 	running := a.Lock.Running() || ap.state.ActiveDrain != nil
 	ap.state.mu.Unlock()
-	h, queuedBefore := enqueueAndWake(ap.state, a, message, makeOnEvent(ap.state, a))
+	h, queuedBefore := enqueueAndWake(ap.state, a, message, types.QueueKindUser, makeOnEvent(ap.state, a))
 	position := queuedBefore + 1
 	broadcastEvent(ap.state, types.AgentEvent{"type": "enqueued", "message": message, "position": position, "running": running})
 	go func() { <-h.done }() // 防 unhandledRejection 等价：错误广播由 drain 统一处理
@@ -1325,7 +1362,8 @@ func (ap *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 	a := ap.state.Agent
 	conn := newSSE(w)
 	ap.state.mu.Lock()
-	queued := append([]string(nil), ap.state.MessageQueue...)
+	queued := queuedTexts(ap.state.MessageQueue)
+	qItems := queuedItems(ap.state.MessageQueue)
 	running := a.Lock.Running() || ap.state.ActiveDrain != nil
 	session := int(a.SessionNo.Load())
 	bgPending := a.BG().Count()
@@ -1335,10 +1373,11 @@ func (ap *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	ap.state.mu.Unlock()
 	conn.write(fmt.Sprintf("event: hello\ndata: %s\n\n", jsonStr(map[string]interface{}{
-		"session":    session,
-		"running":    running,
-		"queued":     queued,
-		"bg_pending": bgPending,
+		"session":      session,
+		"running":      running,
+		"queued":       queued,
+		"queued_items": qItems,
+		"bg_pending":   bgPending,
 	})))
 	// 重放：优先走事件缓冲（原子、含尚未发车的帧）；本轮开头已被窗口挤掉时
 	// 回退 RoundBuf 整轮重放（保住"长轮中途重订也能补全本轮"的旧语义）

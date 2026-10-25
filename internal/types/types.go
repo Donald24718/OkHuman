@@ -181,6 +181,49 @@ type SessionState struct {
 // AgentEvent 事件（JSON 对象；map 形态保证与 TS 版逐字段同形）
 type AgentEvent map[string]interface{}
 
+// ---------- 工具执行结果 ----------
+
+// ToolOutcome 元工具一次执行的结构化结果（2026-10-25）。
+//
+// Text = 回填给模型的完整文本：失败时**仍然带 tools.ToolFailPrefix 前缀**，
+// 模型侧看到的字符串与旧实现逐字相同（KV 缓存前缀、既有认知都不变）。
+// OK   = 工具层是否成功（参数合法、工具存在、未 panic）。
+//
+// OK 的语义边界（刻意与旧 HasPrefix 判定一致，不改）：bash 命令**退出码非 0
+// 仍是 OK=true** —— 命令失败是正常输出，不是工具层故障。要不要把退出码纳入
+// 失败，是另一个待裁定的决定，不由本类型偷偷改变。
+//
+// 为什么要这个类型：旧实现把成败编进文本前缀，消费方用
+// strings.HasPrefix(result, ToolFailPrefix) 反推 → 结果正文恰好以那句话开头
+// 就被误判（成功报成失败 → agent 重跑命令 → 重复副作用）。判定改走字段，
+// 文本前缀退化为纯展示。
+type ToolOutcome struct {
+	Text string
+	OK   bool
+}
+
+// ---------- 实例消息队列 ----------
+
+// 队列条目的语义类型。
+const (
+	QueueKindUser     = "user"      // 用户消息（/chat、/enqueue、心跳、定时任务）
+	QueueKindBGNotice = "bg_notice" // 后台任务完成通知
+)
+
+// QueuedMessage 实例消息队列的一条（2026-10-25）：取代旧的裸 string。
+//
+// 旧实现里"用户追加消息"与"后台完成通知"混在同一条 []string 队列里，
+// 消费方只能靠 strings.HasPrefix(text, "（系统通知：后台任务完成") 猜语义
+// ——文案一改判定就静默失效，正文恰好以那句话开头就被贴错标签。
+// 语义挪进 Kind 字段后，Text 是什么都不影响判定。
+//
+// 对外契约不变：/queue、/status、/events hello 里的 queued 仍是字符串数组
+// （见 server.queuedTexts）。
+type QueuedMessage struct {
+	Text string `json:"text"`
+	Kind string `json:"kind"`
+}
+
 // ---------- 后台任务 ----------
 
 // PendingBackgroundTask 后台任务（settle 前字段未定）
@@ -203,7 +246,7 @@ type BackgroundStartArgs struct {
 	ToolName  string
 	Args      interface{}
 	StartedAt int64
-	Promise   chan string // 结果通道（永不关闭，恰好一个值）
+	Promise   chan ToolOutcome // 结果通道（永不关闭，恰好一个值）
 	// OnSettled settle 时的回调（2026-09-14）：编排器在任务 settle 后调用，
 	// 由调用方（server.runOpt）实现：格式化通知 → 入消息队列 + 唤醒 drain
 	OnSettled func(*PendingBackgroundTask)

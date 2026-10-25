@@ -3,6 +3,8 @@ package server
 import (
 	"fmt"
 	"testing"
+
+	"okhuman/internal/types"
 )
 
 // utf16Count 本地 UTF-16 code units 计数（与 context.utf16Len 同口径）
@@ -21,18 +23,17 @@ func utf16Count(s string) int {
 // TestAssembleBatch 无车多条消息组装规则（2026-09-14）：
 // 1 条 = 该条本身（user，无前缀）；>1 条 = 合并成一条【第 N 条】…（merged）。
 func TestAssembleBatchSingle(t *testing.T) {
-	msg, kind, label, n := assembleBatch([]string{"用户追加三"})
+	msg, kind, label, n := assembleBatch(qq("用户追加三"))
 	if msg != "用户追加三" || kind != "user" || label != nil || n != 0 {
 		t.Fatalf("got (msg=%q kind=%q label=%v n=%d)，want (用户追加三, user, nil, 0)", msg, kind, label, n)
 	}
 }
 
 func TestAssembleBatchMerged(t *testing.T) {
-	msgs := []string{
-		"用户追加三",
+	msgs := qq("用户追加三",
 		"（系统通知：后台任务完成——D-OK）",
 		"用户追加四",
-	}
+	)
 	msg, kind, label, n := assembleBatch(msgs)
 	want := "【第 1 条】用户追加三\n【第 2 条】（系统通知：后台任务完成——D-OK）\n【第 3 条】用户追加四"
 	if msg != want {
@@ -42,8 +43,22 @@ func TestAssembleBatchMerged(t *testing.T) {
 		t.Fatalf("kind=%q n=%d，want merged/3", kind, n)
 	}
 	wantLabel := fmt.Sprintf("3 条合并 / %d 字符",
-		utf16Count(msgs[0])+utf16Count(msgs[1])+utf16Count(msgs[2]))
+		utf16Count(msgs[0].Text)+utf16Count(msgs[1].Text)+utf16Count(msgs[2].Text))
 	if label == nil || *label != wantLabel {
 		t.Fatalf("label=%v，want %q", label, wantLabel)
 	}
+}
+
+// qBg 测试夹具：正文按后台完成通知入队。
+func qBg(text string) types.QueuedMessage {
+	return types.QueuedMessage{Text: text, Kind: types.QueueKindBGNotice}
+}
+
+// qq 测试夹具：把裸正文包成 user 队列条目（bg_notice 用 qBg 显式标）。
+func qq(texts ...string) []types.QueuedMessage {
+	out := make([]types.QueuedMessage, 0, len(texts))
+	for _, t := range texts {
+		out = append(out, types.QueuedMessage{Text: t, Kind: types.QueueKindUser})
+	}
+	return out
 }

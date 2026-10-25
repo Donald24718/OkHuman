@@ -21,13 +21,11 @@ package background
 //   RunLock 的 running/waitIdle 保留（运行串行 + 事件广播判 running 用）。
 
 import (
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
-	"okhuman/internal/tools"
 	"okhuman/internal/types"
 )
 
@@ -107,8 +105,8 @@ func NewOrchestrator() *BackgroundOrchestrator {
 const maxStoredResultBytes = 256 * 1024
 
 // OnBackgroundStart 由 Agent 的工具循环调用：注册任务 + 挂 settle 检测
-// （Promise 通道收到结果 → 标记 settled/ok/durationMs → 调 a.OnSettled 把
-// 通知入消息队列 → 标记 Notified）
+// （Promise 通道收到 types.ToolOutcome → 标记 settled/ok/durationMs → 调
+// a.OnSettled 把通知入消息队列 → 标记 Notified）
 func (o *BackgroundOrchestrator) OnBackgroundStart(a types.BackgroundStartArgs) {
 	t := &types.PendingBackgroundTask{
 		CallID:     a.CallID,
@@ -122,14 +120,20 @@ func (o *BackgroundOrchestrator) OnBackgroundStart(a types.BackgroundStartArgs) 
 	o.tasks[a.CallID] = t
 	o.mu.Unlock()
 	go func() {
-		result := <-a.Promise
+		outcome := <-a.Promise
 		now := time.Now().UnixMilli()
 		o.mu.Lock()
 		cur, exists := o.tasks[a.CallID]
 		if exists {
 			cur.Settled = true
-			cur.OK = !strings.HasPrefix(result, tools.ToolFailPrefix) // 工具异常已被 agent 并入字符串
-			cur.Result = result
+			// 成败看字段，不看文本（2026-10-25）：旧实现是
+			// !strings.HasPrefix(result, tools.ToolFailPrefix)，等于把成败编进
+			// 文案再反推——后台命令的输出恰好以"工具执行失败: "开头（grep 日志、
+			// sed 取首行、脚本自己打印这句话）就被判成失败，通知写"已失败"而正文
+			// 其实是好结果，agent 于是重跑同一条命令（重复下载/重启/覆盖文件）。
+			// OK 的语义边界不变：bash 退出码非 0 仍是 OK=true（工具层没炸）。
+			cur.OK = outcome.OK
+			cur.Result = outcome.Text
 			cur.DurationMs = now - a.StartedAt
 			cur.SettledAt = now
 		}

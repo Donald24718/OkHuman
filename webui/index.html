@@ -475,6 +475,9 @@ function renderHistoryEntry(e) {
       const nImg = e.content.filter((x) => x.type === "image_url").length;
       const refs = e.content.filter((x) => x.type === "inject_ref").map((x) => x.ref).join(",");
       chatUserHtml((text ? text + "\n" : "") + `📎 ${refs || "附件"}${nImg ? `（图片 ×${nImg}）` : ""}`);
+    // 历史消息不带语义类型（落盘格式里没有 kind）→ 这里只能继续按前缀分气泡。
+    // 只影响展示样式；要彻底去掉这条前缀依赖，得给会话消息加类型字段（动落盘
+    // 格式与 KV 前缀），不在本次改动范围内。
     } else String(e.content).startsWith(BG_NOTICE_PREFIX) ? chatSysHtml(e.content) : chatUserHtml(e.content); // 历史里的后台通知也画系统气泡（2026-09-14）
     return;
   }
@@ -739,6 +742,16 @@ function chatUser(text, queued) {
 /* 后台结果通知（2026-09-14 空闲发车）：与 server formatBackgroundNotice 同前缀。
  * 自动发车轮 / 队列里的这类消息画成系统气泡，不当作用户输入 */
 const BG_NOTICE_PREFIX = "（系统通知：";
+/* 队列条目的语义（2026-10-25）：服务端现在随队列/事件带 kind（bg_notice / user），
+ * 有 kind 就按 kind 分气泡；kind 缺失（旧服务端、或本就没有类型的通道如 /history、
+ * run_msg）退回前缀判定。前缀判定是展示层的降级路径，不再参与任何行为判定。 */
+function queueItems(d) {
+  if (Array.isArray(d.queued_items)) return d.queued_items;
+  return (d.queued || []).map((t) => ({ text: String(t), kind: null }));
+}
+function isBgMsg(it) {
+  return it.kind ? it.kind === "bg_notice" : String(it.text).startsWith(BG_NOTICE_PREFIX);
+}
 function chatSysHtml(text, queued) {
   const tag = queued ? `<div class="queue-tag">⏳ 排队中</div>` : "";
   chatAddHtml(`<div class="msg sys"><div class="bubble">${esc(text)}${tag}</div></div>`);
@@ -855,6 +868,8 @@ function handleChatEvent(type, data) {
       if (data.kind === "merged") break;
       const msg = String(data.message ?? "");
       if (!msg) break;
+      // run_msg 的 kind 是 run 级（user/merged），不是消息语义 → 这里仍按前缀分
+      // 气泡（纯展示）。彻底修需要 run 级也带消息语义类型，超出本次范围。
       const isBg = msg.startsWith(BG_NOTICE_PREFIX);
       const pre = msg.slice(0, isBg ? 80 : 40); // 后台通知前 40 字符常相同（同工具），加长区分
       const bb = getBox();
@@ -910,7 +925,7 @@ function handleChatEvent(type, data) {
       // 让后台通知"排队成功后从用户侧发出"，且同一文本双气泡重复渲染。
       const msg = String(data.message ?? "");
       if (!msg) break;
-      const isBg = msg.startsWith(BG_NOTICE_PREFIX);
+      const isBg = data.msg_kind ? data.msg_kind === "bg_notice" : msg.startsWith(BG_NOTICE_PREFIX);
       const pre = msg.slice(0, isBg ? 80 : 40);
       const box = getBox().el;
       const bub = Array.from(box.querySelectorAll(isBg ? ".msg.sys .bubble" : ".msg.user .bubble"))
@@ -993,7 +1008,7 @@ function eventsFor() {
   const on = (name, fn) => { h[name] = (d) => { try { fn(d); } catch (e) { console.error("[events]", name, e); } }; };
   on("hello", (d) => {
     syncUi(d.running);
-    for (const m of (d.queued || [])) String(m).startsWith(BG_NOTICE_PREFIX) ? chatSysHtml(m, true) : chatUserHtml(m, true);
+    for (const it of queueItems(d)) isBgMsg(it) ? chatSysHtml(it.text, true) : chatUserHtml(it.text, true);
   });
   on("enqueued", (d) => {
     if (d.running) {
@@ -1082,8 +1097,9 @@ function refreshQueue() {
     .then((j) => {
       syncUi(j.running);
       const b = getBox();
-      for (const m of (j.queued || [])) {
-        const isBg = String(m).startsWith(BG_NOTICE_PREFIX);
+      for (const it of queueItems(j)) {
+        const m = it.text;
+        const isBg = isBgMsg(it);
         const pre = String(m).slice(0, isBg ? 80 : 40);
         const els = Array.from(b.el.querySelectorAll(isBg ? ".msg.sys .bubble" : ".msg.user .bubble"));
         const hit = els.find((x) => x.textContent?.startsWith(pre));
