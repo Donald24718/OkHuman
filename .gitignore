@@ -5,3 +5,7 @@
 /okhuman.bak-*
 /okhuman-stdout.log
 /node_modules/
+
+/plugins/agent-wire/agent-wire
+/plugins/agent-wire/config.json
+/plugins/agent-wire/data/

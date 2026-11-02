@@ -1,0 +1,9 @@
+{
+  "self": "me",
+  "default_wait_sec": 900,
+  "peers": [
+    {"name": "me",      "url": "http://127.0.0.1:8451"},
+    {"name": "agent-b", "url": "http://127.0.0.1:8452"},
+    {"name": "agent-c", "url": "http://192.168.1.10:8602", "token": "<该实例 lan-bridge 的 token>"}
+  ]
+}
