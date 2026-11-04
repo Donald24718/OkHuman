@@ -310,10 +310,10 @@ func (m *Manager) maybeCompress() {
 		return // 只有 system → 超阈值不可能（system 固定）
 	}
 	if n == 1 {
-		// 只剩最新一条消息：最新一条永不压。此时唯一的杠杆是摘要窗口 →
-		// 丢最旧的一条（不发 LLM；文件仍在盘上，需要时按路径读回）。
+		// 只剩最新一条消息：最新一条永不压。没有原文可压就什么都不做 ——
+		// 真超了模型窗口，请求按既有规则原样报错，处置交给人。（2026-11-05：
+		// 旧的"再压一遍 summary"杠杆随迭代压缩一起删掉，不用"丢摘要"去替代它。）
 		m.mu.Unlock()
-		m.dropOldestSummaryLockedNotHeld()
 		return
 	}
 	// 字符预算：从最新往前累积 ≤ keep_recent_chars 的最大条数（至少 1）
@@ -331,29 +331,11 @@ func (m *Manager) maybeCompress() {
 	m.mu.Unlock()
 
 	if len(batch) == 0 {
-		// 全部消息都在保留预算内 → 没有原文可压，只能缩摘要窗口
-		m.dropOldestSummaryLockedNotHeld()
+		// 全部消息都在保留预算内 → 没有原文可压，什么都不做。
+		// 摘要只在超出 keep_summaries 条数时才丢（见 doCompress），别无第二条丢弃路径。
 		return
 	}
 	m.doCompress(batch)
-}
-
-// dropOldestSummaryLockedNotHeld 上下文仍超阈值、但原文都在保留预算内时，
-// 丢最旧的一条总结（滑动窗口的紧急端点：不发 LLM，文件已落盘不丢数据）。
-// 至少保留 1 条——全丢掉就等于失忆，而单条正文有 summary_max_chars 兜着。
-func (m *Manager) dropOldestSummaryLockedNotHeld() {
-	m.mu.Lock()
-	if len(m.session.Summaries) <= 1 {
-		m.mu.Unlock()
-		return
-	}
-	d := m.session.Summaries[0]
-	m.session.Summaries = m.session.Summaries[1:]
-	n := len(m.session.Summaries)
-	m.mu.Unlock()
-	m.emit("history", fmt.Sprintf(
-		"原文都在保留预算内、仍超阈值 → 丢弃最旧一条总结（seq %d-%d，%d 字符；文本 %s，原文 %s），当前保留 %d 条",
-		d.SeqFrom, d.SeqTo, d.OrigChars, d.SummaryFile, d.RecordFile, n), "", false, 0, nil)
 }
 
 // DumpSessionRecord 把当前会话全文落盘到 session-records/（与压缩存档同一命名口径
