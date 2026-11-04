@@ -26,7 +26,7 @@ setsid ./okmon </dev/null > /tmp/okmon.log 2>&1 &
 { "port": 8496,
   "services": [
     { "name": "okhuman-8451", "label": "主实例", "port": 8451, "start": "./okhuman", "workdir": "<副本目录>/OkHuman" },
-    { "name": "attach", "label": "图片/视频注入", "cli": true }
+    { "name": "attach_look", "label": "看图/看视频注入", "cli": true }
   ] }
 ```
 

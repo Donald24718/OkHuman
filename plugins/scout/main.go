@@ -96,7 +96,7 @@ var xling = map[string][]string{
 	"post": {"发帖"}, "发帖": {"post"}, "publish": {"发布"}, "发布": {"publish"},
 	"upload": {"上传"}, "上传": {"upload"}, "download": {"下载"}, "下载": {"download"},
 	"cron": {"定时"}, "定时": {"cron"}, "schedule": {"定时"},
-	"attach": {"附件"}, "附件": {"attach"},
+	"attach_look": {"附件", "看图", "读图", "看图"}, "附件": {"attach_look"}, "看图": {"attach_look"}, "读图": {"attach_look"},
 	"channel": {"频道"}, "频道": {"channel"},
 	"chat": {"聊天"}, "聊天": {"chat"}, "message": {"消息"}, "消息": {"message"},
 	"bilibili": {"哔哩哔哩"}, "哔哩哔哩": {"bilibili"},

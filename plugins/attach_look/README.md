@@ -1,20 +1,31 @@
-# okattach（attach 插件）
+# okattach（attach_look 插件）
+
+## 我什么时候该用它（先想这个，不要先想机制）
+
+任何素材**需要我知道里面有什么**，就先把它注入我自己的上下文：
+
+- 收到图片（QQ/微信附件、截图、下载的文件、我生成的图）想知道内容、人物、构图、颜色、图里的文字水印 → `okattach <图片>`
+- 收到视频想知道整段内容 / 第几秒发生了什么 → `okattach video <视频>`（要细节再 `okattach frame <视频> <秒>`）
+- 做完图/片要**自己亲眼验收** → 先 okattach 再看，不要只凭参数判断
+
+反例（2026-11-03 实测）：收到一张照片后，我手搓 base64 调 `/v1/chat/completions` 问图里有什么，
+结果转述出错（水印 B612 实际在左下，我先说右下）。正规路径就是 `okattach` 注入自己上下文，一次到位。
+
 
 素材注入 OkHuman 上下文：图片（默认原图 native）/ **视频（直通 input_video，按策略编码分段）** / 单帧高清抽取。音频暂不支持（ASR 插件负责）。
 
 ## 用法
 
 ```
-okattach <file>                      图片：原图注入（native，不缩放不压质，默认）
-okattach <file> --scaled             图片：压宽 800px / JPEG q2（省 token）
-okattach <file> --png                图片：压宽后走 PNG 无损（截图类素材）
+okattach <file>                      图片：原图注入（native，不缩放不压质，唯一路径）
+okattach <file> --png                图片：转 PNG 无损（原分辨率，截图类素材）
 okattach video <file> [--seg N]      视频：按策略编码后以 input_video part 注入
 okattach video <file> --dry-run      视频：只打印计划（分辨率/分段/token 估算），不编码不 POST
 okattach frame <video> <t> [--w W]   视频抽 t 秒单帧，压宽 W（默认 1280）注入为图片
 以上均可加 --note "说明"（/attachments 里可见，不进 LLM 上下文）
 ```
 
-目标端口自动识别：沿**进程父链**找所属 okhuman 主进程，取其 LISTEN 端口（插件由 agent 的 bash 工具启动，父链 okattach←bash←okhuman，端口随实例天然隔离：如 8451 / 8455）；脱离 agent 会话跑（父链无 okhuman）时回退 8451 并告警，此时用 `--okhuman-port` 显式指定。
+目标端口自动识别：沿**进程父链**找所属 okhuman 主进程，取其 LISTEN 端口（插件由 agent 的 bash 工具启动，父链 okattach←bash←okhuman，端口随实例天然隔离：512nv 生产=8451、lil 副本=8452）；脱离 agent 会话跑（父链无 okhuman）时回退 8451 并告警，此时用 `--okhuman-port` 显式指定。
 
 ## 视频注入策略（2026-09-20 用户定版）
 
