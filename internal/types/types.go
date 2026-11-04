@@ -163,17 +163,26 @@ type RawEntry struct {
 	ReasoningContent *string    `json:"reasoning_content,omitempty"`
 }
 
-// TEntry 滚动 summary
-type TEntry struct {
-	Content   string `json:"content"`
-	CreatedAt int64  `json:"created_at"`
+// SummaryEntry 一条历史总结（滑动窗口里的一条）。Content 只存正文：表头、
+// 硬截断提醒、原文指针都在 compose 注入时渲染 —— 正文长度是唯一的计量口径
+// （压缩轮的思考不计入，见 context.CompressOnce）。
+type SummaryEntry struct {
+	Content     string `json:"content"`
+	CreatedAt   int64  `json:"created_at"`
+	SeqFrom     int    `json:"seq_from"` // 本条覆盖的条目 seq 区间（含）
+	SeqTo       int    `json:"seq_to"`
+	OrigChars   int    `json:"orig_chars"`   // 截断前正文字符数（utf16）
+	Truncated   bool   `json:"truncated"`    // 正文超 context.summary_max_chars 被硬截断
+	SummaryFile string `json:"summary_file"` // 本文落盘路径
+	RecordFile  string `json:"record_file"`  // 被压掉的原文存档路径
 }
 
-// SessionState 会话运行态（旧→新）：[system] → [summary(0/1)] → [messages]
+// SessionState 会话运行态（旧→新）：[system] → [summaries ×N（旧→新）] → [messages]
+// Summaries 是滑动窗口：超过 context.keep_summaries 直接从头部丢弃，不做级联合并。
 type SessionState struct {
-	ID       int        `json:"id"`
-	Summary  *TEntry    `json:"summary"`
-	Messages []RawEntry `json:"messages"`
+	ID        int            `json:"id"`
+	Summaries []SummaryEntry `json:"summaries"`
+	Messages  []RawEntry     `json:"messages"`
 }
 
 // ---------- 事件流 ----------

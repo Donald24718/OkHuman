@@ -110,8 +110,8 @@ func TestStripInjectsAndManualCompress(t *testing.T) {
 	}
 
 	// 4) 手动压缩：不等阈值，立刻压最旧一批。
-	//    同时订阅 /events —— 点按钮后聊天区必须像自动压缩那样流式出现压缩思考/正文
-	//    （此前手动压缩没人订阅压缩事件，界面全程无输出）。
+	//    同时订阅 /events —— 主人 2026-10-18 指出：点按钮后聊天区必须像自动压缩那样
+	//    流式出现压缩思考/正文（此前手动压缩没人订阅压缩事件，界面全程无输出）。
 	evConn, err := srv.Client().Get(srv.URL + "/events")
 	if err != nil {
 		t.Fatalf("订阅 /events: %v", err)
@@ -171,8 +171,11 @@ func TestStripInjectsAndManualCompress(t *testing.T) {
 	if did, _ := cmp["did"].(bool); !did {
 		t.Fatalf("/compress 应真的压了: %v", cmp)
 	}
-	if got := a.CM().Session().Summary; got == nil || !strings.Contains(got.Content, "手动压缩的总结") {
-		t.Errorf("summary 应为手动压缩的总结，实际 %+v", got)
+	sums := a.CM().Session().Summaries
+	if len(sums) == 0 {
+		t.Errorf("摘要窗口为空（手动压缩没产出）")
+	} else if last := sums[len(sums)-1]; !strings.Contains(last.Content, "手动压缩的总结") {
+		t.Errorf("最新一条摘要内容不对：%q", last.Content)
 	}
 	// 手动压缩与自动压缩一样落两个文件：全文存档 + 总结文本（detail 里须报出路径）
 	detail, _ := cmp["detail"].(string)

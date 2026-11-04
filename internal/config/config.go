@@ -65,6 +65,11 @@ type ContextCfg struct {
 	// AttachmentTokens：一个附件（图片/音频等非文本 part）按多少 token 计。
 	// 直接按 token 记，不再用"固定 1000 字符"那种间接口径。0 = 不计附件。
 	AttachmentTokens int `json:"attachment_tokens"`
+	// KeepSummaries：上下文里保留几条历史总结（滑动窗口，超了从头部丢弃，不合并）。
+	KeepSummaries int `json:"keep_summaries"`
+	// SummaryMaxChars：单条总结正文的硬上限（utf16 计数，思考不计）。超出直接截断，
+	// 并在注入时提醒模型这条是硬截断的。
+	SummaryMaxChars int `json:"summary_max_chars"`
 }
 
 type ToolsCfg struct {
@@ -109,7 +114,7 @@ func Default() *Config {
 		LLM:          LLMCfg{BaseURL: "http://127.0.0.1:8080/v1", Model: "local", TimeoutSec: 300, StreamIdleSec: 120, MaxResponseBytes: 256 << 20},
 		SystemPrompt: SystemPromptCfg{Dir: "prompts"},
 		Data:         DataCfg{Dir: filepath.Join(home, ".okhuman")},
-		Context:      ContextCfg{MaxTokens: 150000, KeepRecentChars: 60000, HardTruncChars: 150000, StreamIdleSec: 90, CharsPerToken: 1.5, AttachmentTokens: 500},
+		Context:      ContextCfg{MaxTokens: 150000, KeepRecentChars: 60000, HardTruncChars: 150000, StreamIdleSec: 90, CharsPerToken: 1.5, AttachmentTokens: 500, KeepSummaries: 5, SummaryMaxChars: 30000},
 		Tools:        ToolsCfg{FgTimeoutSec: 30, ResultLimit: 10000, TimeoutSec: 600},
 		Doom:         DoomCfg{WarnAfter: 3},
 		Heartbeat:    HeartbeatCfg{Enabled: false, IntervalMin: 30, Prompt: DefaultHeartbeatPrompt},

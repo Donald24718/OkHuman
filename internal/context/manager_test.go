@@ -1,6 +1,7 @@
 package context
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,28 +56,36 @@ func TestConcurrentAddMessageCompression(t *testing.T) {
 	}
 }
 
-// TestContextStatsSummaryCount 回归（2026-09-14）：Summary 计数曾硬编码 0，
-// 导致 WebUI 已压缩仍显示 [summary ×0] / 滚动总结"无"。
-func TestContextStatsSummaryCount(t *testing.T) {
-	// 有 summary → Summary=1，且 token/char 统计非零
-	with := &types.SessionState{
-		Summary: &types.TEntry{Content: "历史总结内容 12345", CreatedAt: 1},
+// TestContextStatsSummaries 摘要窗口的统计口径（2026-11-05 改：单条 → 多条）：
+// 计数=窗口内条数、字符/token 是全部正文之和、截断条数单独报。
+func TestContextStatsSummaries(t *testing.T) {
+	with := &types.SessionState{Summaries: []types.SummaryEntry{
+		{Content: "第一条总结 abcdef", CreatedAt: 1, OrigChars: 22},
+		{Content: "第二条 中文", CreatedAt: 2, OrigChars: 500, Truncated: true},
+	}}
+	st := ContextStatsOf(with, 2, 500, 5, 30000)
+	if st.SummaryCount != 2 {
+		t.Fatalf("SummaryCount 应为 2，实得 %d", st.SummaryCount)
 	}
-	st := ContextStatsOf(with, 2, 500)
-	if st.Summary != 1 {
-		t.Fatalf("有 summary 时 Summary 应为 1，实得 %d", st.Summary)
+	want := utf16Len("第一条总结 abcdef") + utf16Len("第二条 中文")
+	if st.SummaryChars != want {
+		t.Fatalf("SummaryChars=%d 应为累加 %d", st.SummaryChars, want)
 	}
-	if st.SummaryChars != utf16Len("历史总结内容 12345") {
-		t.Fatalf("SummaryChars = %d，期望 %d", st.SummaryChars, utf16Len("历史总结内容 12345"))
+	if st.SummaryTruncCnt != 1 {
+		t.Fatalf("被硬截断条数应为 1，实得 %d", st.SummaryTruncCnt)
+	}
+	if st.SummaryLimit != 5 || st.SummaryMaxChars != 30000 {
+		t.Fatalf("窗口/上限应回显配置：%+v", st)
+	}
+	if len(st.SummaryStats) != 2 || st.SummaryStats[1].OrigChars != 500 || !st.SummaryStats[1].Truncated {
+		t.Fatalf("逐条统计缺失：%+v", st.SummaryStats)
 	}
 	if st.SummaryTokens == 0 || st.TotalTokens != st.MsgTokens+st.SummaryTokens {
 		t.Fatalf("token 统计不一致：%+v", st)
 	}
-	// 无 summary → Summary=0
-	without := &types.SessionState{}
-	st2 := ContextStatsOf(without, 2, 500)
-	if st2.Summary != 0 || st2.SummaryTokens != 0 || st2.SummaryChars != 0 {
-		t.Fatalf("无 summary 时应全 0：%+v", st2)
+	st2 := ContextStatsOf(&types.SessionState{}, 2, 500, 5, 30000)
+	if st2.SummaryCount != 0 || st2.SummaryTokens != 0 || st2.SummaryChars != 0 {
+		t.Fatalf("无摘要时应全 0：%+v", st2)
 	}
 }
 
@@ -94,8 +103,9 @@ func extractBetween(s, pre, post string) string {
 	return rest[:j]
 }
 
-// TestSummaryFilePairing（2026-09-25）：压缩后总结文本落盘 session-summaries/，
-// 与 session-records/ 存档同名基座成对（不同文件夹）；summary 指针含两个路径。
+// TestSummaryFilePairing（2026-09-25，2026-11-05 改口径）：压缩后总结正文落盘
+// session-summaries/，与 session-records/ 同名基座成对；两条路径存在条目字段里，
+// 注入时由 RenderSummary 渲染成指针（正文与指针分开存：正文是唯一计量口径）。
 func TestSummaryFilePairing(t *testing.T) {
 	dir := t.TempDir()
 	fake := llm.NewFakeLLM([]llm.FakeStep{
@@ -108,20 +118,19 @@ func TestSummaryFilePairing(t *testing.T) {
 		StreamIdleMS:    200,
 		CharsPerToken:   1,
 	}, "sys", dir)
-	m.SetSessionNo(4) // 会话号显式设置（建 CM 默认 1 不得泄漏进文件名，2026-09-25）
+	m.SetSessionNo(4)
 	for i := 0; i < 3; i++ {
 		m.AddMessage(&types.RawEntry{Role: "user", Content: "这是一条比较长的消息内容 " + strings.Repeat("x", 30)})
 	}
 	sess := m.Session()
-	if sess.Summary == nil {
-		t.Fatal("无 summary（压缩未触发）")
+	if len(sess.Summaries) < 1 {
+		t.Fatalf("摘要窗口为空（压缩未触发）")
 	}
-	ref := sess.Summary.Content
-	recPath := extractBetween(ref, "[完整原文已存档：", " ——")
-	sumPath := extractBetween(ref, "[压缩后总结文本：", " ——")
-	if recPath == "" || sumPath == "" {
-		t.Fatalf("指针缺路径（rec=%q sum=%q）：\n%s", recPath, sumPath, ref)
+	e := sess.Summaries[len(sess.Summaries)-1]
+	if e.SummaryFile == "" || e.RecordFile == "" {
+		t.Fatalf("条目没记下两个路径：%+v", e)
 	}
+	recPath, sumPath := e.RecordFile, e.SummaryFile
 	if !strings.HasPrefix(recPath, filepath.Join(dir, "session-records")) {
 		t.Fatalf("存档路径不在 session-records/：%s", recPath)
 	}
@@ -136,16 +145,26 @@ func TestSummaryFilePairing(t *testing.T) {
 	if !strings.HasPrefix(recBase, "ctx-4-") {
 		t.Fatalf("文件名会话号未用 SetSessionNo 的值（应 ctx-4-…）：%s", recPath)
 	}
+	// 注入的消息里必须带两条指针 + 表头（模型能自己去找原文）
+	inj := ComposeMessages(sess, "sys")
+	var joined string
+	for _, msg := range inj {
+		if msg.Role == "user" {
+			joined += types.AsString(msg.Content) + "\n"
+		}
+	}
+	suffix := fmt.Sprintf("/%d ·", len(sess.Summaries)) // 表头形如 "[历史总结] 2/2 · 覆盖 seq …"
+	for _, want := range []string{"[本条覆盖的完整原文已存档：" + recPath, "[本条总结文本：" + sumPath, SummaryMarker + " ", suffix} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("注入的总结消息缺少 %q\n%s", want, joined)
+		}
+	}
 	data, err := os.ReadFile(sumPath)
 	if err != nil {
-		t.Fatalf("总结文件未落盘：%v", err)
+		t.Fatalf("总结文本不可读：%v", err)
 	}
-	body := string(data)
-	if !strings.Contains(body, "（假压缩总结）") {
-		t.Fatalf("总结文件内容不符：%s", body)
-	}
-	if !strings.Contains(body, "配对完整存档："+recPath) {
-		t.Fatalf("总结文件头缺配对存档指引：%s", body)
+	if !strings.Contains(string(data), "（假压缩总结）") {
+		t.Fatalf("总结文本内容不对：%s", data)
 	}
 }
 

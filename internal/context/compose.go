@@ -16,7 +16,9 @@ package context
 import (
 	"fmt"
 	"math"
+	"strings"
 	"sync/atomic"
+	"time"
 
 	"okhuman/internal/inject"
 	"okhuman/internal/types"
@@ -24,6 +26,50 @@ import (
 
 // SummaryMarker 历史总结消息的 role:user 前缀（/history 与压缩存档共用识别）
 const SummaryMarker = "[历史总结]"
+
+// RenderSummary 把一条总结渲染成注入上下文的 user 消息：
+// 表头（第几条/覆盖 seq 区间/时间）→ 硬截断提醒（若有，放在正文之前，模型先读到）
+// → 正文 → 两条原文指针（总结文本 + 被压掉的完整存档）。
+// 正文与指针分开存：正文是唯一计量口径（见 Manager 的 summary_max_chars），
+// 指针永不截断 —— 截断了更要去读原文。
+func RenderSummary(idx, total int, sm types.SummaryEntry) string {
+	var b []string
+	b = append(b, fmt.Sprintf("%s %d/%d · 覆盖 seq %d-%d · 生成于 %s",
+		SummaryMarker, idx+1, total, sm.SeqFrom, sm.SeqTo,
+		time.UnixMilli(sm.CreatedAt).UTC().Format("2006-01-02 15:04 UTC")))
+	if sm.Truncated {
+		b = append(b, fmt.Sprintf("⚠️ 本条总结是硬截断的：正文原有 %d 字符，只保留了前面一部分，"+
+			"更早的内容不在这里 —— 需要时按下面的原文路径去读。", sm.OrigChars))
+	}
+	b = append(b, sm.Content)
+	if sm.SummaryFile != "" {
+		b = append(b, "[本条总结文本："+sm.SummaryFile+" —— 回忆任务轨迹先看这里（时间线/关键实体/完成状态）]")
+	}
+	if sm.RecordFile != "" {
+		b = append(b, "[本条覆盖的完整原文已存档："+sm.RecordFile+" —— 需要被压掉的细节时用 bash cat/grep 按需抓回]")
+	}
+	return strings.Join(b, "\n")
+}
+
+// TruncateUTF16 按 utf16 计数截断（与 keep_recent_chars / summary_max_chars 同口径）。
+// 第二个返回值 = 是否发生截断。
+func TruncateUTF16(s string, n int) (string, bool) {
+	if n <= 0 || utf16Len(s) <= n {
+		return s, false
+	}
+	total := 0
+	for i, r := range s {
+		w := 1
+		if r > 0xFFFF {
+			w = 2
+		}
+		if total+w > n {
+			return s[:i], true
+		}
+		total += w
+	}
+	return s, false
+}
 
 // ToolResultMarker 孤儿 tool 降级 user 文本的前缀（与旧 TS 版一致，供对比）
 const ToolResultMarker = "[工具结果"
@@ -55,8 +101,8 @@ func ComposeMessages(session *types.SessionState, systemPrompt string) []types.M
 		}
 	}
 	out := []types.Message{{Role: "system", Content: systemPrompt}}
-	if session.Summary != nil {
-		out = append(out, types.Message{Role: "user", Content: SummaryMarker + "\n" + session.Summary.Content})
+	for i, sm := range session.Summaries {
+		out = append(out, types.Message{Role: "user", Content: RenderSummary(i, len(session.Summaries), sm)})
 	}
 	for _, e := range session.Messages {
 		if e.Role == "tool" {
@@ -185,8 +231,8 @@ func sessionChars(session *types.SessionState, est Est) int {
 	for _, e := range session.Messages {
 		n += messageChars(e, est)
 	}
-	if session.Summary != nil {
-		n += utf16Len(session.Summary.Content)
+	for _, sm := range session.Summaries {
+		n += utf16Len(sm.Content)
 	}
 	return n
 }
@@ -218,18 +264,33 @@ func EstimateMessageTokens(m types.RawEntry, e Est) int {
 }
 
 // ContextStats /health 的上下文统计
+// SummaryStat 单条摘要在状态页上的展示项
+type SummaryStat struct {
+	SeqFrom    int    `json:"seq_from"`
+	SeqTo      int    `json:"seq_to"`
+	CreatedAt  int64  `json:"created_at"`
+	Chars      int    `json:"chars"`
+	OrigChars  int    `json:"orig_chars"`
+	Truncated  bool   `json:"truncated"`
+	RecordFile string `json:"record_file"`
+}
+
 type ContextStats struct {
-	Messages      int `json:"messages"`
-	Summary       int `json:"summary"`
-	MsgTokens     int `json:"msg_tokens"`
-	SummaryTokens int `json:"summary_tokens"`
-	TotalTokens   int `json:"total_tokens"`
-	MsgChars      int `json:"msg_chars"`
-	SummaryChars  int `json:"summary_chars"`
+	Messages        int           `json:"messages"`
+	SummaryCount    int           `json:"summary_count"`
+	SummaryLimit    int           `json:"summary_limit"`     // context.keep_summaries
+	SummaryMaxChars int           `json:"summary_max_chars"` // 单条正文硬上限
+	SummaryTruncCnt int           `json:"summary_truncated"` // 其中被硬截断的条数
+	SummaryStats    []SummaryStat `json:"summaries"`
+	MsgTokens       int           `json:"msg_tokens"`
+	SummaryTokens   int           `json:"summary_tokens"`
+	TotalTokens     int           `json:"total_tokens"`
+	MsgChars        int           `json:"msg_chars"`
+	SummaryChars    int           `json:"summary_chars"`
 }
 
 // ContextStatsOf 会话状态 → /health 统计
-func ContextStatsOf(session *types.SessionState, cpl float64, attachTokens int) ContextStats {
+func ContextStatsOf(session *types.SessionState, cpl float64, attachTokens int, keepSummaries, summaryMaxChars int) ContextStats {
 	est := NewEst(cpl, attachTokens)
 	msgTokens := 0
 	msgChars := 0
@@ -237,19 +298,24 @@ func ContextStatsOf(session *types.SessionState, cpl float64, attachTokens int) 
 		msgTokens += EstimateMessageTokens(e, est)
 		msgChars += messageChars(e, est)
 	}
-	var summaryTokens, summaryChars, summaryCount int
-	if session.Summary != nil {
-		summaryCount = 1 // 2026-09-14 修：原硬编码 0，导致 WebUI 已压缩仍显示 [summary ×0]
-		summaryTokens = EstimateTokens(session.Summary.Content, cpl)
-		summaryChars = utf16Len(session.Summary.Content)
+	var summaryTokens, summaryChars, truncCnt int
+	stats := make([]SummaryStat, 0, len(session.Summaries))
+	for _, sm := range session.Summaries {
+		ch := utf16Len(sm.Content)
+		summaryChars += ch
+		summaryTokens += EstimateTokens(sm.Content, cpl)
+		if sm.Truncated {
+			truncCnt++
+		}
+		stats = append(stats, SummaryStat{SeqFrom: sm.SeqFrom, SeqTo: sm.SeqTo, CreatedAt: sm.CreatedAt,
+			Chars: ch, OrigChars: sm.OrigChars, Truncated: sm.Truncated, RecordFile: sm.RecordFile})
 	}
 	return ContextStats{
-		Messages:      len(session.Messages),
-		Summary:       summaryCount,
-		MsgTokens:     msgTokens,
-		SummaryTokens: summaryTokens,
-		TotalTokens:   msgTokens + summaryTokens,
-		MsgChars:      msgChars,
-		SummaryChars:  summaryChars,
+		Messages: len(session.Messages), SummaryCount: len(session.Summaries),
+		SummaryLimit: keepSummaries, SummaryMaxChars: summaryMaxChars,
+		SummaryTruncCnt: truncCnt, SummaryStats: stats,
+		MsgTokens: msgTokens, SummaryTokens: summaryTokens,
+		TotalTokens: msgTokens + summaryTokens,
+		MsgChars:    msgChars, SummaryChars: summaryChars,
 	}
 }

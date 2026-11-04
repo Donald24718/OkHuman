@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -170,12 +169,13 @@ func (p *Persistence) SaveSession(snap *Snapshot) error {
 }
 
 // LoadSessionFile 加载会话（无文件/损坏 → nil）。
-// 新形状 { id, summary, messages }；旧三层形状 { id, raw, t1s, t2 } 加载时迁移
-// （t2 + t1s 拼一条 summary，raw → messages，数据不丢）。
-// 校验口径：no/seq 必须数字；summary 若存在必须 {content:string, created_at:number}；
-// 每条消息 role 必须 string，content 必须 string 或数组（2026-09-13 修：/inject
-// 附件消息的 content 是 parts 数组，旧校验只认 string → 带附件会话重启被拒载、
-// 上下文全丢）。
+// 唯一形状：{ no, seq, state: { id, summaries:[…], messages:[…] } }。
+// 校验口径：no/seq 必须数字；summaries 若存在必须是数组、每项 content 必须是字符串
+// （任一项形状异常 → 整份拒载，与 validEntry 同口径）；每条消息 role 必须 string，
+// content 必须 string 或数组（/inject 附件消息的 content 是 parts 数组）。
+// 2026-11-05：删掉 TS 版三层形状（raw/t1s/t2）的迁移与单条 summary 的旧字段——
+// 盘上已不存在那种文件，不留不会再被走的代码。旧文件里的 "summary" 字段按未知字段忽略，
+// 结果是"零条摘要"，不报错（下次压缩按新规则从头建）。
 func LoadSessionFile(dir string) (*Snapshot, error) {
 	data, err := os.ReadFile(filepath.Join(dir, SessionFile))
 	if err != nil {
@@ -193,120 +193,74 @@ func LoadSessionFile(dir string) (*Snapshot, error) {
 	if err := json.Unmarshal(*d.St, &st); err != nil || st == nil {
 		return nil, nil
 	}
-	if msgs, ok := st["messages"].([]interface{}); ok {
-		// 新形状
-		if err := checkSummary(st); err != nil {
-			return nil, nil
-		}
-		for _, e := range msgs {
-			if !validEntry(e) {
-				return nil, nil
-			}
-		}
-		snap := &Snapshot{No: *d.No, Seq: *d.Seq, State: &types.SessionState{ID: 1}}
-		if v, ok := st["id"].(float64); ok {
-			snap.State.ID = int(v)
-		}
-		for _, e := range msgs {
-			snap.State.Messages = append(snap.State.Messages, entryFromJSON(e))
-		}
-		snap.State.Summary = summaryFromJSON(st)
-		return snap, nil
-	}
-	// 旧形状（raw / t1s / t2）→ 迁移
-	raw, ok1 := st["raw"].([]interface{})
-	t1s, ok2 := st["t1s"].([]interface{})
-	if !ok1 || !ok2 {
+	msgs, ok := st["messages"].([]interface{})
+	if !ok {
 		return nil, nil
 	}
-	if err := checkT2(st); err != nil {
+	sums, err := summariesFromJSON(st)
+	if err != nil {
 		return nil, nil
 	}
-	for _, e := range raw {
+	for _, e := range msgs {
 		if !validEntry(e) {
 			return nil, nil
 		}
 	}
-	var (
-		parts     []string
-		createdAt int64
-		t2        *types.TEntry
-	)
-	if v, ok := st["t2"]; ok && v != nil {
-		vo := v.(map[string]interface{})
-		t2 = &types.TEntry{Content: vo["content"].(string), CreatedAt: int64(vo["created_at"].(float64))}
-		parts = append(parts, t2.Content)
-		createdAt = t2.CreatedAt
-	}
-	for _, t := range t1s {
-		to, ok := t.(map[string]interface{})
-		if !ok {
-			return nil, nil // t1s 条目形状异常 → 整份拒载（与 validEntry 同口径，
-		}
-		if c, ok := to["content"].(string); ok {
-			parts = append(parts, c)
-			if ca, ok := to["created_at"].(float64); ok && createdAt == 0 {
-				createdAt = int64(ca)
-			}
-		}
-	}
-	snap := &Snapshot{No: *d.No, Seq: *d.Seq, State: &types.SessionState{ID: 1}}
+	snap := &Snapshot{No: *d.No, Seq: *d.Seq, State: &types.SessionState{ID: 1, Summaries: sums}}
 	if v, ok := st["id"].(float64); ok {
 		snap.State.ID = int(v)
 	}
-	for _, e := range raw {
+	for _, e := range msgs {
 		snap.State.Messages = append(snap.State.Messages, entryFromJSON(e))
 	}
-	if len(parts) > 0 {
-		snap.State.Summary = &types.TEntry{Content: strings.Join(parts, "\n\n"), CreatedAt: createdAt}
-	}
-	_ = t2
 	return snap, nil
 }
 
-func checkSummary(st map[string]interface{}) error {
-	v, ok := st["summary"]
+// summariesFromJSON 解析摘要窗口（旧→新顺序原样保留）。
+func summariesFromJSON(st map[string]interface{}) ([]types.SummaryEntry, error) {
+	v, ok := st["summaries"]
 	if !ok || v == nil {
-		return nil
+		return nil, nil
 	}
-	so, ok := v.(map[string]interface{})
+	arr, ok := v.([]interface{})
 	if !ok {
-		return fmt.Errorf("summary 非对象")
+		return nil, fmt.Errorf("summaries 非数组")
 	}
-	if _, ok := so["content"].(string); !ok {
-		return fmt.Errorf("summary.content 非字符串")
+	out := make([]types.SummaryEntry, 0, len(arr))
+	for _, it := range arr {
+		o, ok := it.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("summaries 项非对象")
+		}
+		c, ok := o["content"].(string)
+		if !ok {
+			return nil, fmt.Errorf("summaries.content 非字符串")
+		}
+		sm := types.SummaryEntry{Content: c}
+		if f, ok := o["created_at"].(float64); ok {
+			sm.CreatedAt = int64(f)
+		}
+		if f, ok := o["seq_from"].(float64); ok {
+			sm.SeqFrom = int(f)
+		}
+		if f, ok := o["seq_to"].(float64); ok {
+			sm.SeqTo = int(f)
+		}
+		if f, ok := o["orig_chars"].(float64); ok {
+			sm.OrigChars = int(f)
+		}
+		if b, ok := o["truncated"].(bool); ok {
+			sm.Truncated = b
+		}
+		if str, ok := o["summary_file"].(string); ok {
+			sm.SummaryFile = str
+		}
+		if str, ok := o["record_file"].(string); ok {
+			sm.RecordFile = str
+		}
+		out = append(out, sm)
 	}
-	if _, ok := so["created_at"].(float64); !ok {
-		return fmt.Errorf("summary.created_at 非数字")
-	}
-	return nil
-}
-
-func checkT2(st map[string]interface{}) error {
-	v, ok := st["t2"]
-	if !ok || v == nil {
-		return nil
-	}
-	vo, ok := v.(map[string]interface{})
-	if !ok {
-		return fmt.Errorf("t2 非对象")
-	}
-	if _, ok := vo["content"].(string); !ok {
-		return fmt.Errorf("t2.content 非字符串")
-	}
-	if _, ok := vo["created_at"].(float64); !ok {
-		return fmt.Errorf("t2.created_at 非数字")
-	}
-	return nil
-}
-
-func summaryFromJSON(st map[string]interface{}) *types.TEntry {
-	v, ok := st["summary"]
-	if !ok || v == nil {
-		return nil
-	}
-	so := v.(map[string]interface{})
-	return &types.TEntry{Content: so["content"].(string), CreatedAt: int64(so["created_at"].(float64))}
+	return out, nil
 }
 
 func validEntry(e interface{}) bool {

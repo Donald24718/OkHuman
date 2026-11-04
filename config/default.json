@@ -17,7 +17,9 @@
   "context": {
     "max_tokens": 150000,
     "keep_recent_chars": 60000,
-    "stream_idle_sec": 90
+    "stream_idle_sec": 90,
+    "keep_summaries": 5,
+    "summary_max_chars": 30000
   },
   "tools": {
     "result_limit": 50000,

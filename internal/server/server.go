@@ -52,12 +52,13 @@ type PromptFileInfo struct {
 
 // CompressLogEntry 压缩日志条目（/status compress 字段）
 type CompressLogEntry struct {
-	At     int64  `json:"at"`
-	Scope  string `json:"scope"`
-	Detail string `json:"detail"`
-	Before int    `json:"before"`
-	After  int    `json:"after"`
-	Rounds int    `json:"rounds"`
+	At        int64  `json:"at"`
+	Scope     string `json:"scope"`
+	Detail    string `json:"detail"`
+	Before    int    `json:"before"`
+	After     int    `json:"after"`
+	Truncated bool   `json:"truncated"` // 摘要正文被 summary_max_chars 硬截断
+	Window    int    `json:"window"`    // 当时生效的 context.keep_summaries
 }
 
 // DoomLogEntry doom/bg 日志条目（/status doom 字段）
@@ -272,6 +273,8 @@ func makeCm(a *AgentState) *ctxmgr.Manager {
 		StreamIdleMS:     cfg.Context.StreamIdleSec * 1000, // 配置以秒为单位，内部按毫秒计时
 		AttachmentTokens: cfg.Context.AttachmentTokens,
 		CharsPerToken:    cfg.Context.CharsPerToken,
+		KeepSummaries:    cfg.Context.KeepSummaries,
+		SummaryMaxChars:  cfg.Context.SummaryMaxChars,
 	}, sp, cfg.Data.Dir)
 	m.SetSessionNo(int(a.SessionNo.Load()))
 	m.AddCompressListener(func(e ctxmgr.CompressEvent) { pushCompressLog(a, e) })
@@ -291,12 +294,13 @@ func llmCfgOf(c config.LLMCfg) llm.ClientConfig {
 func pushCompressLog(a *AgentState, e ctxmgr.CompressEvent) {
 	a.logMu.Lock()
 	a.CompressLog = append(a.CompressLog, CompressLogEntry{
-		At:     time.Now().UnixMilli(),
-		Scope:  e.Scope,
-		Detail: e.Detail,
-		Before: e.BeforeChars,
-		After:  e.AfterChars,
-		Rounds: e.Rounds,
+		At:        time.Now().UnixMilli(),
+		Scope:     e.Scope,
+		Detail:    e.Detail,
+		Before:    e.BeforeChars,
+		After:     e.AfterChars,
+		Truncated: e.Truncated,
+		Window:    e.Window,
 	})
 	a.logMu.Unlock()
 }
@@ -733,6 +737,8 @@ func applyConfigPatch(a *AgentState, patch map[string]interface{}, logf func(for
 			HardTruncChars:   nc.Context.HardTruncChars,
 			StreamIdleMS:     nc.Context.StreamIdleSec * 1000,
 			CharsPerToken:    nc.Context.CharsPerToken,
+			KeepSummaries:    nc.Context.KeepSummaries,
+			SummaryMaxChars:  nc.Context.SummaryMaxChars,
 		})
 	}
 	if has("tools") { // 工具超时热更新（2026-10-02）：重建工具表 + 新上限，下条命令生效
@@ -1073,7 +1079,7 @@ func (ap *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{
 		"ok":      true,
 		"session": int(a.SessionNo.Load()),
-		"context": ctxmgr.ContextStatsOf(sess, cfg.Context.CharsPerToken, cfg.Context.AttachmentTokens),
+		"context": ctxmgr.ContextStatsOf(sess, cfg.Context.CharsPerToken, cfg.Context.AttachmentTokens, cfg.Context.KeepSummaries, cfg.Context.SummaryMaxChars),
 		"llm":     cfg.LLM.BaseURL,
 	})
 }
@@ -1090,12 +1096,17 @@ func (ap *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 	doom := lastN(a.DoomLog, 10)
 	a.logMu.Unlock()
 
-	var summary interface{}
-	if s := sess.Summary; s != nil {
-		summary = map[string]interface{}{
-			"chars":   utf16Len(s.Content),
-			"preview": utf16Slice(s.Content, 120),
-		}
+	summaries := make([]map[string]interface{}, 0, len(sess.Summaries))
+	for _, sm := range sess.Summaries {
+		summaries = append(summaries, map[string]interface{}{
+			"chars":      utf16Len(sm.Content),
+			"orig_chars": sm.OrigChars,
+			"truncated":  sm.Truncated,
+			"seq_from":   sm.SeqFrom,
+			"seq_to":     sm.SeqTo,
+			"created_at": sm.CreatedAt,
+			"preview":    utf16Slice(sm.Content, 120),
+		})
 	}
 
 	// raw_tail：末 5 条消息（chars/preview 口径与 TS 一致）
@@ -1159,11 +1170,11 @@ func (ap *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 			"files":    files,
 			"chars":    spChars,
 		},
-		"context":     ctxmgr.ContextStatsOf(sess, cfg.Context.CharsPerToken, cfg.Context.AttachmentTokens),
+		"context":     ctxmgr.ContextStatsOf(sess, cfg.Context.CharsPerToken, cfg.Context.AttachmentTokens, cfg.Context.KeepSummaries, cfg.Context.SummaryMaxChars),
 		"compress":    compress,
 		"doom":        doom,
 		"backgrounds": bgs,
-		"summary":     summary,
+		"summaries":   summaries,
 		"raw_tail":    rawTail,
 	})
 }
@@ -1216,11 +1227,21 @@ func (ap *App) handleHistory(w http.ResponseWriter, r *http.Request) {
 	if runningNow && buf != nil && buf.Round == int(a.SessionNo.Load()) && buf.StartLen < len(entries) {
 		entries = entries[:buf.StartLen]
 	}
-	var summary interface{}
-	if s := sess.Summary; s != nil {
-		summary = s.Content
+	summaries := make([]map[string]interface{}, 0, len(sess.Summaries))
+	for _, sm := range sess.Summaries {
+		summaries = append(summaries, map[string]interface{}{
+			"content":      sm.Content,
+			"seq_from":     sm.SeqFrom,
+			"seq_to":       sm.SeqTo,
+			"created_at":   sm.CreatedAt,
+			"chars":        utf16Len(sm.Content),
+			"orig_chars":   sm.OrigChars,
+			"truncated":    sm.Truncated,
+			"summary_file": sm.SummaryFile,
+			"record_file":  sm.RecordFile,
+		})
 	}
-	writeJSON(w, 200, map[string]interface{}{"session": int(a.SessionNo.Load()), "summary": summary, "entries": entries})
+	writeJSON(w, 200, map[string]interface{}{"session": int(a.SessionNo.Load()), "summaries": summaries, "entries": entries})
 }
 
 func (ap *App) handleBackgrounds(w http.ResponseWriter, r *http.Request) {
@@ -1592,7 +1613,7 @@ func (ap *App) handleAttachments(w http.ResponseWriter, r *http.Request) {
 // ---------- 手动压缩 / 手动剥离附件（2026-10-18，取代旧"LLM 4xx 三级回退"）----
 //
 // 旧阶梯靠硬编码 400/413/415 猜"请求体被拒"，是按 llama.cpp 行为定的，换后端
-// 就不成立（别的后端同一件事可能报别的码）。现在机器不猜，两个动作都由人按按钮。
+// 就不成立（strata 同一件事可能报别的码）。现在机器不猜，两个动作都由人按按钮。
 
 // handleCompressNow 手动压缩上下文：不等 token 阈值，按常规分批口径立刻压最旧一批。
 // run 进行中拒绝（409）——压缩会换掉会话结构（旧消息出列 + summary 替换），与在飞
@@ -1841,6 +1862,12 @@ var numChecks = map[string]func(interface{}) bool{
 	"stream_idle_sec":    func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 && n <= 3600 },      // ≤1h（秒）
 	"max_response_bytes": func(v interface{}) bool { n, ok := v.(float64); return ok && n >= 1024 && n <= 4<<30 }, // 1KB–4GiB（字节）
 	"max_tokens":         func(v interface{}) bool { n, ok := v.(float64); return ok && n > 100 },
+	// keep_summaries：摘要窗口条数。0/负数 = 完全不保留摘要（失忆）；>20 无意义且
+	// 会成倍吃上下文，所以给一个宽但有限的界。
+	"keep_summaries": func(v interface{}) bool { n, ok := v.(float64); return ok && n >= 1 && n <= 20 },
+	// summary_max_chars：单条摘要正文硬上限。过小（<1000）会把摘要压成索引，
+	// 过大（>200k）则"摘要比原文预算还长"，自相矛盾。
+	"summary_max_chars": func(v interface{}) bool { n, ok := v.(float64); return ok && n >= 1000 && n <= 200000 },
 	// chars_per_token：0/负数 → 估算 Infinity/恒超阈（每条消息白压一次）；过大 →
 	// 严重低估 → 永不压缩 → 撑爆模型上下文。英文 ~4 字符/token，20 已极宽松。
 	"chars_per_token": func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 && n <= 20 },

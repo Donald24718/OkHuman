@@ -180,7 +180,8 @@ func (a *Agent) CompressNowWithEvents(emit func(types.AgentEvent)) (string, bool
 			"detail":       e.Detail,
 			"before_chars": e.BeforeChars,
 			"after_chars":  e.AfterChars,
-			"rounds":       e.Rounds,
+			"truncated":    e.Truncated, // 正文超 summary_max_chars 被硬截断
+			"sum_window":   e.Window,    // 当时生效的 context.keep_summaries
 			"text":         e.Text,
 		}
 		if e.Thinking != nil {
@@ -252,7 +253,8 @@ func (a *Agent) runUserMessage(ctx context.Context, userText string, opt RunOpti
 			"detail":       e.Detail,
 			"before_chars": e.BeforeChars,
 			"after_chars":  e.AfterChars,
-			"rounds":       e.Rounds,
+			"truncated":    e.Truncated, // 正文超 summary_max_chars 被硬截断
+			"sum_window":   e.Window,    // 当时生效的 context.keep_summaries
 			"text":         e.Text,
 		}
 		if e.Thinking != nil {
@@ -397,7 +399,7 @@ func (a *Agent) writeToolLog(opt RunOptions, full string) string {
 // AgentStoppedError 抛出（由 runUserMessage 收尾）。
 //
 // 2026-10-18：删掉"LLM 4xx 三级回退阶梯"（4xx→降级最近附件→全部附件→硬截断）。
-// 理由：触发条件写死 400/413/415，是按 llama.cpp 的行为定的；换后端
+// 理由：触发条件写死 400/413/415，是按 llama.cpp 的行为定的；换后端（现 strata）
 // 同一件事可能报 503/500/别的码，阶梯既不触发也拦不住，等于把猜测固化进控制流。
 // 现在 LLM 报错就原样抛出、本轮终止。附件出问题的处置改由人显式做：
 // WebUI「剥离全部注入附件」按钮（POST /strip-injects，永久回写侧车）+
