@@ -49,7 +49,7 @@ setsid ./okmon </dev/null > /tmp/okmon.log 2>&1 &
 | browser | 无头浏览器 | 端口 8702（`browserd 8702 --keep`） |
 | cron | 定时任务 | 端口 8601 |
 | computer | 桌面操作 xusectl | CLI |
-| scout | 语义检索 | 端口 8480 |
+| scout | 关键词检索（无语义向量） | 端口 8480 |
 
 ## 实例界面的边界（诚实列）
 
