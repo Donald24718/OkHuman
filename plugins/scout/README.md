@@ -14,7 +14,7 @@
 | `keywords` | `meta.json` 的 `keywords`（**字符串或字符串数组都接受**）；若 summary 里内联写了「关键词：…」，那截会被折进 keywords 并从 summary 摘掉（同一信号不算两遍） |
 | `summary` | `meta.json` 的 `summary`（必填，空则跳过） |
 | `path` | 目录路径 |
-| `kind` | 在 `OkHuman_skill/…` 下 = `skill`，否则 `plugin`（2026-11-05 前 `source` 一律写 plugin，害我判断错过一次） |
+| `kind` | 在 `OkHuman_skill/…` 下 = `skill`，否则 `plugin`（2026-11-05 前 `source` 一律误写成 plugin） |
 
 另有 manual 条目（`POST /doc` 写入，`reindex` 不清除；**只在内存，重启会丢**）。
 运行时资产目录（`venv`/`data`/`speaker`…）剪枝，但**目录自己带 meta.json 就不剪**（2026-10-16 `asr` 撞名教训）。
@@ -30,7 +30,7 @@
 
 ## 为什么把语义向量拆了（实测，别再重新讨论）
 
-2026-11-05 在同一份语料（26 条）上跑 34 条我自己标的查询做对照：
+同一语料（26 条）、34 条人工标注查询的对照（2026-11-05）：
 
 | 配置 | R@1 | R@3 |
 |---|---|---|
