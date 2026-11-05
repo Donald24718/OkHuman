@@ -1,6 +1,1 @@
-{
-  "name": "browser",
-  "summary": "浏览器操作插件：agent 经 browserctl 轻 CLI 驱动本地 chromium 做导航、定位、填表、点击、取文本、截图；并支持网页自测——errors 收页面 JS 异常/console 报错（有错退出码 1）、count 数元素、eval 求值，agent 写完前端能自己开浏览器验。",
-  "updated": "2026-09-16",
-  "note": "agent 自写简介，scout 扫描时优先于 README 首段"
-}
+{"name":"browser","summary":"浏览器操作插件：agent 经 browserctl 轻 CLI 驱动本地 chromium 做导航、定位、填表、点击、取文本、截图；并支持网页自测——errors 收页面 JS 异常/console 报错（有错退出码 1）、count 数元素、eval 求值，agent 写完前端能自己开浏览器验。","updated":"2026-09-16","note":"agent 自写简介，scout 扫描时优先于 README 首段","keywords":"浏览器 网页 chromium 导航 填表 点击 取文本 截图 打开网页 网页自测 人机验证 验证码 登录网页"}

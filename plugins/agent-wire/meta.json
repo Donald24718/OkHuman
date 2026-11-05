@@ -1,3 +1,1 @@
-{
-  "summary": "agent 之间派活/回信（跨机，无守护进程，只有异步）：list 列出配置的各 agent 与谁在 run（读各实例 /status）；send <名字> <消息> 只给空闲 agent 派活、立刻返回不阻塞（在 run 或给自己发一律拒）；一次性 watcher 靠 /events/poll?since= 游标累加本轮 delta.text、run_end 取最终正文，再 /enqueue 投回发送方，靠主程序的轮内搭车进入发送方当前轮；回信头部由插件拼【agent-wire 回信 · 来自 X】+任务前80字，超时也回明确通知；pending 查在等的。peers[] 可带 token 经 lan-bridge 访问远端实例。"
-}
+{"summary":"agent 之间派活/回信（跨机，无守护进程，只有异步）：list 列出配置的各 agent 与谁在 run（读各实例 /status）；send <名字> <消息> 只给空闲 agent 派活、立刻返回不阻塞（在 run 或给自己发一律拒）；一次性 watcher 靠 /events/poll?since= 游标累加本轮 delta.text、run_end 取最终正文，再 /enqueue 投回发送方，靠主程序的轮内搭车进入发送方当前轮；回信头部由插件拼【agent-wire 回信 · 来自 X】+任务前80字，超时也回明确通知；pending 查在等的。peers[] 可带 token 经 lan-bridge 访问远端实例。","keywords":"派活 委托 另一个实例 别的agent 小黑 小九 小八 回信 收结果 跨机 agent 间 协作 通信 异步 唤醒 谁在忙 空闲"}

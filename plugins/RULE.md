@@ -11,7 +11,8 @@
 - 插件目录直接平铺在本目录下，不分层（现状：attach / browser / computer / cron / okmon / qq-channel / scout / voice-chat）
 - 新插件加入：直接在本目录建子目录，附：
   - `README.md`（启动方式 + 配置 + 排障）
-  - `meta.json`（agent 自写的一句话摘要，scout 索引信号，summary 必填）
+`meta.json`（scout 的索引信号）：`summary` **必填**；`keywords` **必填**——触发词、别名、用户的口语说法
+    （字符串或字符串数组都接受）。**没写 keywords ≈ 这个插件在口语式查询下不存在**。
 - 插件目录内部要求见附录「解耦契约」（独立进程、自带 config.json、data/ 自管）
 
 ## 规范二：skills/ —— 技能库：日期层级（只放 skill，不放插件）
@@ -25,8 +26,7 @@
 - day 目录内的 `README.md` = 当天技能的人工索引（进什么写一行什么）
 - 只写本机实测验证过的，带日期；环境变了（换模型/服务重建/端点变化）同步改 SKILL.md 里的「环境事实」
 - 账号令牌 / API key 不进技能目录（放 /tmp 用完即弃）
-- skill 目录同样带 `meta.json`（agent 自写一句话摘要），**进 scout 索引**，与插件同规则；
-  任务落在某 skill 适用范围时，先 `cat` 对应 SKILL.md 照做
+- skill 目录同样带 `meta.json`（`summary` + `keywords`，同上要求），**进 scout 索引**，与插件同  任务落在某 skill 适用范围时，先 `cat` 对应 SKILL.md 照做
 
 ---
 
@@ -34,8 +34,15 @@
 
 ### scout 索引判据（对插件与技能均生效）
 
-- scout（:8480）递归扫描本目录（`plugin_root`），**任意深度**含非空 `summary` 的
-  `meta.json` 的目录 → 自动建索引（插件与技能同规则）；分类容器目录、日期目录无 meta.json → 不被索引
+- scout（:8480）递归扫描本目录（`plugin_root`），**任意深度**含非空 `summary` 的 `meta.json` 的目录
+  → 自动建索引（插件与技能同规则）。**一个目录被认定为文档后不再向下走**：里面的子模块/子技能不各占一条，
+  只通过母文档的路由表被发现（母文档的 `summary` + `keywords` 必须点名它们与触发词）。
+- **scout 是纯关键词检索，没有语义向量；索引只在内存、不落盘**（真源就是 `meta.json`，启动即扫，毫秒级）。
+  实测（26 条语料、34 条查询）：带语义 24/34、纯关键词 22/34、**纯关键词 + `keywords` 字段 31/34**，
+  而语义的代价是 reindex 16.2 秒 + 常驻 3.49 GB —— 所以缺词才是根因，`keywords` 才是杠杆。
+- 自检：`GET /doctor` 当场重扫并与内存索引对照，报 `no_keywords / stale_in_index / missing_from_index /
+  same_name / meta_problems`；`/health` 里 `docs=0` = scout 没起或数据盘没挂载（不拿旧快照假装正常）。
+- 同名**不自动取舍**：两处同名都返回 + `same_name` 计数，由调用方自己决定删哪份或合并。
 - 改完插件功能 → 同步更新其 README / meta.json →
   `curl -X POST http://127.0.0.1:8480/reindex` 刷索引
   （规则 2「先搜索引」的缘由：实测中读图需求没搜索引走了通用 OCR 弯路，

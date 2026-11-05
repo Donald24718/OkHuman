@@ -1,3 +1,6 @@
 /scout
+/scout-new
 *.log
 index.json
+*.bak-*
+*.orig

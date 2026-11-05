@@ -76,7 +76,7 @@ open http://127.0.0.1:8451/
 | cron | 定时任务（:8601），到点把 prompt 作为 user 消息 POST 到对应实例 /chat |
 | okmon | 进程监控 + 启停管理（webui :8496） |
 | qq-channel | QQ 官方渠道桥：QQ 消息 ↔ agent 双向转发（独立常驻进程，无监听端口） |
-| scout | 插件/技能语义索引（:8480）：关键词 + Qwen3-Embedding 语义向量打分 |
+| scout | 插件/技能检索服务（纯关键词，内存索引，:8480）：`/search` `/reindex` `/doctor`。meta.json 的 `summary`+`keywords` 就是它的索引信号 |
 | tts | 独立 TTS 服务（Kokoro-82M，HTTP :8092）：`say.sh` 出一句，`serve.py` 常驻复用 |
 | voice-chat | 语音全闭环：麦克风 → VAD → 声纹门控 → ASR → 唤醒词路由 → TTS 朗读（ASR/TTS 已拆成上面两个独立插件） |
 

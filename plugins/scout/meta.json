@@ -1,1 +1,1 @@
-{"summary": "语义检索服务（Go 版，移植自 TS 版 scout）：对插件目录/技能建关键词+语义混合索引，:8480 提供 /search /reindex /doc /health；embed 模型 Qwen3-Embedding-0.6B 走常驻 llama-server :8591（健康探测复用，拉起后不重载）"}
+{"summary":"关键词检索服务（无向量）：扫插件/技能树建内存索引，:8480 提供 /search /reindex /doctor /health /doc；主键 kind:name，同名不取舍只报告。","keywords":"搜索 索引 找插件 找能力 该用哪个 检索 关键词 元信息 doctor 健康"}
