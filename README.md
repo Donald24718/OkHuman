@@ -74,7 +74,6 @@ open http://127.0.0.1:8451/
 | browser | browserctl 轻 CLI 驱动本地 chromium（CDP）：导航、定位、填表、点击、取文本、截图；`errors` / `count` / `eval` 让 agent 写完前端自己开浏览器验 |
 | computer | 给 agent 装"手"：整屏截图注入 + X11 鼠标键盘事件 |
 | cron | 定时任务（:8601），到点把 prompt 作为 user 消息 POST 到对应实例 /chat |
-| okknowledge | 关系性知识库（独立 CLI，无守护进程）：接地事实 + 出处 + ID 永不改指；答本机事实前先查它 |
 | okmon | 进程监控 + 启停管理（webui :8496） |
 | qq-channel | QQ 官方渠道桥：QQ 消息 ↔ agent 双向转发（独立常驻进程，无监听端口） |
 | scout | 插件/技能语义索引（:8480）：关键词 + Qwen3-Embedding 语义向量打分 |
