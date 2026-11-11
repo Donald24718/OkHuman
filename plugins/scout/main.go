@@ -10,7 +10,7 @@
 //  2. 索引不落盘。真源是磁盘上的 meta.json/README，内存索引可再生：扫 25 个文件 2.6ms、1000 条约 165ms。
 //     不持久化 = 不会拿旧快照骗人；外接盘没挂载时 docs=0，/health 里明说，不假装正常。
 //
-// 只支持 Linux（按主人的范围约定，不做交叉编译）。
+// 只支持 Linux（按用户的范围约定，不做交叉编译）。
 //
 // 用法:
 //
@@ -36,7 +36,7 @@ import (
 )
 
 const (
-	// 2026-11-05 主人定：一次给 10 条，不再靠翻页。理由是对的——调用方是 LLM，
+	// 2026-11-05 用户定：一次给 10 条，不再靠翻页。理由是对的——调用方是 LLM，
 	// 多几条候选比来回翻页便宜；page 参数仍保留（老调用方不破）。
 	pageSize = 10
 	maxTotal = 50
@@ -88,7 +88,8 @@ var xling = map[string][]string{
 	"post": {"发帖"}, "发帖": {"post"}, "publish": {"发布"}, "发布": {"publish"},
 	"upload": {"上传"}, "上传": {"upload"}, "download": {"下载"}, "下载": {"download"},
 	"cron": {"定时"}, "定时": {"cron"}, "schedule": {"定时"},
-	"attach_look": {"附件", "看图", "读图"}, "附件": {"attach_look"}, "看图": {"attach_look"}, "读图": {"attach_look"},
+	"view_image": {"附件", "看图", "读图", "attach_look"}, "attach_look": {"view_image"},
+	"附件": {"view_image"}, "看图": {"view_image"}, "读图": {"view_image"}, "图片注入": {"view_image"},
 	"channel": {"频道"}, "频道": {"channel"},
 	"chat": {"聊天"}, "聊天": {"chat"}, "message": {"消息"}, "消息": {"message"},
 	"bilibili": {"哔哩哔哩"}, "哔哩哔哩": {"bilibili"},
@@ -308,11 +309,11 @@ func scanCorpus(cfg Config) ([]corpusDoc, []corpusProblem) {
 		if summary == "" {
 			return nil // 无 summary → 跳过（简介一律模型自写，不抓文件内容）
 		}
-		// 子技能不独立建索引（2026-11-05 主人定）：这个目录一旦自认成文档，它下面的一切
+		// 子技能不独立建索引（2026-11-05 用户定）：这个目录一旦自认成文档，它下面的一切
 		// 都属于它的子模块/子技能——只通过母文档的路由表被发现，不在索引里各占一条。
 		// （母文档必须点名每个子模块/子技能 + 触发词，这是 RULE 规范三的要求。）
 		defer func() { r = filepath.SkipDir }()
-		// 同名不去重（2026-11-05，主人的判断）：全部保留，让 agent 看见两处自己决定删哪个。
+		// 同名不去重（2026-11-05，用户的判断）：全部保留，让 agent 看见两处自己决定删哪个。
 		// 原来的 `if seen[name] return` 会让谁被看见取决于 WalkDir 顺序 —— 那是真 bug。
 		docs = append(docs, corpusDoc{pluginName, keywords, summary, path, kindOf(path)})
 		return nil

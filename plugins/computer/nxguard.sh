@@ -5,7 +5,7 @@
 #   真正根因 = 别的最大化窗口（Thunar）盖住点击点 + xfwm4 windowactivate 置顶延迟，
 #   详见 LESSONS.md。本脚本降级为备而不用（用户客户端真在动鼠标时可临时用）。
 # 用法: nxguard.sh <命令...>
-# 例:   nxguard.sh plugins/computer/xusectl click 48 29
+# 例:   nxguard.sh "plugins/computer/xusectl" click 48 29  # 本机无 /usr/NX → 只会走「无会话，直接执行」分支
 set -u
 PW=${NX_SUDO_PASSWORD:-}
 NX=/usr/NX/bin/nxserver

@@ -1,11 +1,12 @@
-// qq-channel：OkHuman 的 QQ 官方渠道桥（独立进程）——TS 版 bridge.ts + qq.ts 的 1:1 Go 移植。
+// OkHuman_p/qq-channel：OkHuman 的 QQ 官方渠道桥（独立进程）——TS 版 bridge.ts + qq.ts 的 1:1 Go 移植。
 //
 // 链路（常驻转发管道）：
-//   上行：QQ 消息 → POST {实例}/enqueue { message }（入队即返，不等回合结束）
-//   下行：桥常驻订阅 GET {实例}/events（SSE 广播）→ 按事件边界整段拆气泡发：
-//         thinking 整段 ≤2950 字（[思考] 前缀）/ text 整段 ≤3000 字 / tool_call [工具] /
-//         tool_result [结果] / finish flushAll+reply 兜底 / error [出错]
-//         轮内 60s 静默 → 15s 轮询 /history 补发回尾 → 10min 放弃
+//
+//	上行：QQ 消息 → POST {实例}/enqueue { message }（入队即返，不等回合结束）
+//	下行：桥常驻订阅 GET {实例}/events（SSE 广播）→ 按事件边界整段拆气泡发：
+//	      thinking 整段 ≤2950 字（[思考] 前缀）/ text 整段 ≤3000 字 / tool_call [工具] /
+//	      tool_result [结果] / finish flushAll+reply 兜底 / error [出错]
+//	      轮内 60s 静默 → 15s 轮询 /history 补发回尾 → 10min 放弃
 //
 // 运行：./okhuman-qq-bridge（输出重定向落日志）。配置：config.json（client_secret 不入日志）。
 // Token 盘缓存：<data_dir>/channels/qq/tokens/<botId>.json（原子写）。
@@ -14,6 +15,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -154,7 +156,7 @@ func isMdTableSeparator(line string) bool {
 }
 
 func collectMdTableLines(lines []string, start int) ([]string, int) {
-	tableLines := []string{lines[start], lines[start + 1]}
+	tableLines := []string{lines[start], lines[start+1]}
 	cursor := start + 2
 	for cursor < len(lines) && strings.Contains(lines[cursor], "|") {
 		if qqMdFenceRe.MatchString(strings.TrimSpace(lines[cursor])) {
@@ -307,6 +309,7 @@ func splitText(text string, maxLen int) []string {
 
 var urlPattern = regexp.MustCompile(`(?i)https?://[^\s]+|www\.[^\s]+`)
 var bareDomainPattern = regexp.MustCompile(`(?i)https?://[^\s]+|www\.[^\s]+|\b[\w][\w.-]*\.(?:com|cn|org|net|edu|gov|io|co|cc|tv|me|info|biz|app|dev|top|xyz|site|vip|shop|tech|club|pro|live|mobi|asia|wiki)(?:\.[a-z]{2,3})?\b(?:/[^\s]*)?`)
+
 const urlPlaceholder = "[链接已省略]"
 
 func sanitizeQQText(text string) (string, bool) {
@@ -363,19 +366,19 @@ type BotCfg struct {
 }
 
 type SharedCfg struct {
-	DataDir          string `json:"data_dir"`
-	Enabled          bool   `json:"enabled"`
-	ReconnectMs      int    `json:"reconnect_ms"`
-	ReauthMs         int    `json:"reauth_ms"`
-	HeartbeatMs      int    `json:"heartbeat_ms"`
-	MaxQueuePerMin   int    `json:"max_queue_per_min"`
-	MaxMsgChars      int    `json:"max_msg_chars"`
-	SendFailStop     int    `json:"send_fail_stop"`
-	AckMessage       string `json:"ack_message"`
-	MarkdownEnabled  bool     `json:"markdown_enabled"`
+	DataDir         string `json:"data_dir"`
+	Enabled         bool   `json:"enabled"`
+	ReconnectMs     int    `json:"reconnect_ms"`
+	ReauthMs        int    `json:"reauth_ms"`
+	HeartbeatMs     int    `json:"heartbeat_ms"`
+	MaxQueuePerMin  int    `json:"max_queue_per_min"`
+	MaxMsgChars     int    `json:"max_msg_chars"`
+	SendFailStop    int    `json:"send_fail_stop"`
+	AckMessage      string `json:"ack_message"`
+	MarkdownEnabled bool   `json:"markdown_enabled"`
 
 	// QQ 侧控制指令（2026-10-18）：/stop 中断 agent 循环，/restart 重置会话。
-	CommandsEnabled bool     `json:"commands_enabled"`
+	CommandsEnabled bool `json:"commands_enabled"`
 	// 白名单（sender openid）。空 = 该 bot 绑定的渠道内任何人都可发指令。
 	CommandOpenIDs []string `json:"command_openids"`
 }
@@ -388,17 +391,17 @@ type BridgeConfig struct {
 
 func defaultSharedCfg() SharedCfg {
 	return SharedCfg{
-		DataDir:          "data",
-		Enabled:          true,
-		ReconnectMs:      3000,
-		ReauthMs:         30000,
-		HeartbeatMs:      30000,
-		MaxQueuePerMin:   100,
-		MaxMsgChars:      4000,
-		SendFailStop:     5,
-		AckMessage:       "收到",
-		MarkdownEnabled:  true,
-		CommandsEnabled:  true,
+		DataDir:         "data",
+		Enabled:         true,
+		ReconnectMs:     3000,
+		ReauthMs:        30000,
+		HeartbeatMs:     30000,
+		MaxQueuePerMin:  100,
+		MaxMsgChars:     4000,
+		SendFailStop:    5,
+		AckMessage:      "收到",
+		MarkdownEnabled: true,
+		CommandsEnabled: true,
 	}
 }
 
@@ -516,17 +519,17 @@ type gatewayFrame struct {
 }
 
 type QQChannel struct {
-	shared    SharedCfg
-	bot       BotCfg
-	botID     string
-	queueLim  *WindowLimiter
-	agentLim  *WindowLimiter
-	tokenFile string
+	shared        SharedCfg
+	bot           BotCfg
+	botID         string
+	queueLim      *WindowLimiter
+	agentLim      *WindowLimiter
+	tokenFile     string
 	onStream      func(string) error
 	onMessage     func(string) (string, error)
-	onAttachments func(string) error // 2026-09-15 方向A：附件落盘后 /inject 路径文本通知
+	onAttachments func(string) error           // 2026-09-15 方向A：附件落盘后 /inject 路径文本通知
 	onCommand     func(string) (string, error) // 2026-10-18：QQ 侧 /stop /restart
-	sendReplyFn   func(string, string) error  // 回复出口（默认 = sendReply；测试可注入）
+	sendReplyFn   func(string, string) error   // 回复出口（默认 = sendReply；测试可注入）
 	logf          func(string)
 
 	mu             sync.Mutex
@@ -648,7 +651,7 @@ func (c *QQChannel) fetchTokenLocked() (*tokenVal, error) {
 		}
 	}
 	now := time.Now().UnixMilli()
-	t := &tokenVal{value: j.AccessToken, expiresAt: now + int64(ein) * 1000}
+	t := &tokenVal{value: j.AccessToken, expiresAt: now + int64(ein)*1000}
 	c.token = t
 	c.saveTokenCacheLocked(t)
 	c.logf("token 已获取（mask=" + mask(t.value) + "，expires_in=" + einStr + "s）")
@@ -1645,11 +1648,11 @@ func (f *EventForwarder) tailFlush() []string {
 // ---------- /events 常驻下行转发循环 ----------
 
 type eventsLoop struct {
-	url    string
-	ch     *QQChannel
-	target string
-	botID  string
-	logf   func(string)
+	url      string
+	ch       *QQChannel
+	target   string
+	botID    string
+	logf     func(string)
 	stopping *atomic.Bool
 
 	fwd EventForwarder
@@ -2132,8 +2135,10 @@ func agentErrDetail(j map[string]interface{}) string {
 }
 
 // makeOnCommand 控制指令 → 实例管理端点：
+//
 //	stop    → POST /stop  ：取消在飞 LLM 请求；若正在执行工具，本次工具跑完后在下次 LLM 调用前强停。
 //	restart → POST /reset ：先停，再清未发消息队列/注入附件/后台任务，换会话（旧会话全文落盘）。
+//
 // 文案里不带本机绝对路径（落盘路径只说"见实例日志/WebUI"）——QQ 是外部渠道。
 func makeOnCommand(instanceURL, instanceID string, logf func(string)) func(string) (string, error) {
 	return func(cmd string) (string, error) {
@@ -2209,6 +2214,14 @@ func makeOnCommand(instanceURL, instanceID string, logf func(string)) func(strin
 }
 
 // ---------- 启动 ----------
+// newGenToken：让位协议的持有令牌。绝不能用 PID 代替（PID 会被复用）。
+func newGenToken() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
 
 func main() {
 	root := pluginRoot()
@@ -2221,35 +2234,23 @@ func main() {
 		fmt.Println("[qq-bridge] shared.enabled=false，桥不启动（配置 enabled 为 true 启用）")
 		os.Exit(0)
 	}
-	// 单实例锁——防双桥（双桥会双份转发/双份入队）
-	lockPath := filepath.Join(cfg.Shared.DataDir, "channels", "qq", "bridge.lock")
-	os.MkdirAll(filepath.Dir(lockPath), 0755)
-	acquireLock := func() bool {
-		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
-		if err == nil {
-			_, werr := f.WriteString(strconv.Itoa(os.Getpid()))
-			f.Close()
-			if werr != nil {
-				fmt.Fprintf(os.Stderr, "[qq-bridge] 桥锁写入失败（不阻塞启动）：%v\n", werr)
-			}
-			return true
+	// 单实例 = 让位（lease），不判活：本进程只自证"当前持有令牌的是不是我"。
+	// 令牌随机、不落 PID —— 旧实现（O_EXCL 锁 + /proc/<pid> 判活）会因 PID 复用把陈旧锁永远判成"别人在跑"。
+	// 新桥写令牌即接管，旧桥在下面的让位看门狗里自己退 0（退 0 不触发 systemd Restart）。
+	genPath := filepath.Join(cfg.Shared.DataDir, "channels", "qq", "bridge.gen")
+	os.MkdirAll(filepath.Dir(genPath), 0755)
+	myGen := newGenToken()
+	writeGen := func() {
+		tmp := genPath + ".tmp"
+		if err := os.WriteFile(tmp, []byte(myGen+"\n"), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "[qq-bridge] bridge.gen 写入失败（不阻塞启动）：%v\n", err)
+			return
 		}
-		// 锁已存在：旧进程存活 → 退出；陈旧锁 → 清掉重试
-		if data, rerr := os.ReadFile(lockPath); rerr == nil {
-			if oldPid, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil && oldPid > 0 {
-				if _, serr := os.Stat(fmt.Sprintf("/proc/%d", oldPid)); serr == nil {
-					fmt.Fprintf(os.Stderr, "[qq-bridge] 已有桥在运行（PID %d），本进程退出\n", oldPid)
-					os.Exit(1)
-				}
-				fmt.Fprintf(os.Stderr, "[qq-bridge] 检测到陈旧锁（PID %d 已不在），清除\n", oldPid)
-			}
+		if err := os.Rename(tmp, genPath); err != nil {
+			fmt.Fprintf(os.Stderr, "[qq-bridge] bridge.gen 原子替换失败（不阻塞启动）：%v\n", err)
 		}
-		os.Remove(lockPath)
-		return false
 	}
-	if !acquireLock() {
-		acquireLock() // O_EXCL 抢占，防两进程同时判陈旧而双启
-	}
+	writeGen()
 	validBots := []BotCfg{}
 	for _, b := range cfg.Bots {
 		if b.AppID != "" && b.ClientSecret != "" {
@@ -2260,17 +2261,39 @@ func main() {
 		fmt.Fprintln(os.Stderr, "config.json bots[] 无有效 bot（每个需 app_id + client_secret，可选 channel_id / instance / max_msgs_per_min）")
 		os.Exit(1)
 	}
+	// c2c msg_seq 的恢复在让位完成后（见下方 leaseWatchdog）：早读会读到旧桥未落的尾值 → 新桥会重复用号
+
+	logf := func(m string) {
+		// TS 版 new Date().toISOString().slice(11,19) = UTC 时
+		fmt.Printf("[%s] [qq-bridge] %s\n", time.Now().UTC().Format("15:04:05"), m)
+	}
+
+	// 让位看门狗（2s）：令牌被别人持有 → 立即退出，不再转发。文件被删/读不到 → 重新持有（自愈）。
+	leaseTick := 2 * time.Second
+	go func() {
+		for {
+			time.Sleep(leaseTick)
+			b, rerr := os.ReadFile(genPath)
+			if rerr != nil {
+				writeGen()
+				continue
+			}
+			if strings.TrimSpace(string(b)) == myGen {
+				continue
+			}
+			logf("bridge.gen 已被新一代持有 → 让位退出（本进程停止转发与 msg_seq 取号）")
+			os.Exit(0)
+		}
+	}()
+	// 先让旧桥退场（它最多 leaseTick 后退出），再取号/连网关：把双写者窗口关在启动阶段
+	time.Sleep(leaseTick + time.Second)
+
 	// c2c msg_seq 从盘上恢复（QQ 要求单调递增）
 	c2cSeqFile = filepath.Join(cfg.Shared.DataDir, "channels", "qq", "msg_seq")
 	if data, err := os.ReadFile(c2cSeqFile); err == nil {
 		if n, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil && n > 0 {
 			c2cMsgSeq = n
 		}
-	}
-
-	logf := func(m string) {
-		// TS 版 new Date().toISOString().slice(11,19) = UTC 时
-		fmt.Printf("[%s] [qq-bridge] %s\n", time.Now().UTC().Format("15:04:05"), m)
 	}
 
 	urlOfInstance := func(instanceID string) string {

@@ -1,1 +1,0 @@
-{"name":"attach_look","summary":"看图 / 读图 / 看视频 / 看单帧——把素材注入 agent 自己的上下文。`okattach <图片>` 原图 native 注入（读内容、人物、构图、颜色、文字/水印）；`okattach video <视频>` 整段直通（服务端抽帧 + 时间戳，可答「第几秒发生了什么」，超长自动分段）；`okattach frame <视频> <秒> --w W` 抽高清单帧。触发：任何图片/视频素材需要知道里面有什么 → 先 okattach，别绕路调 LLM API。文件≤64MB；音频走 asr。","cli":true,"keywords":"看图 读图 图片 照片 截图 视频 看视频 单帧 第几秒 图里有什么 描述图片 OCR 水印 附件 QQ 图片 生成图"}

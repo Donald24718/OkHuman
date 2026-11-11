@@ -1,1 +1,7 @@
-{"name":"asr","summary":"独立 ASR 服务（从 voice-chat 拆出）：llama.cpp CPU build 的 llama-server + Qwen3-ASR-0.6B，OpenAI 兼容接口 :8090/v1/audio/transcriptions。只要音频转文本时不必拉起整套语音对话。start.sh 起服务（只认 HTTP 200，加载中是 503），transcribe.sh 直接转写一个文件出纯文本。实测 7.4 秒音频转写 1.7 秒。模型输出带 <asr_text> 前缀需剥掉。","updated":"2026-10-16","note":"agent 自写简介，scout 扫描时优先于 README 首段","keywords":"语音识别 转文字 录音 音频转文本 转写 听写 这段录音说了什么 语音转文本 麦克风 文件转文字 识别说话 whisper"}
+{
+  "name": "asr",
+  "summary": "音频→文字（ASR）：独立 ASR 服务（从 voice-chat 拆出）：llama.cpp CPU build 的 llama-server + Qwen3-ASR-0.6B，OpenAI 兼容接口 :8090/v1/audio/transcriptions。只要音频转文本时不必拉起整套语音对话。start.sh 起服务（只认 HTTP 200，加载中是 503），transcribe.sh 直接转写一个文件出纯文本。实测 7.4 秒音频转写 1.7 秒。模型输出带 <asr_text> 前缀需剥掉。",
+  "updated": "2026-10-16",
+  "note": "agent 自写简介，scout 扫描时优先于 README 首段",
+  "keywords": "语音识别 转文字 录音 音频转文本 转写 听写 这段录音说了什么 语音转文本 麦克风 文件转文字 识别说话 whisper 录音变文字 这段录音说了啥"
+}

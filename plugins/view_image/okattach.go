@@ -1,7 +1,6 @@
 // okattach —— 素材注入 OkHuman 上下文（图片 / 视频 / 单帧；音频暂不支持）。
-// 图片：默认原图注入（native，不缩放不压质），--scaled 压宽 800px/JPEG q2 省 token；
-//
-//	--png 走 PNG 无损（截图类素材）。
+// 图片：一律原图注入（native，不缩放不压质）；--png 只换容器为 PNG 无损（原分辨率）。
+// 没有缩放注入这条路（2026-10-28 用户定：注入缩略图会误导模型按缩略图读坐标）。
 //
 // 视频：直通 input_video part（llama-server 服务端抽帧+时间戳，比插件侧抽帧
 //
@@ -16,13 +15,13 @@
 //	- 清晰度不够 → okattach frame 抽单帧高清注入；
 //	- 长内容分批 → 分段注入（--seg）。
 //
-// 用法：okattach <file> [--scaled] [--png] [--note "..."]
+// 用法：okattach <file> [--png] [--note "..."]
 //
 //	okattach video <file> [--seg N] [--note "..."] [--dry-run]
 //	okattach frame <video> <t秒> [--w 宽] [--note "..."]
 //
 // 目标端口自动识别：本插件目录向上找 OkHuman 父目录，用其 config.json 的
-// server.port（各实例树独立，端口从进程父链取，不用写死）。
+// server.port（512nv 生产=8451、lil 副本=8452，各树独立，不用写死）。
 package main
 
 import (
@@ -62,13 +61,13 @@ func usage() {
 	fmt.Fprint(os.Stderr, `okattach —— 素材注入 OkHuman 上下文
 
 用法:
-  okattach <file>                      图片：原图注入（native，默认）
-  okattach <file> --scaled             图片：压宽 800px / JPEG q2（省 token）
-  okattach <file> --png                图片：压宽后走 PNG 无损（截图类素材）
+  okattach <file>                      图片：原图注入（native，唯一路径）
+  okattach <file> --png                图片：转 PNG 无损（原分辨率，截图类素材）
   okattach video <file> [--seg N]      视频：按策略编码后直通 input_video 注入
   okattach video <file> --dry-run      视频：只打印计划（分辨率/分段/token 估算），不编码不 POST
   okattach frame <video> <t> [--w W]   视频抽 t 秒单帧，压宽 W（默认 1280）注入为图片
-  以上均可加 --note "说明"（/attachments 里可见，不进 LLM 上下文）
+  以上均可加 --note "说明"（会作为 label 进正文）
+  --okhuman-port <端口>  显式指定注入到哪个实例；默认沿父进程链自动认，认不出直接报错（不猜端口）
 
 视频策略（:8080 实测标定，详见 README）:
   源宽 <360px → 原样注入；源宽 ≥360px → 压到宽 360px
@@ -83,11 +82,11 @@ func usage() {
 
 type flag struct {
 	note   string
-	scaled bool
 	png    bool
 	dryRun bool
 	seg    int // 0 = 未指定（视频单段/自动）
 	frameW int // frame 子命令目标宽
+	okPort int // --okhuman-port：显式指定注入到哪个实例端口
 }
 
 func parseFlags(args []string) (flag, []string) {
@@ -103,9 +102,19 @@ func parseFlags(args []string) (flag, []string) {
 			i++
 			f.note = args[i]
 		case a == "--scaled":
-			f.scaled = true
+			die("--scaled 已移除：图片一律原图注入（缩放会让模型按缩略图读坐标，读不准）")
 		case a == "--png":
 			f.png = true
+		case a == "--okhuman-port":
+			if i+1 >= len(args) {
+				die("--okhuman-port 需要端口号")
+			}
+			i++
+			n, err := strconv.Atoi(args[i])
+			if err != nil || n < 1 || n > 65535 {
+				die("--okhuman-port 须为 1-65535: %s", args[i])
+			}
+			f.okPort = n
 		case a == "--dry-run":
 			f.dryRun = true
 		case a == "--seg":
@@ -135,14 +144,18 @@ func parseFlags(args []string) (flag, []string) {
 	return f, pos
 }
 
-// targetPort 沿进程父链找所属 okhuman 主进程，取其 LISTEN 端口（插件由 agent 的 bash 工具启动，
-// 父链 okattach←bash←okhuman，端口随实例天然隔离）；找不到回退 8451 并提示
-func targetPort() int {
+// targetPort 选注入目标：① --okhuman-port 显式指定优先；② 沿进程父链找所属 okhuman 主进程，取其 LISTEN
+// 端口（插件由 agent 的 bash 工具启动，父链 okattach←bash←okhuman，端口随实例天然隔离）。
+// ② 失败时不再猜端口：2026-11-07 去掉硬编码回退 8451——猜来的目标会让图片静默进错实例的会话。
+func targetPort(f flag) int {
+	if f.okPort > 0 {
+		return f.okPort
+	}
 	if ports := detectOwnPorts(); len(ports) > 0 {
 		return ports[0]
 	}
-	fmt.Fprintln(os.Stderr, "okattach: 父链未找到 okhuman 主进程，回退默认端口 8451（如属错误实例请用 --okhuman-port 显式指定）")
-	return 8451
+	die("父链未找到 okhuman 主进程，无法确定注入到哪实例；在 agent 里跑会自动认出，手工跑请显式加 --okhuman-port <端口>")
+	return 0
 }
 
 func ppidOf(pid int) int {
@@ -158,7 +171,8 @@ func ppidOf(pid int) int {
 	return n
 }
 
-// isOkHumanMain pid 是否为 OkHuman 主程序（Go 单文件二进制：argv0 基名为 okhuman）
+// isOkHumanMain pid 是否为 OkHuman 主程序。argv0 基名允许 `okhuman` 或 `okhuman-*`
+// （2026-11-07：ey-desktop 上主实例二进制叫 okhuman-local，严格相等会判不出来 → 只能回退默认端口）
 func isOkHumanMain(pid int) bool {
 	cmd, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	if err != nil {
@@ -168,7 +182,8 @@ func isOkHumanMain(pid int) bool {
 	if len(parts) == 0 || parts[0] == "" {
 		return false
 	}
-	return filepath.Base(strings.TrimRight(parts[0], "\x00")) == "okhuman"
+	base := filepath.Base(strings.TrimRight(parts[0], "\x00"))
+	return base == "okhuman" || strings.HasPrefix(base, "okhuman-")
 }
 
 func listenPortsOf(pid int) []int {
@@ -339,7 +354,7 @@ func main() {
 	}
 	sub := os.Args[1]
 	f, pos := parseFlags(os.Args[2:])
-	port := targetPort()
+	port := targetPort(f)
 
 	switch sub {
 	case "video":
@@ -533,26 +548,18 @@ func main() {
 		}
 
 		b64, imgMime := base64.StdEncoding.EncodeToString(data), mime
-		if f.scaled || f.png {
-			out := filepath.Join(os.TempDir(), fmt.Sprintf("okattach-%d.%s", os.Getpid(), ext[1:]))
+		if f.png {
+			out := filepath.Join(os.TempDir(), fmt.Sprintf("okattach-%d.png", os.Getpid()))
 			defer os.Remove(out)
-			encArgs := []string{"-v", "error", "-i", file, "-vf", "scale='min(800,iw)':-2", "-an"}
-			if f.png {
-				encArgs = append(encArgs, out)
-			} else {
-				encArgs = append(encArgs, "-q:v", "2", out)
-			}
-			if _, err := runCmd("ffmpeg", encArgs...); err != nil {
-				die("ffmpeg 压缩失败: %v", err)
+			if _, err := runCmd("ffmpeg", "-v", "error", "-i", file, "-an", out); err != nil {
+				die("ffmpeg 转 PNG 失败: %v", err)
 			}
 			data, err = os.ReadFile(out)
 			if err != nil {
-				die("读压缩产物失败: %v", err)
+				die("读 PNG 产物失败: %v", err)
 			}
 			b64 = base64.StdEncoding.EncodeToString(data)
-			if !f.png {
-				imgMime = "image/jpeg"
-			}
+			imgMime = "image/png"
 		}
 
 		parts := []part{{

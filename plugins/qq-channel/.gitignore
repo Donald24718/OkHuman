@@ -2,3 +2,5 @@
 /data/
 /config.json
 *.log
+
+*.bak-*

@@ -20,10 +20,11 @@ llama.cpp **CPU build** 的 `llama-server` + Qwen3-ASR-0.6B（bf16 GGUF + mmproj
 ```bash
 curl -s http://127.0.0.1:8090/v1/audio/transcriptions \
   -F "file=@speech.wav" -F "model=qwen3-asr-0.6b" -F "language=Chinese"
-# -> {"text":"<asr_text>识别结果"}
+# -> {"type":"transcript.text.done","text":"language Chinese<asr_text>识别结果","usage":{...}}
 ```
 
-模型输出带 `<asr_text>` 前缀，调用方要剥掉（`transcribe.sh` 已处理）。
+**取文本要剥两层前缀**：`language Chinese` 与 `<asr_text>`（2026-10-28 实测响应里两段都在；
+`transcribe.sh` 已处理，自己拼 curl 时别只剥 `<asr_text>`）。响应还带 `type` 字段，别按整段 JSON 当文本用。
 
 ## 配置（config.json）
 
@@ -40,6 +41,15 @@ curl -s http://127.0.0.1:8090/v1/audio/transcriptions \
 - 7.4 秒音频 → 转写 **1.7 秒**（CPU，16 线程）
 - 模型加载约 30 秒（期间 `/v1/models` 返回 **503 "Loading model"**，不是就绪信号）
 
+## 两台机器上的实况（2026-11-06 实测，两台都能本机跑，不必跨机）
+
+| | 生产实例（本机） | 另一台（副本） |
+|---|---|---|
+| 二进制与模型 | 本插件目录内 `bin/llama-server` + `models/`（同结构） | 同：`同一插件目录（配置里换根路径）`，`models/Qwen3-ASR-0.6B-bf16.gguf`(1.5 G)+`mmproj-…`(378 M) |
+| 端口 | 8090 | 8090（各绑本机回环，互不冲突），已实测 `:8090`=200 |
+| 常驻方式 | **不是 systemd 单元**（脱管进程），重启不自启 → 用 `./start.sh` | 同样不是单元 |
+| 查它在不在 | `pgrep -f 'llama-server.*8090'` + `curl -sf http://127.0.0.1:8090/health` | 同 |
+
 ## 排障
 
 - **`start.sh` 卡在"启动中"**：模型加载中会返回 503，脚本只认 HTTP 200，会一直等到 120 秒。
@@ -54,3 +64,11 @@ curl -s http://127.0.0.1:8090/v1/audio/transcriptions \
 
 voice-chat 不再自带 ASR：它的 `start.sh` 探活 :8090，不通就调用本插件 `start.sh`。
 本插件挂了 voice-chat 的识别会报错重试；voice-chat 挂了不影响本插件。
+
+## 用法坑（2026-10-27）
+
+`transcribe.sh` 第一行就 `cd "$(dirname "$0")"`，所以**必须传绝对路径**；
+传相对路径时 curl 取不到文件，脚本**静默返回空**（不报错），容易被误判成"模型没识别出来"。
+整片 90 秒一次转写没问题（16 kHz 单声道 wav）。
+
+- 别自己拼 HTTP multipart 调接口（boundary/字段名易错且失败静默）→ 一律走 `./transcribe.sh <绝对路径wav>`。

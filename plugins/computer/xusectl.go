@@ -1,4 +1,4 @@
-// xusectl —— 桌面 computer-use 插件（Go 移植自早期 TS 版 computer/xusectl.ts，2026-09-14）
+// xusectl —— 桌面 computer-use 插件（Go 移植自 OkHuman_p/computer/xusectl.ts，2026-09-14）
 //
 // 给 agent 装"手"：整屏截图 + X11 鼠标键盘事件。微内核设计：内核零改动，
 // 视觉走现有 okattach（截图注入上下文），动作走 xdotool(XTest)/ffmpeg(x11grab)。
@@ -19,8 +19,8 @@
 //   windowactivate|windowminimize|windowraise|windowmaximize|windowunmaximize <窗口名|0xID|十进制ID>
 //   stack [x y] / sleep <ms>
 //
-// 坐标空间：默认=真实屏幕像素。若 agent 看的是 okattach 缩略图（长边 1600），
-// 加 --view-w 1600，插件自动乘 屏幕宽/1600 换算。
+// 坐标空间：真实屏幕像素。注入的图片一律是原生分辨率，坐标直接用；
+// --view-w W 只在你手上是别处来的缩放图时才用（乘 屏幕宽/W 换算）。
 package main
 
 import (
@@ -372,9 +372,7 @@ func doShot(rest []string) {
 		os.Exit(3)
 	}
 	fmt.Fprintf(os.Stderr, "已截图 %s（%d 字节）\n", out, size.Size())
-	fmt.Fprintf(os.Stdout, "已截图 %s（%d×%dpx，文件为原生分辨率、坐标直接用）。okattach 默认原图直传（免换算）；"+
-		"仅 --scaled 注入（长边 1600）时按注入图读坐标需乘 %s，或 click 等动作加 --view-w 1600 由插件换算。\n",
-		out, w, h, strconv.FormatFloat(float64(w)/1600.0, 'f', 3, 64))
+	fmt.Fprintf(os.Stdout, "已截图 %s（%d×%dpx，原生分辨率；注入进上下文的就是这张原图，坐标直接用，无需换算）\n", out, w, h)
 }
 
 func doMouse(action string, rest []string) {

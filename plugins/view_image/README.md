@@ -1,33 +1,35 @@
-# okattach（attach_look 插件）
+# 看图（view_image 插件；命令名仍是 `okattach`）
+
+> **能力面只有一件：把图片注入我自己的上下文。** 视频注入不可用（后端不透出 `input_video`，实测 2026-11-06：调用返回 ok、侧车写入、估算 ~1.6k tokens，但我上下文里没有画面）。要看视频内容就用 `frame` 抽帧成图片再注入。音频不走这里（ASR 插件负责）。
 
 ## 我什么时候该用它（先想这个，不要先想机制）
 
 任何素材**需要我知道里面有什么**，就先把它注入我自己的上下文：
 
 - 收到图片（QQ/微信附件、截图、下载的文件、我生成的图）想知道内容、人物、构图、颜色、图里的文字水印 → `okattach <图片>`
-- 收到视频想知道整段内容 / 第几秒发生了什么 → `okattach video <视频>`（要细节再 `okattach frame <视频> <秒>`）
+- 收到**视频**想知道里面有什么 → **不要用 `okattach video`（当前后端不可用）**；用 `okattach frame <视频> <秒>` 抽帧成图片注入（要多个时刻就多次调用）
 - 做完图/片要**自己亲眼验收** → 先 okattach 再看，不要只凭参数判断
 
-反例（2026-11-03 实测）：收到一张照片后，我手搓 base64 调 `/v1/chat/completions` 问图里有什么，
-结果转述出错（水印 B612 实际在左下，我先说右下）。正规路径就是 `okattach` 注入自己上下文，一次到位。
+反例（2026-11-03 我犯的）：用户发来照片，我手搓 base64 调 `/v1/chat/completions` 问图里有什么，
+凭记忆转述位置会出错（水印 B612 实际在左下，曾被说成右下）。正规路径就是 `okattach` 注入自己上下文，一次到位。
 
 
-素材注入 OkHuman 上下文：图片（默认原图 native）/ **视频（直通 input_video，按策略编码分段）** / 单帧高清抽取。音频暂不支持（ASR 插件负责）。
+把**图片**注入 OkHuman 上下文：默认原图 native（不缩放不压质）；或从视频抽 t 秒单帧压宽后注入为图片。内核按 part 类型透传（`types.go` 注释：主程序对 part 类型零感知），**能不能被后端透出由后端决定**——当前 :8080 只支持 image_url，`input_video` 被忽略。
 
 ## 用法
 
 ```
 okattach <file>                      图片：原图注入（native，不缩放不压质，唯一路径）
 okattach <file> --png                图片：转 PNG 无损（原分辨率，截图类素材）
-okattach video <file> [--seg N]      视频：按策略编码后以 input_video part 注入
+okattach video <file> [--seg N]      【当前不可用】input_video 被后端忽略，别用
 okattach video <file> --dry-run      视频：只打印计划（分辨率/分段/token 估算），不编码不 POST
 okattach frame <video> <t> [--w W]   视频抽 t 秒单帧，压宽 W（默认 1280）注入为图片
-以上均可加 --note "说明"（/attachments 里可见，不进 LLM 上下文）
+加 --note "说明"：它会作为 label **进我的上下文**（`[okattach] <note>`，见 server.go:1562-1575），不是只显示在 /attachments
 ```
 
-目标端口自动识别：沿**进程父链**找所属 okhuman 主进程，取其 LISTEN 端口（插件由 agent 的 bash 工具启动，父链 okattach←bash←okhuman，端口随实例天然隔离：512nv 生产=8451、lil 副本=8452）；脱离 agent 会话跑（父链无 okhuman）时回退 8451 并告警，此时用 `--okhuman-port` 显式指定。
+目标端口：默认沿**进程父链**找所属 okhuman 主进程（argv0 基名 `okhuman` 或 `okhuman-*`），取其 LISTEN 端口——插件由 agent 的 bash 工具启动，父链 okattach←bash←okhuman，端口随实例天然隔离。**认不出就报错退出（退出码 1），不猜端口**；在会话外手工跑要显式加 `--okhuman-port <端口>`。
 
-## 视频注入策略（2026-09-20 用户定版）
+## 【归档】视频注入策略（2026-09-20 定版；**当前后端已不适用**，2026-11-06 实测 input_video 不透出。留作 llama.cpp 后端时代的参考）
 
 llama-server 服务端自己抽帧（4fps + 2 帧时序 merge），并**每 5 秒往帧流注入文本时间戳**（`[0m5.00s]` 格式，视频开头有 "Video:"）——时间定位比插件侧抽帧准，模型可答"第几秒发生了什么"（实测误差 ±0.5~1s）。
 
@@ -61,13 +63,21 @@ llama-server 服务端自己抽帧（4fps + 2 帧时序 merge），并**每 5 �
 - ffmpeg/ffprobe（本机 6.1.1）；ffprobe 失败（无视频流/非视频）直接退出。
 - 文件 ≤ 64MB（与 /inject 侧车上限一致）；注入走 base64，侧车体积 ≈ 文件 ×4/3。
 - 视频段编码：libx264 crf23 fast、yuv420p、去音轨（`-ss` 在 `-i` 前 = 快 seek + 帧精确 + 输出时间戳归零）。
-- `--note` 只是 /attachments 的展示元数据，**不进 LLM 上下文**；要给模型的时间轴/主题说明写在视频自带的文本 part 或聊天消息里。
+- ~~`--note` 不进 LLM 上下文~~（错）：note 就是回显 label，会进正文（`[okattach] <note>`）。要给我时间轴/主题说明就写在 note 里，一行足够。
 - /inject 的 parts 透传支持（任意带 type 的 JSON 对象 part，含 input_video）需 OkHuman 主进程 2026-09-20 版；更早的二进制只认 text/image_url，发视频会 400。
 - LLM 端点须支持视频（llama-server MTMD_VIDEO + mmproj）；不支持时 OkHuman 4xx 降级为文本存根自动重试。
 
 ## 排障
 
-- 看到 `okattach: 父链未找到 okhuman 主进程，回退默认端口 8451` → 你是在 agent 会话外跑的，属错实例就用 `--okhuman-port` 指定；注入失败 → 看返回状态码：400=主进程旧版或 parts 格式错；0/连接失败=OkHuman 没起。
+- 看到 `okattach: 父链未找到 okhuman 主进程…` → 你是在 agent 会话外跑的（父链里没有主进程）。这不是 bug：显式加 `--okhuman-port <端口>` 再跑。（旧版会静默回退 8451，2026-11-07 去掉——猜来的目标会让图片静默进错实例。）
 - 分段数比预期多 → 估算式偏保守（720p 高估 13%），属正常；要精确先看 `--dry-run`。
 - 抽帧时间不准 → 确认 ffmpeg ≥5（旧版 -ss 行为不同）。
 - 段内时间戳与"原时间轴"对不上 → 模型读的是段内 0 起的时间戳，换算 = 段内时间 + 段起点（注入文本里已写明）。
+
+## OCR 依赖在两台的情况（2026-11-06）
+
+- **本机（生产）**：`tesseract 5.3.4`，语言 `chi_sim eng osd`。用法与边界见上面 OCR 一节。
+- **另一台（副本）**：**已装 `tesseract 5.3.4` + `chi_sim eng osd`**（`sudo apt-get install tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-osd`，
+  不到 20 秒——我原先担心它外网 apt 很慢，是错的）。两台**同版本**：同一张截图分别 OCR，输出**逐字节一致**（md5 相同）；
+  `--tsv` 词框、以及「黑底白字先用 `ffmpeg -vf negate` 反色再读」在 `.3` 上同样有效。
+  两台都有 XFCE4 桌面，GUI 自动化两台都能跑（`.3` 用 `DISPLAY=:1`，对照表见 `computer` 插件 README）。

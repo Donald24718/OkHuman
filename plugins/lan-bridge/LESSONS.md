@@ -1,0 +1,6 @@
+# lan-bridge 可复用的坑
+
+- 探活按 `config.json` 的 `listen.host` 决定打哪个地址。**2026-11-08 起本机 = `0.0.0.0:8602`**（`127.0.0.1` 和两个 LAN 地址都听）。之前绑死 `<本机某张网卡的地址>` 时打 `127.0.0.1:8602` 得 000，会误判成"没起"（2026-11-07 犯过）；而且绑单地址 = 只有一条路进得来，`.1`（sd-box）走有线那段（`本机`）当时进不来。判"能不能用"要从**访问方那侧** curl，不要只在本机测。
+- 改 `config.json`（`instances[]`/`token` 等）后**必须重启桥**，没有热加载；按端口取 pid：`ss -ltnp | awk '/:8602 /'`，❌ 别 `pgrep -f lan-bridge`（会打到其它实例的桥）。
+- 本机的 `lan-bridge-8451/8452`、`okmon`、`okhuman-cron`、`scout`、`qq-bridge` 都是 **ey 的 user 单元**（`~/.config/systemd/user/`，全 `Restart=no` → kill 不复活）；其中 lan-bridge×2、scout、qq-bridge、两个 okhuman 实例已 enable，`okmon`/`okhuman-cron` 有单元但没 enable。改过 config 要 `systemctl --user restart <unit>`，手工 setsid 起的会和单元抢端口。
+- `.1`（sd-box，用户 `sd`）上的 root 单元 `okhuman-entries.service` = 本桥的 TCP 转发枢纽（`/opt/okhuman-entries/entries.py`，root 所有 644 → 改它**连备份都要 sudo**）：`UP` 表每行 =（tag, 本机端口, 上游 host:port, 显示名, 对端 token, 强制实例），靠 `force_inst` 改写 `Cookie` 里的 `okh_inst`。当前四行：18451→8451、18452→8452、18501→`.3:8451`、18502→`.3:8452`（18454/小鲸 已于 2026-11-08 删，备份 `entries.py.bak-20261108-drop-8454`）。加/删实例都只改 `UP` 一行 + `python3 -m py_compile` 过语法 + `sudo systemctl restart okhuman-entries`。入口页在 `:8500`（**只有 `.1` 本机取得到，跨机被它的防火墙挡**）→ 判"卡还在不在"要 `ssh sd-box curl 127.0.0.1:8500`，从这边测不到不等于没改。

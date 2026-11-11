@@ -95,7 +95,7 @@ func TestMakeOnCommandRestartReportsCountButNotLocalPath(t *testing.T) {
 	f := &fakeInstance{h: map[string]func(http.ResponseWriter){
 		"/reset": jsonHandler(map[string]interface{}{
 			"ok": true, "session": 10,
-			"record": "/var/lib/okhuman/session-records/ctx-9-demo.txt", "record_msgs": 974,
+			"record": "<内存盘>/inst/session-records/ctx-9-2026-10-18.txt", "record_msgs": 974,
 		}),
 		"/queue": jsonHandler(map[string]interface{}{"running": false, "queued": []string{}}),
 	}}

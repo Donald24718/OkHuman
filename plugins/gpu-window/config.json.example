@@ -1,0 +1,12 @@
+{
+  "services": [
+    { "name": "8081",
+      "match": ["apps/ninfer-serve"],
+      "gates": [{ "url": "http://127.0.0.1:8452/status", "field": "running" }] },
+    { "name": "8080",
+      "match": ["strata", "bin/strata-vision"],
+      "protected": true,
+      "gates": [{ "url": "http://127.0.0.1:8451/status", "field": "running" }] },
+    { "name": "comfyui", "match": ["main.py --listen 127.0.0.1 --port 8188"] }
+  ]
+}

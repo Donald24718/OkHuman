@@ -12,7 +12,7 @@
    命中就读对应插件的 README / SKILL.md 再用；scout 挂了或无相关命中才退回
    `ls plugins/` 或通用工具。凭记忆/常识跳过这一步 = 违规（缘由见 plugins/RULE.md 附录）
    搜的时候**必须把 `summary` 一起打印**（`name + score + summary`）——只看名字等于没搜：
-   `attach_look`（看图/看视频）就是因此被我漏掉的（2026-11-03 实测）。候选只要上榜，就去
+   `view_image`（看图）就是因此被我漏掉的（2026-11-03 实测）。候选只要上榜，就去
    `cat` 它的 README / SKILL.md 一行确认，**不许按分数自断**。
 3. **改完某插件/skill 的 README 或 meta.json** → 刷 scout 索引 `curl -X POST http://127.0.0.1:8480/reindex`
 4. **任务落在某 skill 适用范围内** → 先 `cat` 对应 SKILL.md 照做
