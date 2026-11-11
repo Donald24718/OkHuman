@@ -66,8 +66,8 @@ func TestCappedBufferPartialOver(t *testing.T) {
 // TestBashViaTempScript 方案 B（2026-09-15 移植自 TS 4a5182c）：命令文本进 /tmp 临时脚本、
 // 不进 argv——根治 pkill/pgrep -f 自匹配自杀；进程退出后脚本删除。
 // 验证：1) 运行期没有任何进程的 argv 含命令文本（在脚本文件里，不在 argv）；
-//       2) 输出正常；3) 退出后无新增临时脚本（跑前快照比对——同机其他 OkHuman
-//       实例的并发脚本不算残留）。
+//  2. 输出正常；3) 退出后无新增临时脚本（跑前快照比对——同机其他 OkHuman
+//     实例的并发脚本不算残留）。
 func TestBashViaTempScript(t *testing.T) {
 	marker := "okhuman-planb-marker-7731"
 	before, _ := filepath.Glob(filepath.Join(os.TempDir(), "okhuman-bash-*.sh"))
