@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -130,9 +131,9 @@ func buildTools(fgMS, timeoutMS int) []types.ToolSpec {
 			Name: "bash",
 			Description: "执行 bash 命令（异步并行；输出超长被截断时，全文已写入 log 文件、截断处会给出路径，用 bash 的 cat / grep / tail 抓回）。" +
 				fmt.Sprintf("前台等待 %d 秒未完成自动转后台（你收到通知后继续干活，结果在轮内下一个工具调用间隙或下一次 run 带回来）；命令总时长超 %d 秒被强制终止（整个命令进程组）。", fgSec, toSec) +
-				fmt.Sprintf("起长驻服务（python 服务器等）必须完全脱离，否则服务占住本工具的进程组、会被 %d 秒超时连带杀掉：用 ", toSec) +
-				"(setsid <启动命令> < /dev/null > /tmp/<名>.log 2>&1 &)，之后用 curl 探活、cat 读日志。脱离后服务独立存活，不受前台超时/转后台影响。" +
-				"脱离必须三件套：setsid + 重定向 stdout/stderr + < /dev/null——只 setsid 不重定向，脱离子进程仍持有输出管道写端，Wait 收不到 EOF 会永久挂住，且超时杀组打不到它（上限彻底失效）。",
+				fmt.Sprintf("起长驻服务（python 服务器等）必须离开本工具的进程组，否则会被 %d 秒超时连带杀掉。默认写法（立即返回不占管道，且活得过本进程重启）：systemd-run --user --unit=<唯一名> --collect --property=StandardOutput=append:<日志> <启动命令>，之后 systemctl --user 查/停；日志别落 tmpfs。", toSec) +
+				"无 user manager（systemd-run 报 Failed to connect to bus）才退回 setsid 三件套：(setsid <启动命令> < /dev/null > <日志> 2>&1 &)——三件套缺一不可（少重定向会挂死 Wait）；setsid 只换会话不换 cgroup：本进程所在单元被重启时它连坐被杀，本进程崩溃时它成孤儿带着旧配置继续跑。" +
+				"命令会先过一道静态检查（guard）：`rm -rf $d/`、`rm -rf /`、`find … -delete`（未先 -print）、`chmod/chown -R` 打到系统根、`kill 0`、`git push -f`、`> 覆盖已存在的文件`——命中就不执行，并给出更安全写法（没有绕过开关）。它只认形状，换个写法就看不见（`xargs rm`、python `shutil.rmtree`）；同理这些也不会因改写变安全，得你自己判断：`rsync --delete`、`git reset --hard`、`git clean -fdx`、`docker … --volumes`、`mkfs/dd/删卷`、改另一台机器——其中不可逆又无法预览的先问用户。",
 			Parameters: types.ToolParameters{
 				Type: "object",
 				Properties: map[string]interface{}{
@@ -185,6 +186,14 @@ func toolBash(args map[string]interface{}) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("参数 command 缺失或不是字符串")
 	}
+	// guard（2026-11-08）：只硬拦「可低成本换成更安全写法」的灾难形状，无逃生门
+	// ——不给 agent 留 --force 出口，要放开只能改 guard.go。语义上必须如此的（rsync --delete、
+	// git reset --hard、mkfs、dd、down -v）不在此列，见 guard.go 头注释与 fixture 测试。
+	if blocked, _ := guardCommand(command); blocked != nil {
+		return "", fmt.Errorf("bash 未执行（被 guard 拦下）\n%s", blocked.String())
+	}
+	guardNotes := guardNotes(command)
+
 	// 上限来自配置 tools.timeout_sec（2026-10-02；旧为硬编码 600）
 	limitSec := int(toolTimeoutMS.Load()) / 1000
 	if limitSec < 1 {
@@ -251,10 +260,13 @@ func toolBash(args map[string]interface{}) (string, error) {
 		}
 	}
 	head := fmt.Sprintf("退出码: %d", code)
+	if len(guardNotes) > 0 { // 不拦，只把看不见的连带后果说出来（一次输出，不多一轮）
+		head = strings.Join(guardNotes, "\n") + "\n" + head
+	}
 	if killed.Load() {
 		// 光说"已超时"不够：模型分不清"命令自己失败"与"被上限杀掉"，会误判重试。
 		// 给出上限值与出路（脱离进程组 / 调大配置）。
-		head += fmt.Sprintf("（超过 %d 秒上限被强制终止；要跑更久：用 setsid + 重定向完全脱离进程组，或调大配置 tools.timeout_sec）", timeoutSec)
+		head += fmt.Sprintf("（超过 %d 秒上限被强制终止；要跑更久：systemd-run --user 或 setsid 完全脱离进程组，或调大配置 tools.timeout_sec）", timeoutSec)
 	}
 	out := stdout.String()
 	errOut := stderr.String()
