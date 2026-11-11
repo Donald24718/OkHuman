@@ -89,52 +89,28 @@ KV 缓存代价，也不多发一次 LLM 调用。
 
 ---
 
-## 4. 轮末校验（`end_check`）：收笔前再问一次
+## 4. 空闲心跳（`heartbeat`）：agent 空着时自己开一轮
 
-**触发条件**：模型输出结束且**没有 tool_calls** —— 这被视为本轮的停止信号。
+**触发判定**（`heartbeatDue`，纯函数可测）：开关关、或正在 run → 不触发；否则以**最后一次 run
+结束**为起点计时，超过 `heartbeat.interval_min`（默认 30 分钟）即触发。巡检每 30 秒一次
+（`heartbeatTickMS`）；run 期间不计时，任何 run 结束都把计时归零。
 
-**动作**：存下 assistant 消息 → 发 `end_check` 事件 → 注入一条 user 校验提示 →
-再发一次 LLM 调用。
+**动作**：把 `heartbeat.prompt` 作为一条 **user 消息**入队（走 `/enqueue`），开启一轮 run。默认
+`heartbeat.enabled = false`；`heartbeat` 属热加载段（`hotSections`），改完下一个巡检 tick 生效。
+`/status` 带心跳可观测字段（开关、阈值、上次 run 结束时刻、是否到点）。
 
-**两个分支**：
+**措辞就是判据**：出厂默认提示词先写明「这是系统主动开启、不是用户发的消息，不构成新任务
+授权」，再给自查清单（挂起的后台任务有无结果、接下的活是否收尾、有无该推进的下一步），并
+要求「没有就一句话说明状态然后停下」。缺前半句，模型会把心跳当成用户的新指令去执行。
 
-- 模型仍无 tool_calls → 确认真的做完了，正式收笔。**本轮回复取校验前的正文**
-  （真实答案），不是校验应答。
-- 模型发出 tool_calls → 说明有未完成事项，马上继续工具循环。
+## 5. 收笔：无 tool_calls 即结束本轮
 
-**防乒乓**：每次停止至多校验一次；校验后仍停就直接收笔，不再追问。
-**可关**：`agent.end_check = false` → 无工具调用即收笔（旧行为）。
+模型输出结束且没有 tool_calls → 正式收笔，不追问。
 
-**措辞就是判据**（这条是踩坑换来的）。旧文案问"目前有没有还未完成的事情"，
-模型会把它读成"整个任务做完了没有"——只要还有东西没跑完，答案永远是"有"，
-于是每次收笔都被推回去。现文案问的是：
-
-> 此刻有没有**必须你现在就做的**动作？有 → 发出工具调用；没有 → 不再调用工具，一句话收笔。
-
-差别在"此刻"和"必须你现在就做"：等待外部结果不算"有"。
-
----
-
-## 5. 闸门：有在飞后台任务时，连问都不问
-
-光靠措辞不够——模型仍可能误判。所以机制层直接拦：
-
-```go
-n := 0
-if opt.UnsettledBackground != nil { n = opt.UnsettledBackground() }   // = BG().Unsettled()
-if opt.EndCheck && n > 0 {
-    emit({"type":"end_check_skipped", "detail": "有 N 个后台任务未 settle → 不追问，直接收笔"})
-    return a.finishText(resp, emit, totals)
-}
-```
-
-**为什么值得专门加**：实测一次 5 GiB 模型下载期间，模型被追问十余次，
-每一次都是一次完整的 LLM 推理——而下载这件事一次都不需要模型。追问不产生价值，
-只烧算力，还占着推理服务的排队位置。
-
-**已知局限（重要）**：闸门只统计**经编排器注册**的转后台任务。模型自己用 `setsid`
-完全脱离启动的进程（比如起一个常驻服务）不在任务表里，`Unsettled()` 看不见它们。
-这类场景仍会追问一次——此时靠 §4 的措辞兜底。
+**历史（读旧文档时会撞上）**：此前有一层「轮末校验」（`agent.end_check`：收笔前注入校验提示
+再问一次）和一层「后台任务闸门」（有未 settle 的后台任务就不追问）。实测一次 5 GiB 模型下载
+期间被追问十余次，每次都是一次完整推理，而下载这件事一次都不需要模型。**2026-10-17 起这两层
+整体移除**，改为上面的空闲心跳；`agent.end_check` 不再是任何代码路径的输入。
 
 ---
 
@@ -145,7 +121,6 @@ if opt.EndCheck && n > 0 {
 | `tools.fg_timeout_sec` | 30 | 前台等待上限（秒），超时转后台 |
 | `tools.timeout_sec` | 600 | 命令总时长硬上限（秒），到点杀进程组 |
 | `tools.result_limit` | 50000 | 回填给模型的字符上限，超出截断+落盘 |
-| `agent.end_check` | true | 轮末校验开关（热加载，下轮运行生效）|
 | `doom.warn_after` | 3 | 连续 N 次完全相同调用 → 注入警告，警告后仍重复 → 强停 |
 | `heartbeat.enabled` | false | 空闲到点自动开启一轮 run（类型必须是布尔，否则 `POST /config` 直接 400）|
 | `heartbeat.interval_min` | 30 | 空闲多少分钟后触发；run 期间不计时，run 结束才重置计时 |
@@ -166,7 +141,7 @@ if opt.EndCheck && n > 0 {
 
 **事件流**（`GET /events`，WebUI 据此渲染卡片）：
 `tool_call` → `tool_result`（可能带 `backgrounded`）→ `bg_start` → `user_piggyback` →
-`end_check` / `end_check_skipped` → `doom_warn` / `doom_stop` → `done`
+`doom_warn` / `doom_stop` → `done`（心跳到点则多一条 `user` 入队，走同一套事件流）
 
 **查在飞任务**：`GET /backgrounds` → `{"count":N,"running":bool,"tasks":[{call_id,tool,started_at,settled,ok,duration_ms,result_chars}]}`
 
@@ -177,14 +152,11 @@ if opt.EndCheck && n > 0 {
 ```
 assistant  tool_calls: bash(sleep 200)
 tool       （系统：此调用前台等待超过 30 秒…已自动转入后台…）      ← 不阻塞，模型可继续干别的
-assistant  （无 tool_calls，收笔）
-           → 闸门查 Unsettled()=1 → end_check_skipped → 本轮结束，不追问
+assistant  （无 tool_calls）→ 正式收笔（无追问，2026-10-17 起）
 … 命令跑完 …
 user       （系统通知：后台任务完成——…现已成功（耗时 200.3s）…）   ← 路 B，触发新一轮
 assistant  基于结果继续干活
-assistant  （无 tool_calls，收笔）
-           → 闸门查 Unsettled()=0 → end_check → 注入校验提示
-assistant  （仍无 tool_calls）→ 正式收笔，回复取校验前正文
+assistant  （无 tool_calls）→ 正式收笔
 ```
 
 设计取向一句话：**模型不该等 I/O，但也不该被追问去替 I/O 操心。**

@@ -16,7 +16,7 @@
 
 - **上下文压缩 + 摘要滑动窗口**：总 token 超预算时把最旧一批压成**一条新总结**（已有总结不重写）；按 `keep_summaries`（默认 5）滑动保留，超出丢最旧一条、不合并；单条正文按 `summary_max_chars`（默认 30000 字符，思考不计）**硬截断**并在上下文里明确告知模型；每条总结自带 seq 区间与原文路径。
 - **前台超时自动转后台**：工具调用与 30s 前台超时赛跑（`tools.fg_timeout_ms`），超时不取消、转后台继续执行，立即回填"已转后台"通知（tool_calls 与 tool 消息严格配对）；`BackgroundOrchestrator` 持任务表（call_id → settled/ok/耗时/结果副本），goroutine 阻塞在结果通道上，出结果即标记 settled 并把通知 push 进消息队列。通知走两条路：本轮未结束 → 下次 LLM 调用前搭车注入（纯追加，不加 LLM 调用、不动已缓存前缀 → 无额外 KV 代价；后台通知以"（系统通知：后台任务完成"开头，不加【用户追加】前缀，与用户追加同队列不同标记）；本轮已收笔 → 留在队列，下次运行触发。命令总时长另有 `tools.timeout_ms` 硬兜底（到点杀整个进程组）——转后台不是无限放任。
-- **轮末校验（end_check）+ 后台任务闸门**：模型输出结束且无 tool_calls（=本轮停止信号）→ 注入校验提示再问一次 → 仍无工具调用才正式收笔（**本轮回复取校验前正文**，不是校验应答），有工具调用则继续干活。每次停止至多校验一次（防追问乒乓），`agent.end_check=false` 全关回到旧行为。措辞即判据（踩坑换来）：旧文案问"有没有还未完成的事情"，模型读成"任务没全完=有"，于是等待期间每次收笔都被推回去；现文案问"此刻有没有必须你现在就做的动作"，把"等待外部结果"明确排除在"有"之外。机制层再加闸门：收笔前查 `Unsettled()`（未 settle 的后台任务数）>0 → 发 `end_check_skipped` 事件直接收笔，连追问都省掉。实测一次 5 GiB 模型下载期间被追问十余次，每次 = 一次完整 LLM 推理，而下载一次都不需要模型。局限：闸门只覆盖经编排器注册的任务，模型自己 `setsid` 完全脱离起的进程不在表内，此类场景靠措辞兜底。
+- **空闲心跳（heartbeat）**：空闲到点（默认 30 分钟，run 期间不计时）由系统把提示词作为 user 消息入队，主动开启一轮自查；默认关、热加载、`/status` 可观测。
 - **死循环检测（doom）**：连续 3 次完全相同（工具名+参数逐字段比较）的调用 → 注入警告；警告后仍重复 → 强停本轮。
 - **提示词分层 + 热加载**：通用层（prompts/*.md）拼接为系统提示词，POST /prompts/reload 热加载；专用层（部署拓扑 / 插件规范 / 各插件 README）不进系统提示词，agent 按需 cat。
 - **彻底解耦契约**：主程序对插件无感知——不加载、不扫描、不启动；插件不 import 主程序任何模块、不共享进程/内存，只走公开 HTTP 接口（/chat、/enqueue、/events SSE、/history……）；配置自管（插件目录内 config.json）、数据自管（插件/data/）、独立可跑（独立 Go 模块 + 独立 git 仓）。插件挂了不影响 OkHuman，OkHuman 重启不影响插件。
@@ -28,7 +28,7 @@
 
 两个区域（`plugins/RULE.md` 为唯一权威）：
 
-1. **plugins/** —— 插件目录，扁平排列：attach_look / browser / computer / cron / okmon / qq-channel / scout / voice-chat
+1. **plugins/** —— 插件目录，扁平排列：view_image / gpu-window / browser / computer / cron / okmon / qq-channel / scout / voice-chat
 2. **plugins/skills/** —— 技能库，日期层级 year_/month_/day_：skill = SKILL.md（本机**实测验证过**的操作经验，照它执行）+ 可选 scripts/references；账号令牌不进技能目录
 
 每个插件是一个**自包含小系统**：
