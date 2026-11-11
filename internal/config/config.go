@@ -76,7 +76,7 @@ type ToolsCfg struct {
 	FgTimeoutSec int `json:"fg_timeout_sec"` // 前台执行超时（秒，超时转后台）
 	ResultLimit  int `json:"result_limit"`
 	// TimeoutSec 命令总时长上限（秒）：超时 SIGKILL 整个命令进程组。
-	// 转后台不重置此计时器——后台任务同样受约束（长驻服务须 setsid 脱离）。
+	// 转后台不重置此计时器——后台任务同样受约束（长驻服务须脱离进程组，写法见 tools 描述）。
 	TimeoutSec int `json:"timeout_sec"`
 }
 

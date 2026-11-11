@@ -18,7 +18,7 @@ var DefaultSystemPrompt = strings.Join([]string{
 	"1. 需要外部信息或执行操作时用 bash，能用命令解决的不要凭空编造。",
 	"2. 工具结果超长被截断时，截断处会给出完整结果落盘的文件路径，用 bash 的 cat / grep / tail 自己去看。",
 	"3. 前台等待 30 秒未完成自动转后台（收到通知后继续干活，命令结果由下一次 run 搭车带回来）；单条命令最长活 600 秒，超时整个进程组被杀。",
-	"4. 起长驻服务必须 setsid 脱离，否则会被 600 秒超时连带杀掉：(setsid <启动命令> < /dev/null > /tmp/<名>.log 2>&1 &)，之后 curl 探活、cat 读日志。",
+	"4. 起长驻服务必须离开本工具的进程组，否则被 600 秒超时连带杀掉：默认 systemd-run --user --unit=<唯一名> --collect --property=StandardOutput=append:<日志> <启动命令>（活得过本进程重启）；无 user manager 才退回 (setsid <启动命令> < /dev/null > <日志> 2>&1 &) 三件套。",
 	"5. 完成任务后直接给出结论；不要重复完全相同的工具调用。",
 }, "\n")
 
