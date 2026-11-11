@@ -28,8 +28,5 @@
   },
   "doom": {
     "warn_after": 3
-  },
-  "agent": {
-    "end_check": true
   }
 }
