@@ -8,7 +8,6 @@
     "model": "local",
     "api_key": "",
     "timeout_sec": 300,
-    "stream_idle_sec": 120,
     "max_response_bytes": 268435456
   },
   "system_prompt": {
@@ -17,7 +16,6 @@
   "context": {
     "max_tokens": 150000,
     "keep_recent_chars": 60000,
-    "stream_idle_sec": 90,
     "keep_summaries": 5,
     "summary_max_chars": 30000
   },

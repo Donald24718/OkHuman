@@ -5,6 +5,7 @@
 #   真正根因 = 别的最大化窗口（Thunar）盖住点击点 + xfwm4 windowactivate 置顶延迟，
 #   详见 LESSONS.md。本脚本降级为备而不用（用户客户端真在动鼠标时可临时用）。
 # 用法: nxguard.sh <命令...>
+# 需要 sudo 才能问 /usr/NX/bin/nxserver：口令走 env NX_SUDO_PASSWORD（公开版不内置）。未设时 sudo 失败会被当作「无已连接会话」直接执行，不报错。
 # 例:   nxguard.sh "plugins/computer/xusectl" click 48 29  # 本机无 /usr/NX → 只会走「无会话，直接执行」分支
 set -u
 PW=${NX_SUDO_PASSWORD:-}
