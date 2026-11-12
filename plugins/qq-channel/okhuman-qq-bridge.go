@@ -541,6 +541,7 @@ type QQChannel struct {
 	heartbeatStop  chan struct{}
 	reconnectTimer *time.Timer
 	stopped        bool
+	inboxDir       string // 入站附件落盘目录（按实例分，见 inboxDirFor）
 	abnormalRecon  int
 	sendFailStreak int
 
@@ -558,6 +559,7 @@ func NewQQChannel(shared SharedCfg, bot BotCfg, dataDir string,
 		queueLim:      &WindowLimiter{limit: shared.MaxQueuePerMin},
 		agentLim:      &WindowLimiter{limit: bot.MaxMsgsPerMin},
 		tokenFile:     filepath.Join(dataDir, "channels", "qq", "tokens", bot.AppID+".json"),
+		inboxDir:      inboxDirFor(bot),
 		onStream:      onStream,
 		onMessage:     onMessage,
 		onAttachments: onAttachments,
@@ -1109,7 +1111,7 @@ func (c *QQChannel) handleC2CMessage(m *qqMsg) {
 		}
 		if len(lines) > 0 {
 			if err := c.onAttachments(strings.Join(lines, "\n")); err != nil {
-				c.logf("附件通知 /inject 失败（文件已落 /tmp/qq-inbox）：" + err.Error())
+				c.logf("附件通知 /inject 失败（文件已落 " + c.inboxDir + "）：" + err.Error())
 			}
 		}
 	}
@@ -1332,7 +1334,7 @@ func qqFileTypeByExt(name string) int {
 	return 4
 }
 
-// 2026-09-15 方向A：下载 QQ 附件 → /tmp/qq-inbox/<ts36>-<安全名>（30s 超时；失败返回 false + 日志，不打断主流程）
+// 2026-09-15 方向A：下载 QQ 附件 → 收件口/<ts36>-<安全名>（30s 超时；失败返回 false + 日志，不阻断消息）
 var unsafeNameRe = regexp.MustCompile(`[^0-9A-Za-z._\-一-龥]`)
 
 type qqLandedFile struct {
@@ -1340,6 +1342,49 @@ type qqLandedFile struct {
 	name     string
 	fileType string
 	size     int
+}
+
+// inboxDirFor：入站附件按实例分一口（2026-11-12）。原来硬写 /tmp/qq-inbox，两个实例共用同一个收件口——
+// 谁的附件都能落进同一目录，通知里的路径就可能指到另一个实例收的东西。分开只要加一层子目录，
+// 仍留在 /tmp：重启自动清、不占数据目录，目录由下面的 MkdirAll 动态建。
+// 谁的附件都能落进同一目录，通知里的路径就可能指到另一个实例收的东西；/tmp 还会在重启后凭空清掉，
+// 那句“已保存到 …”就指向空。收件口改成和 outbox 同一根：data/channels/qq/inbox/<实例 id>。
+func inboxDirFor(bot BotCfg) string {
+	id := strings.TrimSpace(bot.Instance)
+	if id == "" {
+		id = strings.TrimSpace(bot.AppID) // 没写实例就用 app_id：照样一口一实例
+	}
+	id = unsafeNameRe.ReplaceAllString(id, "_")
+	if id == "" || id == "." || id == ".." { // 消毒后剩下纯点会把大家合回同一口
+		id = "default"
+	}
+	return filepath.Join("/tmp/qq-inbox", id)
+}
+
+// inboxKeep：/tmp 只在重启时清；机器长期不重启时靠这个上限防收件口无限长（tmpfs 也占内存）。
+const inboxKeep = 7 * 24 * time.Hour
+
+func (c *QQChannel) pruneInbox(dir string) {
+	fs, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	now, n := time.Now(), 0
+	for _, f := range fs {
+		if f.IsDir() {
+			continue
+		}
+		st, err := f.Info()
+		if err != nil || now.Sub(st.ModTime()) <= inboxKeep {
+			continue
+		}
+		if os.Remove(filepath.Join(dir, f.Name())) == nil {
+			n++
+		}
+	}
+	if n > 0 {
+		c.logf(fmt.Sprintf("收件口清掉 %d 个超过 7 天的旧附件", n))
+	}
 }
 
 func (c *QQChannel) downloadAttachment(a *qqAttachment) (qqLandedFile, bool) {
@@ -1354,7 +1399,7 @@ func (c *QQChannel) downloadAttachment(a *qqAttachment) (qqLandedFile, bool) {
 			safe = "qqfile"
 		}
 	}
-	dir := "/tmp/qq-inbox"
+	dir := c.inboxDir
 	path := filepath.Join(dir, ts36(time.Now().UnixMilli())+"-"+safe)
 	name := safe
 	if a.Filename != nil && *a.Filename != "" {
@@ -1392,6 +1437,7 @@ func (c *QQChannel) downloadAttachment(a *qqAttachment) (qqLandedFile, bool) {
 	} else if i := strings.LastIndex(safe, "."); i >= 0 && len(safe)-i-1 <= 8 {
 		fileType = strings.ToLower(safe[i+1:])
 	}
+	c.pruneInbox(dir)
 	c.logf(fmt.Sprintf("附件已落：%s（%d 字节，原文件名 %s）", path, len(buf), name))
 	return qqLandedFile{path: path, name: name, fileType: fileType, size: len(buf)}, true
 }
@@ -2223,12 +2269,185 @@ func newGenToken() string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
+// ---------- attach：把文件投进「我自己的」outbox（2026-11-11）----------
+//
+// 用法：okhuman-qq-bridge attach <文件> [--bot <app_id>] [--to <实例id>] [--dry-run]
+//
+// 为什么要有它：outbox 按 botAppID 分目录，而 app_id ↔ 实例 的映射本来就写在桥的 config 里。
+// 以前 agent 要自己把 app_id 抄进路径（README 里甚至硬写过 app_id）——抄错 = 把图发进别人的
+// 会话，而消息发出去收不回。这里按实例声明认人：OKHUMAN_SELF_URL（主程序
+// internal/tools.SetSelfID 注入，与 agent-wire / view_image 同一个身份来源）→ 匹配
+// instances[].url → 取 bots[].instance 等于我的那条。优先级：--bot/--to 显式 > 声明；
+// 认不出不猜（报错退出，不落文件）。
+// 落盘走「先写 outbox/.staging/ 再 rename 进 bot 目录」：watcher 每 2s 只扫 bot 目录，
+// 直接 cp 大文件可能被半截拾取（rename 在同一文件系统内是原子的）。
+func qqNorm(s string) string { return strings.TrimRight(strings.TrimSpace(s), "/") }
+
+func botIDs(bs []BotCfg) string {
+	out := []string{}
+	for _, b := range bs {
+		out = append(out, fmt.Sprintf("%s(渠道 %s)", b.AppID, b.ChannelID))
+	}
+	return strings.Join(out, "、")
+}
+
+func cmdAttach(cfg *BridgeConfig, args []string) int {
+	var file, botWant, instWant string
+	dry := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--bot" || a == "--to" {
+			if i+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "%s 需要参数\n", a)
+				return 2
+			}
+			if a == "--bot" {
+				botWant = args[i+1]
+			} else {
+				instWant = args[i+1]
+			}
+			i++
+			continue
+		}
+		if a == "--dry-run" {
+			dry = true
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			fmt.Fprintf(os.Stderr, "未知参数：%s\n用法：okhuman-qq-bridge attach <文件> [--bot <app_id>] [--to <实例id>] [--dry-run]\n", a)
+			return 2
+		}
+		if file != "" {
+			fmt.Fprintln(os.Stderr, "只接受一个文件参数")
+			return 2
+		}
+		file = a
+	}
+	if file == "" {
+		fmt.Fprintln(os.Stderr, "用法：okhuman-qq-bridge attach <文件> [--bot <app_id>] [--to <实例id>] [--dry-run]")
+		return 2
+	}
+	if !cfg.Shared.Enabled {
+		fmt.Fprintln(os.Stderr, "config 里 shared.enabled=false：没有桥在跑，投了也没人发")
+		return 2
+	}
+	// 我是哪个实例
+	if instWant == "" {
+		self := qqNorm(os.Getenv("OKHUMAN_SELF_URL"))
+		if self == "" {
+			fmt.Fprintln(os.Stderr, "认不出我自己：没有 OKHUMAN_SELF_URL，也没有 --to/--bot —— 不猜（猜错就发进别人的会话，收不回）")
+			return 2
+		}
+		for _, in := range cfg.Instances {
+			if qqNorm(in.URL) == self {
+				instWant = in.ID
+				break
+			}
+		}
+		if instWant == "" {
+			fmt.Fprintf(os.Stderr, "OKHUMAN_SELF_URL=%s 不在 config.instances 里。已配的实例：", self)
+			for _, in := range cfg.Instances {
+				fmt.Fprintf(os.Stderr, " %s=%s", in.ID, in.URL)
+			}
+			fmt.Fprintln(os.Stderr)
+			return 2
+		}
+	}
+	// 我的 bot
+	byInst := []BotCfg{}
+	for _, b := range cfg.Bots {
+		if b.Instance == instWant {
+			byInst = append(byInst, b)
+		}
+	}
+	chosen := ""
+	if botWant != "" {
+		found := false
+		for _, b := range cfg.Bots {
+			if b.AppID == botWant {
+				found = true
+				if b.Instance != instWant {
+					fmt.Fprintf(os.Stderr, "bot %s 绑的是实例 %s，不是 %s——要发给它请用 --to %s，或去掉 --bot 用我自己的实例\n", botWant, b.Instance, instWant, b.Instance)
+					return 2
+				}
+			}
+		}
+		if !found {
+			fmt.Fprintf(os.Stderr, "config.bots 里没有 bot %s。实例 %s 的 bot：%s\n", botWant, instWant, botIDs(byInst))
+			return 2
+		}
+		chosen = botWant
+	} else if len(byInst) == 0 {
+		fmt.Fprintf(os.Stderr, "实例 %s 没配 bot（config.bots[].instance 加一条才能投递）\n", instWant)
+		return 2
+	} else if len(byInst) > 1 {
+		fmt.Fprintf(os.Stderr, "实例 %s 配了 %d 个 bot，必须用 --bot 指定一个：%s\n", instWant, len(byInst), botIDs(byInst))
+		return 2
+	} else {
+		chosen = byInst[0].AppID
+	}
+	ch := BotCfg{}
+	for _, b := range cfg.Bots {
+		if b.AppID == chosen {
+			ch = b
+		}
+	}
+	st, err := os.Stat(file)
+	if err != nil || !st.Mode().IsRegular() {
+		fmt.Fprintf(os.Stderr, "文件读不到：%s\n", file)
+		return 1
+	}
+	outRoot := filepath.Join(cfg.Shared.DataDir, "channels", "qq", "outbox")
+	dir := filepath.Join(outRoot, chosen)
+	base := filepath.Base(file)
+	if dry {
+		fmt.Printf("（dry-run）将投递：%s（%d 字节）→ bot %s（实例 %s，渠道 %s）→ 目录 %s\n", file, st.Size(), chosen, ch.Instance, ch.ChannelID, dir)
+		return 0
+	}
+	tmpDir := filepath.Join(outRoot, ".staging")
+	if err := os.MkdirAll(tmpDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "建暂存目录失败：%v\n", err)
+		return 1
+	}
+	data, err := os.ReadFile(file)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "读文件失败：%v\n", err)
+		return 1
+	}
+	tmp := filepath.Join(tmpDir, fmt.Sprintf("%s.%d", base, time.Now().UnixNano()))
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "写暂存失败：%v\n", err)
+		return 1
+	}
+	dest := filepath.Join(dir, base)
+	if _, err := os.Stat(dest); err == nil { // 同名不覆盖：加后缀，免得把还没发的顶掉
+		dest = filepath.Join(dir, fmt.Sprintf("%s.%d%s", base[:len(base)-len(filepath.Ext(base))], time.Now().Unix(), filepath.Ext(base)))
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		os.Remove(tmp)
+		fmt.Fprintf(os.Stderr, "建 outbox 目录失败：%v\n", err)
+		return 1
+	}
+	if err := os.Rename(tmp, dest); err != nil {
+		os.Remove(tmp)
+		fmt.Fprintf(os.Stderr, "投递失败（未进 outbox）：%v\n", err)
+		return 1
+	}
+	fmt.Printf("已投递：%s（%d 字节）→ bot %s（实例 %s，渠道 %s）→ %s。发送由运行中的桥完成（2s 轮询）；成功归档 sent/，失败留原位下轮重试。\n",
+		file, st.Size(), chosen, ch.Instance, ch.ChannelID, dest)
+	return 0
+}
+
 func main() {
 	root := pluginRoot()
 	cfg, err := loadConfig(root)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
+	}
+	// 子命令：attach = 把文件投进「我自己的」outbox（不起服务也能用，见 cmdAttach）
+	if len(os.Args) > 1 && os.Args[1] == "attach" {
+		os.Exit(cmdAttach(cfg, os.Args[2:]))
 	}
 	if !cfg.Shared.Enabled {
 		fmt.Println("[qq-bridge] shared.enabled=false，桥不启动（配置 enabled 为 true 启用）")
@@ -2387,7 +2606,7 @@ func main() {
 			}
 		}(ch, dir, ch.botID)
 	}
-	logf(fmt.Sprintf("outbox 就绪：cp <文件> %s/<botAppID>/ = 一次手动媒体投递（成功归档 sent/）", outboxRoot))
+	logf(fmt.Sprintf("outbox 就绪：cp <文件> %s/<botAppID>/ = 一次手动媒体投递（成功归档 sent/）；入站收件口按实例分：/tmp/qq-inbox/<实例 id>（自动清 7 天前的）", outboxRoot))
 
 	// 常驻：QQChannel 内部自重连/重认证；SIGINT 优雅收尾
 	sigCh := make(chan os.Signal, 2)
