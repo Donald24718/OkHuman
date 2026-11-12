@@ -38,7 +38,7 @@ GOPROXY=off GOSUMDB=off go build -o okhuman-lan-bridge .
 | `listen.port` | 默认 `8602` |
 | `token` | **留空则首次启动自动生成 32 位十六进制（128 bit）并写回本文件**；日志里**不**打印 token |
 | `instances[]` | `{id,url}` 列表，url 必须是 localhost（桥不转发任意上游） |
-| `default_instance` | 没有实例 cookie 时用哪个 |
+| `default_instance` | 只用于两种回落：单上游的桥、人的落地页（多上游的机器请求未点名一律 400） |
 | `allow_config_write` | 默认 `false`：手机上不能 `POST /config` 改实例配置 |
 
 改 token = 手机上的 cookie 立刻失效，要重新登录。
@@ -63,8 +63,8 @@ GOPROXY=off GOSUMDB=off go build -o okhuman-lan-bridge .
 
 ## 切实例
 
-`/pick` 列出配置里的实例，点一下设 `okh_inst` cookie 并回首页。认不出的 cookie 退回
-`default_instance`，不报错。
+`/pick` 列出配置里的实例，点一下设 `okh_inst` cookie 并回首页。**挂多个上游时点名必填**：未点名或 id 认不出 → 400（静默落默认的后果是"回信来自另一个 agent"，看不见）。
+例外只有两种：桥只挂一个上游（没得选）；`/` 与静态资源——人先落到 `default_instance` 的页，同时把这次选择钉进 cookie，要换实例走 `/pick`。
 
 ## Origin 改写（手机上发消息的关键）
 
@@ -112,5 +112,5 @@ GOPROXY=off GOSUMDB=off go build -o okhuman-lan-bridge .
 
 `go test ./...`：鉴权（未登录 302 且不碰上游 / 错 token 401 不发 cookie / Bearer 可用）、
 白名单（未知路径 403、方法不符不放行、`POST /config` 默认 403、开关打开才放行）、
-实例切换（cookie 切上游、认不出退回默认）、**SSE 逐块 flush**（第一帧必须在上游第二帧之前就到达）、
+实例切换（点名切上游；未点名/认不出 400；单上游不需要点名）、**SSE 逐块 flush**（第一帧必须在上游第二帧之前就到达）、
 上游不可达 502、`/healthz` 免鉴权、token 自动生成 + 落盘 600 + 重启不换。

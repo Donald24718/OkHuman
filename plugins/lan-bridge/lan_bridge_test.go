@@ -97,14 +97,22 @@ func TestLoginThenProxy(t *testing.T) {
 	defer ts.Close()
 
 	c := authedClient(t, ts)
-	r, err := c.Get(ts.URL + "/history")
+	// 多上游时人也要先"落地"：GET / 给默认实例并把选择钉进 cookie，之后页面的数据请求才通
+	r, err := c.Get(ts.URL + "/")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Body.Close()
-	got := readAll(r)
-	if got != "A:/history" {
-		t.Fatalf("应转发到默认实例 A，实得 %q", got)
+	if got := readAll(r); got != "A:/" {
+		t.Fatalf("落地页应给默认实例 A，实得 %q (code %d)", got, r.StatusCode)
+	}
+	r.Body.Close()
+	r2, err := c.Get(ts.URL + "/history")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r2.Body.Close()
+	if got := readAll(r2); got != "A:/history" {
+		t.Fatalf("落地后应转发到默认实例 A，实得 %q (code %d)", got, r2.StatusCode)
 	}
 }
 
@@ -139,6 +147,7 @@ func TestBearerHeaderAuth(t *testing.T) {
 
 	req, _ := http.NewRequest("GET", ts.URL+"/status", nil)
 	req.Header.Set("Authorization", "Bearer "+testToken)
+	req.AddCookie(&http.Cookie{Name: instCookie, Value: "A"}) // 多上游必须点名；这条测的是鉴权
 	r, err := ts.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -197,6 +206,12 @@ func TestWebuiEndpointsAllWhitelisted(t *testing.T) {
 	ts := newTestBridge(t, a, b, false)
 	defer ts.Close()
 	c := authedClient(t, ts)
+	// 真实浏览器顺序：登录 → /pick 点一次实例（之后 cookie 带着走）→ 各页面端点
+	if r, err := c.Get(ts.URL + "/pick?inst=A"); err != nil {
+		t.Fatal(err)
+	} else {
+		r.Body.Close()
+	}
 	gets := []string{"/", "/marked.min.js", "/sanitize.js", "/health", "/status", "/queue",
 		"/history", "/config", "/prompts", "/prompts/file", "/attachments", "/events/poll"}
 	posts := []string{"/enqueue", "/stop", "/reset", "/compress", "/strip-injects", "/inject",
@@ -210,6 +225,9 @@ func TestWebuiEndpointsAllWhitelisted(t *testing.T) {
 		r.Body.Close()
 		if code == http.StatusForbidden {
 			t.Fatalf("webui 会用 GET %s，不该被白名单挡", p)
+		}
+		if code == http.StatusBadRequest {
+			t.Fatalf("GET %s 被要求点名实例（400）：页面选过一次之后不该再遇到，说明浏览器流程断了", p)
 		}
 	}
 	for _, p := range posts {
@@ -232,6 +250,7 @@ func TestAllowConfigWriteOptIn(t *testing.T) {
 	ts := newTestBridge(t, a, b, true)
 	defer ts.Close()
 	c := authedClient(t, ts)
+	c.Jar.SetCookies(mustURL(t, ts.URL), []*http.Cookie{{Name: instCookie, Value: "A"}}) // 多上游：点名要改谁
 
 	r, err := c.Post(ts.URL+"/config", "application/json", strings.NewReader(`{"patch":{}}`))
 	if err != nil {
@@ -268,7 +287,8 @@ func TestInstanceCookieSwitchesUpstream(t *testing.T) {
 	}
 }
 
-func TestUnknownInstCookieFallsBackToDefault(t *testing.T) {
+// 认不出的 inst：2026-11-11 起不再静默退回默认（错的形态是"回信来自另一个 agent"，看不见），改为 400。
+func TestUnknownInstCookieIsRejected(t *testing.T) {
 	a, b := fakeInst("A"), fakeInst("B")
 	defer a.Close()
 	defer b.Close()
@@ -282,8 +302,8 @@ func TestUnknownInstCookieFallsBackToDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Body.Close()
-	if got := readAll(r); got != "A:/history" {
-		t.Fatalf("认不出的实例 cookie 应退回默认 A，实得 %q", got)
+	if r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("认不出的实例 cookie 应 400（不静默落默认），实得 %q (code %d)", readAll(r), r.StatusCode)
 	}
 }
 
@@ -447,6 +467,61 @@ func TestOriginRewrittenToUpstream(t *testing.T) {
 	if gotOrigin != "" {
 		t.Fatalf("客户端没发 Origin 时不该伪造，实得 %q", gotOrigin)
 	}
+}
+
+// 多上游桥：没点名的机器请求必须响（400），点错也响，点名才转给那一个。
+// 这条是为了堵掉"消息发出去、回信来自另一个 agent"这种看不见的错。
+func TestMultiUpstreamRequiresExplicitInstance(t *testing.T) {
+	a, b := fakeInst("A"), fakeInst("B")
+	defer a.Close()
+	defer b.Close()
+	ts := newTestBridge(t, a, b, false)
+	defer ts.Close()
+	c := authedClient(t, ts)
+
+	for _, p := range []string{"/status", "/history", "/queue"} {
+		r, err := c.Get(ts.URL + p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		code := r.StatusCode
+		r.Body.Close()
+		if code != http.StatusBadRequest {
+			t.Fatalf("%s 未点名实例应 400，实得 %d", p, code)
+		}
+	}
+
+	req, _ := http.NewRequest("GET", ts.URL+"/status", nil)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	req.AddCookie(&http.Cookie{Name: instCookie, Value: "B"})
+	r, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readAll(r); got != "B:/status" {
+		t.Fatalf("点名 B 应打到 B，实得 %q", got)
+	}
+	r.Body.Close()
+
+}
+
+// 只挂一个上游时不必点名（没得可选），照旧转过去。
+func TestSingleUpstreamNeedsNoCookie(t *testing.T) {
+	up := fakeInst("U")
+	defer up.Close()
+	cfg := &Cfg{Token: testToken, Instances: []Instance{{ID: "U", URL: up.URL}}}
+	ts := httptest.NewServer(newBridge(cfg))
+	defer ts.Close()
+	req, _ := http.NewRequest("GET", ts.URL+"/status", nil)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	r, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readAll(r); got != "U:/status" {
+		t.Fatalf("单上游不该要求点名，实得 %q (code %d)", got, r.StatusCode)
+	}
+	r.Body.Close()
 }
 
 func readAll(r *http.Response) string {

@@ -156,6 +156,18 @@ func newBridge(cfg *Cfg) *bridge {
 	}
 }
 
+// 页面壳与静态资源：人可以先落到默认实例再点 /pick 选；机器请求不适用。
+var uiShell = map[string]bool{"/": true, "/favicon.ico": true, "/marked.min.js": true, "/sanitize.js": true}
+
+// explicitInst 只认显式点名：okh_inst cookie 且 id 认得才返回，否则 nil（不猜）。
+func (b *bridge) explicitInst(r *http.Request) *Instance {
+	c, err := r.Cookie(instCookie)
+	if err != nil {
+		return nil
+	}
+	return b.findInst(c.Value)
+}
+
 func (b *bridge) findInst(id string) *Instance {
 	for i := range b.cfg.Instances {
 		if b.cfg.Instances[i].ID == id {
@@ -165,7 +177,8 @@ func (b *bridge) findInst(id string) *Instance {
 	return nil
 }
 
-// pickInst 选上游：cookie 指定 → 配置默认 → 第一个。认不出的 cookie 退回默认，不报错。
+// pickInst 只用于两处回落：/pick 页面高亮"当前是哪个"，以及单上游桥（没得可选）。
+// 机器发起的请求一律走 explicitInst —— 多上游时不再静默兜默认（见 ServeHTTP）。
 func (b *bridge) pickInst(r *http.Request) *Instance {
 	if c, err := r.Cookie(instCookie); err == nil {
 		if in := b.findInst(c.Value); in != nil {
@@ -379,7 +392,26 @@ func (b *bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "方法不允许", http.StatusForbidden)
 		return
 	}
-	b.proxy(w, r, b.pickInst(r))
+	in := b.explicitInst(r)
+	if in == nil {
+		// 桥挂着多个上游时，点名必填：漏写或写错都会静默打到默认实例，而错的形态是
+		// "回信来自另一个 agent"——不报错、看不见，所以这里必须响。
+		// 只留两种回落：① 桥只挂一个上游（没得选）；② 页面壳——人先落地看默认那个，
+		// 同时把这次选择钉进 cookie，页面自己的 /status、/events 才接得上（要换实例走 /pick）。
+		if len(b.cfg.Instances) > 1 {
+			if !uiShell[p] {
+				log.Printf("拒绝（多实例桥未点名实例）%s %s", r.Method, p)
+				http.Error(w, "多实例桥：请求要带 okh_inst cookie（agent 在 config 里写 inst；浏览器先走 /pick 选一次）", http.StatusBadRequest)
+				return
+			}
+			in = b.pickInst(r)
+			http.SetCookie(w, &http.Cookie{Name: instCookie, Value: in.ID, Path: "/",
+				HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 365 * 24 * 3600})
+		} else {
+			in = b.pickInst(r)
+		}
+	}
+	b.proxy(w, r, in)
 }
 
 func main() {

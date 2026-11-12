@@ -1,4 +1,1 @@
-{
-  "summary": "局域网桥插件（:8602）：手机浏览器访问 OkHuman WebUI 的唯一对外入口——主程序只监听 127.0.0.1 且零鉴权，本插件代它监听局域网，token 登录（HttpOnly cookie / Bearer）+ 端点白名单（默认拒绝，POST /config 默认禁）+ SSE 逐块不缓冲转发 + cookie 选实例（一个页面切 8451/8452，绕开实例不发 CORS 的限制）；主程序零改动，与主程序零代码耦合",
-  "keywords": "局域网 手机 访问 webui 对外 入口 桥 token 登录 白名单 内网 http https 手机浏览器打开 从另一台拿文件 局域网拿文件 手机访问WebUI"
-}
+{"summary": "局域网桥插件（:8602）：手机浏览器访问 OkHuman WebUI 的唯一对外入口——主程序只监听 127.0.0.1 且零鉴权，本插件代它监听局域网，token 登录（HttpOnly cookie / Bearer）+ 端点白名单（默认拒绝，POST /config 默认禁）+ SSE 逐块不缓冲转发 + 实例路由（多实例时机器请求必须点名 `inst=<实例 id>`，缺或错 400、不静默落默认；人走 / 落地页 + /pick 切换，一个页面切 8451/8452）；主程序零改动，与主程序零代码耦合", "keywords": "局域网 手机 访问 webui 对外 入口 桥 token 登录 白名单 内网 http https 手机浏览器打开 从另一台拿文件 局域网拿文件 手机访问WebUI 点名 inst 多实例"}
