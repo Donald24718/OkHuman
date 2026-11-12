@@ -2,3 +2,4 @@ okhuman-lan-bridge
 config.json
 data/
 *.log
+lan-bridge
