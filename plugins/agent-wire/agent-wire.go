@@ -19,9 +19,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
-	"regexp"
 	"sync"
 	"syscall"
 	"time"
@@ -31,11 +31,24 @@ type Peer struct {
 	Name  string `json:"name"`
 	URL   string `json:"url"`
 	Token string `json:"token,omitempty"` // 经 lan-bridge 时用 Bearer
+	Inst  string `json:"inst,omitempty"`  // 桥挂多实例时要哪个上游（8451/8452…）；桥只认 okh_inst cookie
+}
+
+// auth 带上桥的两把钥匙：Bearer 决定能不能进，okh_inst 决定打到哪个上游。
+// 桥挂着多个上游时 inst 必填：缺了或写错，桥直接 400，不再静默落到 default_instance
+// （2026-11-11 起；静默落错的表现为"回信来自另一个 agent"，看不见，所以必须让它响）。
+// 桥只挂一个上游时可以不写。
+func (p *Peer) auth(r *http.Request) {
+	if p.Token != "" {
+		r.Header.Set("Authorization", "Bearer "+p.Token)
+	}
+	if p.Inst != "" {
+		r.Header.Set("Cookie", "okh_inst="+p.Inst)
+	}
 }
 
 type Cfg struct {
 	Peers []Peer `json:"peers"`
-	Self  string `json:"self"`
 }
 
 var httpc = &http.Client{Timeout: 8 * time.Second}
@@ -47,7 +60,7 @@ var httpcBig = &http.Client{Timeout: 30 * time.Second}
 func loadCfg() *Cfg {
 	exe, _ := os.Executable()
 	dir := filepath.Dir(exe)
-	cfgPath := os.Getenv("AGENT_WIRE_CONFIG") // 同机多实例各用自己的配置：self 必须是用它的那个实例
+	cfgPath := os.Getenv("AGENT_WIRE_CONFIG") // 要换配置文件时用；"我是谁"仍只由 OKHUMAN_SELF_URL 声明
 	if cfgPath == "" {
 		cfgPath = filepath.Join(dir, "config.json")
 	}
@@ -71,9 +84,7 @@ func (p *Peer) getWith(hc *http.Client, path string) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	if p.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+p.Token)
-	}
+	p.auth(req)
 	return hc.Do(req)
 }
 
@@ -84,9 +95,7 @@ func (p *Peer) post(path string, body any) (*http.Response, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if p.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+p.Token)
-	}
+	p.auth(req)
 	return httpc.Do(req)
 }
 
@@ -300,7 +309,7 @@ func collectTurn(p *Peer, base int, task string) (string, string, string) {
 								}
 							}
 							if started && roundText != nil && clean(roundText.String()) != "" {
-								return clean(roundText.String()), "正文（本轮事件流 run_end 收口）"+missNote(missed), "run_end"
+								return clean(roundText.String()), "正文（本轮事件流 run_end 收口）" + missNote(missed), "run_end"
 							}
 							if started {
 								t, k := lastEntry(p)
@@ -329,7 +338,7 @@ func collectTurn(p *Peer, base int, task string) (string, string, string) {
 				note += "｜没在输入里认出我的原文，这条可能不是给我的"
 			}
 			if roundText != nil && clean(roundText.String()) != "" {
-				return clean(roundText.String()), "正文（对端已空闲，本轮只取到这些）"+note, "ended"
+				return clean(roundText.String()), "正文（对端已空闲，本轮只取到这些）" + note, "ended"
 			}
 			if t, k := entryForTask(p, task); t != "" {
 				return t, k, "ended"
@@ -343,6 +352,7 @@ func collectTurn(p *Peer, base int, task string) (string, string, string) {
 	t, k := lastEntry(p)
 	return t, k, "stalled"
 }
+
 // missNote：有批次没取到时必须在回信里写明，不能交出一段看起来完整、其实被截过的正文。
 func missNote(missed int) string {
 	if missed <= 0 {
@@ -366,17 +376,23 @@ func clean(t string) string {
 // ---------- 异步：等完把正文以 /enqueue 投回发送方（靠主程序的轮内搭车进当前轮） ----------
 
 type wait struct {
-	Watcher int `json:"watcher"` // watcher 进程 pid：ID 里的 pid 是 send 那一刻的短命进程，判不了活死
-	Revives int `json:"revives"` // 被重新接上次数的上限（防止 watcher 反复死掉形成循环）
-	ID    string `json:"id"`
-	Peer  string `json:"peer"`
-	Base  int    `json:"base"`
-	Task  string `json:"task"`
-	Self  string `json:"self"`
-	Start int64  `json:"start"`
+	Watcher int    `json:"watcher"` // watcher 进程 pid：ID 里的 pid 是 send 那一刻的短命进程，判不了活死
+	Revives int    `json:"revives"` // 被重新接上次数的上限（防止 watcher 反复死掉形成循环）
+	ID      string `json:"id"`
+	Peer    string `json:"peer"`
+	Base    int    `json:"base"`
+	Task    string `json:"task"`
+	Start   int64  `json:"start"`
 }
 
+// waitDir：优先实例自己声明的数据目录（$OKHUMAN_DATA_DIR/agent-wire/waiting，跟着实例走，
+// 共用这份插件的多个实例互不搅）；没有声明就退回可执行文件同目录（终端手跑的老行为）。
 func waitDir() string {
+	if dd := strings.TrimSpace(os.Getenv("OKHUMAN_DATA_DIR")); dd != "" {
+		d := filepath.Join(dd, "agent-wire", "waiting")
+		os.MkdirAll(d, 0o700)
+		return d
+	}
 	exe, _ := os.Executable()
 	d := filepath.Join(filepath.Dir(exe), "data", "waiting")
 	os.MkdirAll(d, 0o755)
@@ -398,14 +414,30 @@ func atomicWrite(path string, b []byte) error {
 // logPath 是 watcher 自己的日志：doSend 建它，watcher 退出时删（此前从不删）。
 func logPath(id string) string { return filepath.Join(waitDir(), id+".log") }
 
+func normURL(s string) string { return strings.TrimRight(strings.TrimSpace(s), "/") }
+
+// selfURL 是"我自己是谁 / 回信投给谁"，只认实例的声明：OKHUMAN_SELF_URL ——
+// 主程序起工具子进程时注入（internal/tools.SetSelfID），谁跑我谁说清我是谁，不靠我猜。
+// 为什么不在 config 里留 self：同机多实例共用同一份插件时它会认错人——2026-11-11 实测
+// 8452 读到了 8451 的 config（self: me），回信投进 8451、等待记录也落在同一个目录。
+// 终端里手跑就自己声明：OKHUMAN_SELF_URL=http://127.0.0.1:8451 agent-wire send …
+func selfURL(c *Cfg) string {
+	return normURL(os.Getenv("OKHUMAN_SELF_URL"))
+}
+
+// selfPeer 取"我自己"那一条：URL 相同即同一个人（名字只是显示用），带上它的 token。
 func selfPeer(c *Cfg) *Peer {
+	u := selfURL(c)
+	if u == "" {
+		return nil
+	}
 	for _, p := range c.Peers {
-		if p.Name == c.Self {
+		if normURL(p.URL) == u {
 			pp := p
 			return &pp
 		}
 	}
-	return nil
+	return &Peer{Name: "本实例", URL: u}
 }
 
 // spawnWatcher 起（或重新接上）一个等待进程，返回它的 pid（必须记进记录，否则下次调用会把它当孤儿再接一个）。
@@ -544,7 +576,7 @@ func doWaitInject(c *Cfg, id string) {
 	}
 	me := selfPeer(c)
 	if peer == nil || me == nil {
-		fmt.Println("配置缺 peer:", w.Peer, "或 self:", c.Self)
+		fmt.Println("配置缺 peer:", w.Peer, "，或没有 OKHUMAN_SELF_URL —— 回信不知道该投给谁")
 		return
 	}
 	for {
@@ -562,7 +594,7 @@ func doWaitInject(c *Cfg, id string) {
 				"【agent-wire 无回信 · 来自 %s】\n任务：%s\n（连续不可达：对端可能已重启或被杀）\n要不要我重问一次，等用户一句话。",
 				w.Peer, first(w.Task, 80)))
 		} else {
-			enqueueSelf(me, prefix + fmt.Sprintf("（末条类型：%s）\n%s", orX(kind, "无内容"), text))
+			enqueueSelf(me, prefix+fmt.Sprintf("（末条类型：%s）\n%s", orX(kind, "无内容"), text))
 		}
 		break
 	}
@@ -578,9 +610,6 @@ func doList(c *Cfg) {
 			defer wg.Done()
 			s := fetchStatus(&p)
 			who := p.Name
-			if p.Name == c.Self {
-				who += " (我自己)"
-			}
 			switch {
 			case s.Err != "":
 				out[i] = fmt.Sprintf("%-10s 离线   %s  [%s]", who, p.URL, s.Err)
@@ -606,12 +635,11 @@ func doList(c *Cfg) {
 // ---------- send ----------
 
 type ev struct {
-	Type     string `json:"type"`
-	Text     string `json:"text"`
-	Message  string `json:"message"` // run_msg / user_piggyback：本轮（或搭车）实际输入的原文
-	Thinking string `json:"thinking"`
-	Role     string `json:"role"`
-	Name     string `json:"name"`
+	Type    string `json:"type"`
+	Text    string `json:"text"`
+	Message string `json:"message"` // run_msg / user_piggyback：本轮（或搭车）实际输入的原文
+	Role    string `json:"role"`
+	Name    string `json:"name"`
 }
 
 func doSend(c *Cfg, name, msg string) {
@@ -631,7 +659,12 @@ func doSend(c *Cfg, name, msg string) {
 		fmt.Println("没有这个 agent：", name, "  可选:", strings.Join(names, ", "))
 		os.Exit(1)
 	}
-	if name == c.Self {
+	if selfURL(c) == "" { // 认不出自己就不知道回信投给谁：先出声，别派一个永远收不到回的活
+		// （2026-11-11 各实例 config 已删掉 self，身份只由实例声明给出，见 SetSelfID）
+		fmt.Println("认不出我自己：没有 OKHUMAN_SELF_URL。在实例里跑由主程序注入；终端里手跑自己声明：OKHUMAN_SELF_URL=http://127.0.0.1:<端口> agent-wire send …")
+		os.Exit(2)
+	}
+	if normURL(peer.URL) == selfURL(c) {
 		fmt.Println("不能给自己发：自己正在 run（这正是规则要防的）")
 		os.Exit(2)
 	}
@@ -661,7 +694,7 @@ func doSend(c *Cfg, name, msg string) {
 
 	// 一律异步：派完就返回，对方跑完由 watcher 把正文投回我的会话（靠轮内搭车进当前轮）
 	w := &wait{ID: fmt.Sprintf("%d%x", os.Getpid(), time.Now().UnixNano()), Peer: name, Base: base,
-		Task: msg, Self: c.Self, Start: time.Now().Unix()}
+		Task: msg, Start: time.Now().Unix()}
 	bb, _ := json.Marshal(w)
 	if err := atomicWrite(w.path(), bb); err != nil {
 		fmt.Println("写等待记录失败，未派活：", err)

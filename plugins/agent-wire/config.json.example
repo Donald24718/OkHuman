@@ -1,5 +1,4 @@
 {
-  "self": "me",
   "peers": [
     {
       "name": "me",
@@ -12,7 +11,8 @@
     {
       "name": "agent-c",
       "url": "http://192.0.2.10:8602",
-      "token": "<该实例 lan-bridge 的 token>"
+      "token": "<该实例 lan-bridge 的 token>",
+      "inst": "8451"
     }
   ]
 }
