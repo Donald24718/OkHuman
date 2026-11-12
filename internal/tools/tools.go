@@ -101,6 +101,30 @@ func CleanupStaleScripts() int {
 // Configure 设置工具超时并重建工具表：启动时一次，tools 段热更新时再调。
 // 新上限对"下一条命令"生效；已在跑的命令沿用其启动时的上限。
 // atomic.Pointer 与 context.ConfigureInjectResolver 同构（与在飞 LLM 调用的读并发）。
+// SetSelfID 向工具子进程声明"跑它的是哪个实例"：OKHUMAN_SELF_URL（回信/请求的去处）与
+// OKHUMAN_DATA_DIR（本实例的数据目录）。同机多实例共用同一份插件时，插件靠 config 里的
+// 身份字段会认错人（2026-11-11 实测：副本实例用了生产实例的配置，回信投进了另一个实例、
+// 等待记录落在同一个目录）。声明由拥有身份的一方给出，插件不必去猜父进程是谁。
+var selfID atomic.Value // []string，形如 ["OKHUMAN_SELF_URL=http://127.0.0.1:<port>", ...]
+
+func SetSelfID(port int, dataDir string) {
+	e := []string{}
+	if port > 0 {
+		e = append(e, fmt.Sprintf("OKHUMAN_SELF_URL=http://127.0.0.1:%d", port))
+	}
+	if dataDir != "" {
+		e = append(e, "OKHUMAN_DATA_DIR="+dataDir)
+	}
+	selfID.Store(e)
+}
+
+func selfIDEnv() []string {
+	if v := selfID.Load(); v != nil {
+		return v.([]string)
+	}
+	return nil
+}
+
 func Configure(fgMS, timeoutMS int) {
 	if timeoutMS <= 0 || timeoutMS > MaxToolTimeoutMS {
 		timeoutMS = DefaultToolTimeoutMS
@@ -229,6 +253,9 @@ func toolBash(args map[string]interface{}) (string, error) {
 	defer os.Remove(scriptPath)
 	cmd := exec.Command("bash", scriptPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // 独立进程组
+	if e := selfIDEnv(); len(e) > 0 {                     // 身份声明只给工具子进程，不写进本进程环境
+		cmd.Env = append(os.Environ(), e...)
+	}
 	// 审计 H3 修（2026-09-14）：输出按流封顶 32MB（防单条命令灌 GB 级输出
 	// OOM 整个进程；600s 只限时间不限大小）。超上限部分丢弃但持续读取
 	// （管道不堵，子进程不挂起），正文留前 32MB + 截断说明。

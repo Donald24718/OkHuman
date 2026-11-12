@@ -108,3 +108,36 @@ func countIn(dir string) int {
 	ms, _ := filepath.Glob(filepath.Join(dir, "okhuman-bash-*"))
 	return len(ms)
 }
+
+func TestSelfIDDeclaredToToolChild(t *testing.T) {
+	prev, _ := selfID.Load().([]string)
+	// 先清掉继承来的同名变量：这测试常由 agent 的 bash 工具跑，那个环境里就带着这两条声明，
+	// 不清就把"父进程本来有声明"误判成"SetSelfID 污染了本进程"。
+	prevURL, hadURL := os.LookupEnv("OKHUMAN_SELF_URL")
+	prevDir, hadDir := os.LookupEnv("OKHUMAN_DATA_DIR")
+	os.Unsetenv("OKHUMAN_SELF_URL")
+	os.Unsetenv("OKHUMAN_DATA_DIR")
+	t.Cleanup(func() {
+		selfID.Store(prev) // atomic.Value 不许存 nil，空切片即"不注入"
+		if hadURL {
+			os.Setenv("OKHUMAN_SELF_URL", prevURL)
+		}
+		if hadDir {
+			os.Setenv("OKHUMAN_DATA_DIR", prevDir)
+		}
+	})
+	Configure(30000, 600000)
+	SetSelfID(4321, filepath.Join(t.TempDir(), "data-4321"))
+	out, err := ExecuteTool("bash", map[string]interface{}{
+		"command": "printf '%s|%s\\n' \"$OKHUMAN_SELF_URL\" \"$OKHUMAN_DATA_DIR\""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "http://127.0.0.1:4321") || !strings.Contains(out, "data-4321") {
+		t.Errorf("工具子进程没收到身份声明：%q", out)
+	}
+	// 本进程环境不该被污染（否则会被 exec 出去的东西继承成假声明）
+	if os.Getenv("OKHUMAN_SELF_URL") != "" {
+		t.Errorf("SetSelfID 污染了本进程环境")
+	}
+}

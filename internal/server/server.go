@@ -746,6 +746,7 @@ func applyConfigPatch(a *AgentState, patch map[string]interface{}, logf func(for
 	}
 	// 自我生命感知输入随配置热更新（llm base_url / server 段变化）
 	a.CM().SetSelfInfo(ctxmgr.SelfInfo{Port: nc.Server.Port, DataDir: nc.Data.Dir, LLMBaseURL: nc.LLM.BaseURL})
+	tools.SetSelfID(nc.Server.Port, nc.Data.Dir) // 身份声明随配置热更新一起走
 	a.CfgRef.Store(nc)
 	// tools / doom 段：由 runOpt 每轮现取，无需动作
 	return PatchResult{Applied: dedupe(applied), Restart: dedupe(restart)}

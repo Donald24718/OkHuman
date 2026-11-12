@@ -129,6 +129,7 @@ func main() {
 	// /tmp；并在启动时清掉上次被强杀留下的残留——defer os.Remove 在 SIGKILL 下不跑，
 	// 信号处理也拦不住 SIGKILL，所以兜底必须放在启动时，不依赖优雅退出。
 	tools.SetScriptDir(filepath.Join(dataDir, "bash-jobs"))
+	tools.SetSelfID(port, dataDir) // 向工具子进程声明身份（见 tools.SetSelfID）
 	if n := tools.CleanupStaleScripts(); n > 0 {
 		log(fmt.Sprintf("[tools] 已清理上次遗留的命令脚本 %d 个（%s）", n, filepath.Join(dataDir, "bash-jobs")))
 	}
