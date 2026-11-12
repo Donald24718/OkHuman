@@ -1,7 +1,1 @@
-{
-  "name": "view_image",
-  "summary": "看图——把**图片**注入我自己的上下文（原图 native，不缩放不压质），我直接读画面：内容、人物、构图、颜色、图里的文字与水印。自己生成的图、要验收的视频帧也走它（先 ffmpeg 抽帧再注入）。当前只有图片注入：视频/音频注入不可用（后端不透出 input_video，实测 2026-11-06）。命令名仍是 `okattach`，内核回显前缀 `[okattach]` 是内核的注入标记，不是外部看图服务。",
-  "cli": true,
-  "updated_at": "2026-11-06",
-  "keywords": "okattach view_image 图片注入 看图 读图 原图 native --png 图里有什么 描述图片 图上的文字 海报上写了啥 抽帧看视频 视频里有什么 图上写了什么"
-}
+{"name": "view_image", "summary": "看图——把**图片**注入我自己的上下文（原图 native，不缩放不压质），我直接读画面：内容、人物、构图、颜色、图里的文字与水印。自己生成的图、要验收的视频帧也走它（先 ffmpeg 抽帧再注入）。当前只有图片注入：视频/音频注入不可用（后端不透出 input_video，实测 2026-11-06）。命令名仍是 `okattach`，内核回显前缀 `[okattach]` 是内核的注入标记，不是外部看图服务。注入目标优先级：`--okhuman-port` 显式 > 实例声明 `OKHUMAN_SELF_URL` 里的端口 > 沿父进程链找主进程 LISTEN 端口；都认不出报错不猜（2026-11-11 起声明优先）", "cli": true, "updated_at": "2026-11-06", "keywords": "okattach view_image 图片注入 看图 读图 原图 native --png 图里有什么 描述图片 图上的文字 海报上写了啥 抽帧看视频 视频里有什么 图上写了什么 哪个实例 OKHUMAN_SELF_URL"}

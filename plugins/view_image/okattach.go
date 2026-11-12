@@ -20,8 +20,9 @@
 //	okattach video <file> [--seg N] [--note "..."] [--dry-run]
 //	okattach frame <video> <t秒> [--w 宽] [--note "..."]
 //
-// 目标端口自动识别：本插件目录向上找 OkHuman 父目录，用其 config.json 的
-// server.port（512nv 生产=8451、lil 副本=8452，各树独立，不用写死）。
+// 目标实例自动识别：优先读本实例声明 OKHUMAN_SELF_URL（主程序注入，见
+// internal/tools.SetSelfID）；没有声明才退回沿父进程链找 okhuman 主进程的 LISTEN 端口。
+// 都不行就报错，绝不猜端口——猜来的目标会让素材静默进错实例的会话。
 package main
 
 import (
@@ -31,6 +32,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -75,7 +77,7 @@ func usage() {
   段内时间戳从 0 起，注入文本标注原时间轴范围
   清晰度不够 → 用 frame 抽单帧高清；长内容 → --seg 分批
 
-目标端口自动识别（本插件目录的 OkHuman 父目录 config.json 的 server.port）。
+目标实例自动识别：读 OKHUMAN_SELF_URL（实例声明）> 父进程链兜底 > --okhuman-port 显式指定优先于两者。
 `)
 	os.Exit(2)
 }
@@ -144,18 +146,38 @@ func parseFlags(args []string) (flag, []string) {
 	return f, pos
 }
 
-// targetPort 选注入目标：① --okhuman-port 显式指定优先；② 沿进程父链找所属 okhuman 主进程，取其 LISTEN
-// 端口（插件由 agent 的 bash 工具启动，父链 okattach←bash←okhuman，端口随实例天然隔离）。
-// ② 失败时不再猜端口：2026-11-07 去掉硬编码回退 8451——猜来的目标会让图片静默进错实例的会话。
+// targetPort 选注入目标：① --okhuman-port 显式指定；② 本实例声明 OKHUMAN_SELF_URL 里的端口
+// （主程序起工具子进程时注入，同 agent-wire 的身份来源，2026-11-11）；③ 兜底才沿父进程链找
+// okhuman 主进程取其 LISTEN 端口（给没带声明的旧主程序或手跑用）。
+// 认不出不猜端口：2026-11-07 去掉硬编码回退端口——猜来的目标会让素材静默进错实例的会话。
+// 为什么 ② 排在 ③ 前：③ 要按二进制名猜（.3 的插件代码里记着 2026-11-07 主实例二进制当时叫 okhuman-local，
+// 判不出只能退回默认端口；2026-11-11 复核：那台两台现在都叫 okhuman，已改名），
+// 且多个 LISTEN 时只能取最低一个；② 是跑我的实例直接说的，跨平台、不受进程树变形影响。
 func targetPort(f flag) int {
 	if f.okPort > 0 {
 		return f.okPort
 	}
+	if p := selfPort(); p > 0 {
+		return p
+	}
 	if ports := detectOwnPorts(); len(ports) > 0 {
 		return ports[0]
 	}
-	die("父链未找到 okhuman 主进程，无法确定注入到哪实例；在 agent 里跑会自动认出，手工跑请显式加 --okhuman-port <端口>")
+	die("认不出注入到哪实例：没有 OKHUMAN_SELF_URL，父链也没找到 okhuman 主进程；在 agent 里跑会自动认出，手工跑请显式加 --okhuman-port <端口>")
 	return 0
+}
+
+// selfPort 读本实例的声明（OKHUMAN_SELF_URL）里的端口；没声明或读不出端口返回 0。
+func selfPort() int {
+	u, err := url.Parse(strings.TrimSpace(os.Getenv("OKHUMAN_SELF_URL")))
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(u.Port())
+	if err != nil || n < 1 || n > 65535 {
+		return 0
+	}
+	return n
 }
 
 func ppidOf(pid int) int {
@@ -172,7 +194,7 @@ func ppidOf(pid int) int {
 }
 
 // isOkHumanMain pid 是否为 OkHuman 主程序。argv0 基名允许 `okhuman` 或 `okhuman-*`
-// （2026-11-07：ey-desktop 上主实例二进制叫 okhuman-local，严格相等会判不出来 → 只能回退默认端口）
+// （2026-11-07 记：另一台机器上主实例二进制曾叫 okhuman-local，严格相等会判不出来；2026-11-11 复核两台现在都叫 okhuman）
 func isOkHumanMain(pid int) bool {
 	cmd, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	if err != nil {
