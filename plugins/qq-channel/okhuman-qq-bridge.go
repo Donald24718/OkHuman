@@ -1361,8 +1361,9 @@ func inboxDirFor(bot BotCfg) string {
 	return filepath.Join("/tmp/qq-inbox", id)
 }
 
-// inboxKeep：/tmp 只在重启时清；机器长期不重启时靠这个上限防收件口无限长（tmpfs 也占内存）。
-const inboxKeep = 7 * 24 * time.Hour
+// inboxKeep：收件口里的附件默认留 1 天（2026-11-12 定）。/tmp 只在重启时清，机器长期不重启时
+// 靠这个上限防无限长（tmpfs 也占内存）；1 天足够让 agent 在这一天里回头再读那张图。
+const inboxKeep = 24 * time.Hour
 
 func (c *QQChannel) pruneInbox(dir string) {
 	fs, err := os.ReadDir(dir)
@@ -1383,7 +1384,7 @@ func (c *QQChannel) pruneInbox(dir string) {
 		}
 	}
 	if n > 0 {
-		c.logf(fmt.Sprintf("收件口清掉 %d 个超过 7 天的旧附件", n))
+		c.logf(fmt.Sprintf("收件口清掉 %d 个超过 1 天的旧附件", n))
 	}
 }
 
@@ -2567,7 +2568,7 @@ func main() {
 		len(started), len(cfg.Instances), strings.Join(ids, ","), cfg.Shared.DataDir))
 
 	// 2026-09-24 outbox 手动投递：cp <文件> <DataDir>/channels/qq/outbox/<botAppID>/ = 向该 bot 的 c2c
-	// 渠道明确发一条媒体消息（不扫聊天文本，谁放进来谁负责）。发送成功 → 归档 sent/；失败 → 留在原位下轮重试。
+	// 渠道明确发一条媒体消息（不扫聊天文本，谁放进来谁负责）。发送成功 → 删掉原文件不留档；失败 → 留在原位下轮重试。
 	outboxRoot := filepath.Join(cfg.Shared.DataDir, "channels", "qq", "outbox")
 	os.MkdirAll(outboxRoot, 0755)
 	for _, ch := range started {
@@ -2575,7 +2576,6 @@ func main() {
 			continue
 		}
 		dir := filepath.Join(outboxRoot, ch.botID)
-		os.MkdirAll(filepath.Join(dir, "sent"), 0755)
 		go func(ch *QQChannel, dir, botID string) {
 			tk := time.NewTicker(2 * time.Second)
 			defer tk.Stop()
@@ -2595,18 +2595,19 @@ func main() {
 						break
 					}
 					if ch.sendFileMessage(ch.bot.ChannelID, p, token.value) {
-						dest := filepath.Join(dir, "sent", fmt.Sprintf("%s.%d", e.Name(), time.Now().Unix()))
-						if merr := os.Rename(p, dest); merr != nil {
-							logf(fmt.Sprintf("[bot=%s] outbox 归档失败（文件已发）：%v", botID, merr))
+						// 发完即删（2026-11-12）。原先归档 sent/：到 11-12 已积 475 个 / 730MB，没有任何
+						// retention，只增不减。QQ 那边这条消息本来就留着；要留档请在 attach 前自己存一份。
+						if rerr := os.Remove(p); rerr != nil {
+							logf(fmt.Sprintf("[bot=%s] 已发出但删不掉（下轮会再发一遍）：%v", botID, rerr))
 						} else {
-							logf(fmt.Sprintf("[bot=%s] outbox 投递完成：%s", botID, e.Name()))
+							logf(fmt.Sprintf("[bot=%s] outbox 投递完成并删除：%s", botID, e.Name()))
 						}
 					}
 				}
 			}
 		}(ch, dir, ch.botID)
 	}
-	logf(fmt.Sprintf("outbox 就绪：cp <文件> %s/<botAppID>/ = 一次手动媒体投递（成功归档 sent/）；入站收件口按实例分：/tmp/qq-inbox/<实例 id>（自动清 7 天前的）", outboxRoot))
+	logf(fmt.Sprintf("outbox 就绪：cp <文件> %s/<botAppID>/ = 一次手动媒体投递（发完即删，不留档）；入站收件口按实例分：/tmp/qq-inbox/<实例 id>（自动清 1 天前的）", outboxRoot))
 
 	// 常驻：QQChannel 内部自重连/重认证；SIGINT 优雅收尾
 	sigCh := make(chan os.Signal, 2)

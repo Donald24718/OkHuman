@@ -19,13 +19,12 @@ QQ 消息进 agent、agent 回复回 QQ。无监听端口，只有出站连接�
 ## 启动 / 停止 / 重建
 
 ```bash
-# 启动（日志落 /tmp/okhuman-qq-bridge.log；/tmp 是 tmpfs，重启清空）
-cd "<本目录>" && setsid ./okhuman-qq-bridge > /tmp/okhuman-qq-bridge.log 2>&1 &
+# 长驻跑法：systemd user unit（日志在 journal；要进程死了自动拉起就在 unit 里加 Restart=on-failure——租约让位是干净退 0，不会被拉起）
+systemctl --user restart qq-bridge.service ; journalctl --user -u qq-bridge.service -n 80
+# 临时起一个测试 = 接管租约，正在跑的那个让位退 0（11-11 踩过一次）→ 测完要 restart 交回
+cd "<本目录>" && ./okhuman-qq-bridge
 
-# 停止（SIGTERM 立即退）
-kill <pid>
-
-# 改完源码后重建（Go 工具链 /usr/local/go，go 在 /usr/local/bin）
+# 改完源码后重建（子命令与服务是同一个二进制，但子命令是另起的短命进程 → 不必重启服务）
 cd "<本目录>" && go build -o okhuman-qq-bridge okhuman-qq-bridge.go
 ```
 
@@ -83,25 +82,26 @@ LESSONS.md               踩坑档案（token 解析 / 忘重编 / 挪目录数�
 2. **数据写到旧路径**（挪目录后）：见上文 ⚠️——杀进程、迁数据、新路径重拉；`readlink /proc/<pid>/cwd` 可确认进程实际位置
 3. **双份转发 / 重复入队**（让位没生效才会见）：日志里搜「让位退出」——没出现 = 旧桥卡在阻塞调用里超过 2s，手动 `kill` 它；`cat data/channels/qq/bridge.gen` 看现在谁持有
 4. **消息被 QQ 拒**：msg_seq 回退——确认 `data/channels/qq/msg_seq` 存在且比上次发送值大
-5. **QQ 发了没反应**：看 /tmp/okhuman-qq-bridge.log 有没有"已订阅 /events"（每个 bot×实例一条）；再手动 `curl -X POST {实例}/enqueue` 验证实例可达
+5. **QQ 发了没反应**：`journalctl --user -u qq-bridge.service -n 80` 看有没有"已订阅 /events"（每个 bot×实例一条）；再手动 `curl -X POST {实例}/enqueue` 验证实例可达
 
-## 手动媒体投递（outbox，2026-09-24）
+## 媒体进出（outbox 2026-09-24 立 / attach 2026-11-11 / 入站按实例分 2026-11-12）
 
-正文 `[File: <路径>]` 标记自动发文件已整块删除（2026-09-24：纯副作用——思考段引用
-路径会误发，当天一图发 3 次）。发文件一律走 outbox 显式投递：
+发文件一律显式投递，**用子命令、不自己拼路径**：
 
 ```bash
-cp <文件> "<本目录>/data/channels/qq/outbox/<botAppID>/"
-# botAppID 见 config.json bots[].app_id（本机部署：<botAppID-A>=default/小A，<botAppID-B>=second/小B）
+./okhuman-qq-bridge attach <文件>   # 按 OKHUMAN_SELF_URL 认出我 = 哪个实例 → 取 config 里属于我的那个 bot
+# 可选 --bot <app_id> / --to <实例id>；--dry-run 只打印将投给谁，不落文件
 ```
 
-放进目录 = 向该 bot 的 c2c 渠道发一条媒体消息（桥 2s 轮询拾取）。成功 → 归档
-`outbox/<botAppID>/sent/<文件>.<unix秒>`；失败（token 不可用/上传/发送报错）→ 留在原位
-下轮重试。图片扩展名自动识别为图片消息，其它为文件消息。
+映射写在 config（`instances[].url` + `bots[].instance`），所以不用手抄 app_id；认不出自己 /
+该实例配多个 bot / `--bot` 与实例不符 → **报错不猜**（猜错就发进别人的会话，收不回）。手写法
+`cp … "outbox/<botAppID>/"` 仍可用，但可能被 2s 轮询拾到半截文件（attach 先写 `.staging` 再 rename）。
+发出去就删掉原文件（2026-11-12 改：原先归档 `sent/`，到那天已积 475 个 / 730MB 且无 retention；要留档在 attach 前自己存一份）。失败留原位重试；图片扩展名按图片、其余按文件。
+入站（你发来的附件）落 `/tmp/qq-inbox/<实例 id>/<ts36>-<安全名>`（`/inject` 通知带绝对路径）；按实例一口 2026-11-12 起，此前两实例共用一口；目录动态建，默认留 1 天、在下次落盘时清（tmpfs 占内存）。**入站在常驻进程里跑，改这条要重启桥**。
 
 历史坑（09-24 修）：① QQ `/v2/users/{openid}/files` 返回的 `file_info` 是 **base64 字符串**
 不是对象，按 map 解析恒 nil → “缺 file_info”；② 文件消息 `msg_seq` 原用 WS 会话 seq
-（`c.seq`），与文本消息的 `c2cMsgSeq` 不同源，回退被 QQ 拒 → 统一 `nextC2CSeq()`。
+（`c.seq`），与文本消息的 `c2cMsgSeq` 不同源，回退被 QQ 拒 → 统一 `nextC2CSeq()`；③ 正文里 `[File: <路径>]` 自动发文件曾存在，因纯副作用（思考段引用路径就误发）整块删除（2026-09-24）。
 
 ## 解耦契约自检
 

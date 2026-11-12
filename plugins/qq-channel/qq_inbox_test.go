@@ -57,7 +57,7 @@ func TestPruneInboxOnlyDropsStale(t *testing.T) {
 	if err := os.MkdirAll(sub, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	ago := time.Now().Add(-8 * 24 * time.Hour)
+	ago := time.Now().Add(-26 * time.Hour) // 超过 1 天就该被清
 	if err := os.Chtimes(old, ago, ago); err != nil {
 		t.Fatal(err)
 	}
