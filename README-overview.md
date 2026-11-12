@@ -28,7 +28,7 @@
 
 两个区域（`plugins/RULE.md` 为唯一权威）：
 
-1. **plugins/** —— 插件目录，扁平排列：view_image / gpu-window / browser / computer / cron / okmon / qq-channel / scout / voice-chat
+1. **plugins/** —— 插件目录，扁平排列：view_image / gpu-window / browser / computer / cron / okmon / qq-channel / lan-bridge / agent-wire / scout / voice-chat
 2. **plugins/skills/** —— 技能库，日期层级 year_/month_/day_：skill = SKILL.md（本机**实测验证过**的操作经验，照它执行）+ 可选 scripts/references；账号令牌不进技能目录
 
 每个插件是一个**自包含小系统**：

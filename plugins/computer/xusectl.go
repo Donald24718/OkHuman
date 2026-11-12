@@ -3,30 +3,30 @@
 // 给 agent 装"手"：整屏截图 + X11 鼠标键盘事件。微内核设计：内核零改动，
 // 视觉走现有 okattach（截图注入上下文），动作走 xdotool(XTest)/ffmpeg(x11grab)。
 //
-//   shot [--out <f>] [--settle <ms>]   整屏截图（ffmpeg x11grab）
-//   move <x> <y> [--view-w <W>]        移动鼠标
-//   click <x> <y> [--button b] [--double] [--view-w <W>] [--target 窗口名|0xID] [--settle ms]
-//   right_click / double_click <x> <y>
-//   drag <x1> <y1> <x2> <y2>
-//   scroll <x> <y> --dx <N> --dy <N>   滚轮（dy>0 向下，dx>0 向右）
-//   type <text>                        输入（ASCII XTest 键入；非 ASCII 走 U+码点 keysym）
-//   key <combo> [--repeat N --interval ms]
-//   hold <combo> <ms>
-//   wake [密码]                        解锁 xfce4-screensaver
-//   focus <窗口名|wid>
-//   open <cmd...>                      setsid 起应用
-//   diff <prev.png> [--out new.png] [--region x,y,w,h]  像素差异预检
-//   windowactivate|windowminimize|windowraise|windowmaximize|windowunmaximize <窗口名|0xID|十进制ID>
-//   stack [x y] / sleep <ms>
+//	shot [--out <f>] [--settle <ms>]   整屏截图（ffmpeg x11grab）
+//	move <x> <y> [--view-w <W>]        移动鼠标
+//	click <x> <y> [--button b] [--double] [--view-w <W>] [--target 窗口名|0xID] [--settle ms]
+//	right_click / double_click <x> <y>
+//	drag <x1> <y1> <x2> <y2>
+//	scroll <x> <y> --dx <N> --dy <N>   滚轮（dy>0 向下，dx>0 向右）
+//	type <text>                        输入（ASCII XTest 键入；非 ASCII 走 U+码点 keysym）
+//	key <combo> [--repeat N --interval ms]
+//	hold <combo> <ms>
+//	wake [密码]                        解锁 xfce4-screensaver
+//	focus <窗口名|wid>
+//	open <cmd...>                      setsid 起应用
+//	diff <prev.png> [--out new.png] [--region x,y,w,h]  像素差异预检
+//	windowactivate|windowminimize|windowraise|windowmaximize|windowunmaximize <窗口名|0xID|十进制ID>
+//	stack [x y] / sleep <ms>
 //
 // 坐标空间：真实屏幕像素。注入的图片一律是原生分辨率，坐标直接用；
 // --view-w W 只在你手上是别处来的缩放图时才用（乘 屏幕宽/W 换算）。
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
-	"encoding/json"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -36,21 +36,21 @@ import (
 )
 
 var (
-	display    = envOr("DISPLAY", ":0.0")
-	focusFile  = filepath.Join(os.TempDir(), "okhuman-xuse-focus")
-	dangerous  = []*regexp.Regexp{
+	display   = envOr("DISPLAY", ":0.0")
+	focusFile = filepath.Join(os.TempDir(), "okhuman-xuse-focus")
+	dangerous = []*regexp.Regexp{
 		regexp.MustCompile(`^ctrl\+alt\+del$`),
 		regexp.MustCompile(`^ctrl\+alt\+backspace$`),
 		regexp.MustCompile(`^super\+l$`),
 		regexp.MustCompile(`^ctrl\+alt\+f\d$`),
 		regexp.MustCompile(`^alt\+f4$`),
 	}
-	reHexID     = regexp.MustCompile(`^0x[0-9a-f]+$`)
-	reDecID     = regexp.MustCompile(`^\d+$`)
-	reMouseLoc  = regexp.MustCompile(`x:(\d+) y:(\d+) screen:\d+ window:(\d+)`)
-	reXWinID    = regexp.MustCompile(`- id: 0x[0-9a-f]+`)
-	reYAVG      = regexp.MustCompile(`YAVG[=:]\s*([\d.]+)`)
-	reYMAX      = regexp.MustCompile(`YMAX[=:]\s*([\d.]+)`)
+	reHexID    = regexp.MustCompile(`^0x[0-9a-f]+$`)
+	reDecID    = regexp.MustCompile(`^\d+$`)
+	reMouseLoc = regexp.MustCompile(`x:(\d+) y:(\d+) screen:\d+ window:(\d+)`)
+	reXWinID   = regexp.MustCompile(`- id: 0x[0-9a-f]+`)
+	reYAVG     = regexp.MustCompile(`YAVG[=:]\s*([\d.]+)`)
+	reYMAX     = regexp.MustCompile(`YMAX[=:]\s*([\d.]+)`)
 )
 
 func envOr(k, def string) string {

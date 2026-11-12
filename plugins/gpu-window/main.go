@@ -1,6 +1,6 @@
 // gpu-window —— 把某个服务占的显存临时换出到 host 内存（让卡），用完换回来：一张卡当分时槽位用。
 // 关键设计：只操作「真正持有显存的 pid」——从 nvidia-smi 的显存归属取，不碰 unit 的 MainPID
-//（多进程服务打在 MainPID 上会「成功但无效」，2026-11-08 在 8080 上踩过）。
+// （多进程服务打在 MainPID 上会「成功但无效」，2026-11-08 在 8080 上踩过）。
 package main
 
 /*
@@ -36,10 +36,10 @@ type gate struct {
 	Field string `json:"field"` // 默认 "running"
 }
 type service struct {
-	Name      string    `json:"name"`
-	Match     strList   `json:"match"`     // 对 /proc/<pid>/cmdline 子串匹配（可写一个或数组）
-	Protected bool      `json:"protected"` // true = 默认不许让卡（如 8080）
-	Gates     []gate    `json:"gates"`     // 空闲闸门：这些实例在 run 就拒绝切
+	Name      string  `json:"name"`
+	Match     strList `json:"match"`     // 对 /proc/<pid>/cmdline 子串匹配（可写一个或数组）
+	Protected bool    `json:"protected"` // true = 默认不许让卡（如 8080）
+	Gates     []gate  `json:"gates"`     // 空闲闸门：这些实例在 run 就拒绝切
 }
 type conf struct{ Services []service }
 

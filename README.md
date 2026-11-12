@@ -68,13 +68,15 @@ open http://127.0.0.1:8451/
 | 插件 | 干什么 |
 |---|---|
 | asr | 独立 ASR 服务：llama.cpp CPU build 的 llama-server + ASR 模型，OpenAI 兼容 `/v1/audio/transcriptions`（:8090）；`transcribe.sh` 单文件转写 |
-| view_image | 看图：把图片**原图 native** 注入我自己的上下文（内容、人物、构图、图上的文字与水印）；命令名 `okattach`。视频/音频注入当前不可用（后端不透出 `input_video`，2026-11-06 实测） |
+| view_image | 看图：把图片**原图 native** 注入我自己的上下文（内容、人物、构图、图上的文字与水印）；命令名 `okattach`。视频/音频注入当前不可用（后端不透出 `input_video`，2026-11-06 实测）；注入目标由实例声明 `OKHUMAN_SELF_URL` 认出，认不出报错不猜 |
 | browser | browserctl 轻 CLI 驱动本地 chromium（CDP）：导航、定位、填表、点击、取文本、截图；`errors` / `count` / `eval` 让 agent 写完前端自己开浏览器验 |
 | computer | 给 agent 装"手"：整屏截图注入 + X11 鼠标键盘事件 |
 | gpu-window | 独占型 GPU 的「让卡窗口」：按客户实例 `/status` 判定空闲才让重负载进程占卡，`protected` 服务不被挤走 |
 | cron | 定时任务（:8601），到点把 prompt 作为 user 消息 POST 到对应实例 /chat |
 | okmon | 进程监控 + 启停管理（webui :8496） |
-| qq-channel | QQ 官方渠道桥：QQ 消息 ↔ agent 双向转发（独立常驻进程，无监听端口） |
+| qq-channel | QQ 官方渠道桥：QQ 消息 ↔ agent 双向转发（独立常驻进程，无监听端口）；`attach <文件>` 子命令按实例声明选 bot（不必手抄 app_id）；入站附件按实例分收件口 |
+| lan-bridge | 把只绑 `127.0.0.1` 的实例透出到局域网的反向代理（token → HttpOnly cookie）；**挂多个实例时机器请求必须点名 `inst=<实例 id>`**，缺或错一律 400（不静默落默认实例）；人走 `/` 落地页 + `/pick` 切换 |
+| agent-wire | agent 之间异步派活/回信（无守护进程，只有异步）：只给空闲 agent 发、起一次性 watcher 取本轮正文再投回发送方；"我自己"由主程序注入的 `OKHUMAN_SELF_URL` 声明 |
 | scout | 插件/技能检索服务（纯关键词，内存索引，:8480）：`/search` `/reindex` `/doctor`。meta.json 的 `summary`+`keywords` 就是它的索引信号 |
 | tts | 独立 TTS 服务（Kokoro-82M，HTTP :8092）：`say.sh` 出一句，`serve.py` 常驻复用 |
 | voice-chat | 语音全闭环：麦克风 → VAD → 声纹门控 → ASR → 唤醒词路由 → TTS 朗读（ASR/TTS 已拆成上面两个独立插件） |

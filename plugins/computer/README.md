@@ -23,7 +23,7 @@
 | 动作 | 说明 |
 |---|---|
 | `$XU shot [f] [--out f] [--settle ms]` | 整屏截图 1920×1080（f 可作位置参数=落盘路径；锁屏时会提示先 wake） |
-| `$XU wake [密码]` | 解锁 xfce4-screensaver 锁屏（密码走显式参数，或 env `OKHUMAN_UNLOCK_PASSWORD`）。**本机锁屏密码备忘（用户 2026-09-30 授权记录，纯文本，插件代码/二进制未为此改动）**：`sdxhy737598` |
+| `$XU wake [密码]` | 解锁 xfce4-screensaver 锁屏（密码走显式参数，或 env `OKHUMAN_UNLOCK_PASSWORD`）。密码不入库：由 env `OKHUMAN_UNLOCK_PASSWORD` 或显式参数给（本机那份记在本地不入库的备忘里） |
 | `$XU move x y` / `click x y [--button left\|right\|middle] [--double]` | 鼠标（坐标=屏幕真实像素） |
 | `$XU click x y --target <窗口名\|0xID> [--settle ms]` | **关键点击首选**：显式置顶目标窗→settle(默认300ms)→校验指针下顶层窗确是目标（或其子窗），不过则 exit 4 中止，绝不让点击落在盖窗上（2026-09-13 Thunar 盖窗事故后新增） |
 | `$XU right_click x y` / `double_click x y` / `drag x1 y1 x2 y2` | |
