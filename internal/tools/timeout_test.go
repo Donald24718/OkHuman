@@ -92,7 +92,7 @@ func TestSpecTextStableAtLiveValues(t *testing.T) {
 		"前台等待 30 秒未完成自动转后台（你收到通知后继续干活，结果在轮内下一个工具调用间隙或下一次 run 带回来）；命令总时长超 60000 秒被强制终止（整个命令进程组）。" +
 		"起长驻服务（python 服务器等）必须离开本工具的进程组，否则会被 60000 秒超时连带杀掉。默认写法（立即返回不占管道，且活得过本进程重启）：systemd-run --user --unit=<唯一名> --collect --property=StandardOutput=append:<日志> <启动命令>，之后 systemctl --user 查/停；日志别落 tmpfs。" +
 		"无 user manager（systemd-run 报 Failed to connect to bus）才退回 setsid 三件套：(setsid <启动命令> < /dev/null > <日志> 2>&1 &)——三件套缺一不可（少重定向会挂死 Wait）；setsid 只换会话不换 cgroup：本进程所在单元被重启时它连坐被杀，本进程崩溃时它成孤儿带着旧配置继续跑。" +
-		"命令会先过一道静态检查（guard）：`rm -rf $d/`、`rm -rf /`、`find … -delete`（未先 -print）、`chmod/chown -R` 打到系统根、`kill 0`、`git push -f`、`> 覆盖已存在的文件`——命中就不执行，并给出更安全写法（没有绕过开关）。它只认形状，换个写法就看不见（`xargs rm`、python `shutil.rmtree`）；同理这些也不会因改写变安全，得你自己判断：`rsync --delete`、`git reset --hard`、`git clean -fdx`、`docker … --volumes`、`mkfs/dd/删卷`、改另一台机器——其中不可逆又无法预览的先问用户。" // 2026-11-08：guard 上线时加；要让模型知道拦什么/拦不住什么，不能只说「代码拦不住」
+		"命令会先过一道静态检查（guard）：`rm -rf $d/`、`rm -rf /`、`find … -delete`（未先 -print）、`chmod/chown -R` 打到系统根、`kill 0`、`git push -f`、`> 覆盖已存在的文件`——命中就不执行，并给出更安全写法（没有绕过开关）。它只认形状，换个写法就看不见（`xargs rm`、python `shutil.rmtree`）；同理这些也不会因改写变安全，得你自己判断：`rsync --delete`、`git reset --hard`、`git clean -fdx`、`docker … --volumes`、`mkfs/dd/删卷`、改另一台机器——其中不可逆又无法预览的先问主人。" // 2026-11-08：guard 上线时加；要让模型知道拦什么/拦不住什么，不能只说「代码拦不住」
 	if specs[0].Description != want {
 		t.Errorf("bash 描述文本变了（会毁 KV 前缀）：\n得：%s\n望：%s", specs[0].Description, want)
 	}

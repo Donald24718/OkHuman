@@ -143,24 +143,17 @@ func (a *Agent) Stop() {
 	}
 }
 
-// CompressNowWithEvents 手动压缩（WebUI「手动压缩上下文」按钮 / POST /compress，
-// 2026-10-18）。与 run 内自动压缩的差别只在"谁触发"：压缩事件走与 run 同一条 emit
-// 通道（compress_delta / compress）→ 前端聊天区能看到压缩思考与正文的流式活卡。
-// 此前只有 run 注册了压缩监听（run 结束即注销），手动压缩时没人订阅 → 主人点完按钮
-// 界面全程无输出，只能等 HTTP 响应（主人 2026-10-18 指出）。
-// 压缩流挂新建的 runCtx 并登记 a.runCancel → /stop 能中断它（与 run 内压缩同一条中止
-// 路径；中断后 session 不变）。调用方须持 RunLock（server 侧 a.Lock.Run），否则新 run
-// 会与压缩并发改会话结构。
-func (a *Agent) CompressNowWithEvents(emit func(types.AgentEvent)) (string, bool) {
-	if emit == nil {
-		emit = func(types.AgentEvent) {}
-	}
-	runCtx, runCancel := context.WithCancel(context.Background())
-	a.mu.Lock()
-	a.runCancel = runCancel
-	a.mu.Unlock()
-	a.cm.SetRunSignal(&runCtx)
+// wireCompressEvents 把压缩过程的增量与结果转成前端事件，返回一次性注销函数。
+// 两条入口（手动压缩 / 正常 run 内的自动压缩）接的是同一组事件，此前整块抄了两遍
+// （2026-11-13 四方审计 C1）：以后加字段只改一处，不会漏掉另一条路径。
+// skippedToolText 排在触发强停那个调用**之后**的 tool_call：它们根本没被执行，
+// 不能沿用"重复调用已停止"那句话——那会让模型以为自己也重复了，因果是假的
+// （2026-11-13 四方审计）。
+func skippedToolText(name string) string {
+	return "[本轮已因重复调用而停止，这个调用未执行，没有结果。工具名：" + name + "] 重复完全相同调用的是它前面那一个。"
+}
 
+func (a *Agent) wireCompressEvents(emit func(types.AgentEvent)) func() {
 	offDelta := a.cm.AddCompressDeltaListener(func(scope string, d types.Delta) {
 		if d.Thinking != "" || d.Text != "" {
 			ev := types.AgentEvent{"type": "compress_delta", "scope": scope}
@@ -189,8 +182,29 @@ func (a *Agent) CompressNowWithEvents(emit func(types.AgentEvent)) (string, bool
 		}
 		emit(ev)
 	})
+	return func() { offDelta(); offCompress() }
+}
+
+// CompressNowWithEvents 手动压缩（WebUI「手动压缩上下文」按钮 / POST /compress，
+// 2026-10-18）。与 run 内自动压缩的差别只在"谁触发"：压缩事件走与 run 同一条 emit
+// 通道（compress_delta / compress）→ 前端聊天区能看到压缩思考与正文的流式活卡。
+// 此前只有 run 注册了压缩监听（run 结束即注销），手动压缩时没人订阅 → 主人点完按钮
+// 界面全程无输出，只能等 HTTP 响应（主人 2026-10-18 指出）。
+// 压缩流挂新建的 runCtx 并登记 a.runCancel → /stop 能中断它（与 run 内压缩同一条中止
+// 路径；中断后 session 不变）。调用方须持 RunLock（server 侧 a.Lock.Run），否则新 run
+// 会与压缩并发改会话结构。
+func (a *Agent) CompressNowWithEvents(emit func(types.AgentEvent)) (string, bool) {
+	if emit == nil {
+		emit = func(types.AgentEvent) {}
+	}
+	runCtx, runCancel := context.WithCancel(context.Background())
+	a.mu.Lock()
+	a.runCancel = runCancel
+	a.mu.Unlock()
+	a.cm.SetRunSignal(&runCtx)
+
+	offCompress := a.wireCompressEvents(emit)
 	defer func() {
-		offDelta()
 		offCompress()
 		a.cm.SetRunSignal(nil)
 		a.mu.Lock()
@@ -234,40 +248,12 @@ func (a *Agent) runUserMessage(ctx context.Context, userText string, opt RunOpti
 	a.mu.Unlock()
 	a.cm.SetRunSignal(&runCtx)
 
-	offCompressDelta := a.cm.AddCompressDeltaListener(func(scope string, d types.Delta) {
-		if d.Thinking != "" || d.Text != "" {
-			ev := types.AgentEvent{"type": "compress_delta", "scope": scope}
-			if d.Thinking != "" {
-				ev["thinking"] = d.Thinking
-			}
-			if d.Text != "" {
-				ev["text"] = d.Text
-			}
-			emit(ev)
-		}
-	})
-	offCompress := a.cm.AddCompressListener(func(e ctxmgr.CompressEvent) {
-		ev := types.AgentEvent{
-			"type":         "compress",
-			"scope":        e.Scope,
-			"detail":       e.Detail,
-			"before_chars": e.BeforeChars,
-			"after_chars":  e.AfterChars,
-			"truncated":    e.Truncated, // 正文超 summary_max_chars 被硬截断
-			"sum_window":   e.Window,    // 当时生效的 context.keep_summaries
-			"text":         e.Text,
-		}
-		if e.Thinking != nil {
-			ev["thinking"] = *e.Thinking
-		}
-		emit(ev)
-	})
+	offCompress := a.wireCompressEvents(emit)
 
 	defer func() {
 		// 正常/中断/出错统一收尾（defer 保证恰好一次）
 		emit(types.AgentEvent{"type": "run_end"})
 		offCompress()
-		offCompressDelta()
 		a.cm.SetRunSignal(nil)
 		a.mu.Lock()
 		a.runCancel = nil
@@ -468,7 +454,7 @@ func (a *Agent) llmCall(ctx context.Context, emit func(types.AgentEvent), totals
 }
 
 // streamOnce 一次流式调用（idleMs=0 → 客户端用自己的 StreamIdleMS，来自
-// llm.stream_idle_sec；2026-10-18 A5 起不再回落 max(timeout_ms,10min)）
+// llm.stream_idle_sec；未配置时客户端仍回落 max(llm.timeout_sec,10min)）
 func (a *Agent) streamOnce(ctx context.Context, client llm.LlmClient, messages []types.Message, onDelta func(types.Delta), respOut **types.Response) error {
 	r, err := client.CompleteStream(ctx, messages, tools.Specs(), onDelta, 0)
 	if err == nil {
@@ -519,7 +505,8 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 		// 警告/强停消息都在本批 tool 结果之后插入，保证 assistant.tool_calls 与 tool 消息严格配对。
 		stopped := false
 		doomWarnPending := false
-		for _, tc := range calls {
+		warnName := "" // 触发重复的那条调用的工具名（不是批次末位，见下方警告处）
+		for idx, tc := range calls {
 			args := parseArgs(tc.Function.Arguments)
 			a.mu.Lock()
 			a.lastCalls = append(a.lastCalls, callRec{Name: tc.Function.Name, Key: stableKey(tc.Function.Name, args)})
@@ -533,11 +520,20 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 				a.cm.AddMessage(&types.RawEntry{Role: "tool", ToolCallID: &tc.ID, Content: syn})
 				emit(types.AgentEvent{"type": "tool_result", "name": tc.Function.Name, "call_id": tc.ID, "truncated": false, "total_chars": 0, "content": syn})
 				emit(types.AgentEvent{"type": "doom_stop", "detail": fmt.Sprintf("警告后仍重复完全相同调用 %s，强停本轮", tc.Function.Name)})
+				// 批次里排在其后的调用同样不执行，但**也必须**各有一条 tool 消息：
+				// 只补当前这条会留下 assistant.tool_calls 与 tool 消息不配对的残缺轮，
+				// 它之后每轮都跟着会话发给模型（2026-11-13 四方审计；旧实现只补一条）。
+				// 不给它们发 tool_call/tool_result 事件——前端从没见过这些调用。
+				for _, rest := range calls[idx+1:] {
+					a.cm.AddMessage(&types.RawEntry{Role: "tool", ToolCallID: &rest.ID,
+						Content: skippedToolText(rest.Function.Name)})
+				}
 				stopped = true
 				break
 			}
 			if sameRun && !warned {
 				doomWarnPending = true // 先执行，整批结束后再警告
+				warnName = tc.Function.Name
 			}
 
 			emit(types.AgentEvent{"type": "tool_call", "name": tc.Function.Name, "args": args, "call_id": tc.ID})
@@ -601,10 +597,11 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 
 		a.mu.Lock()
 		needWarn := !stopped && doomWarnPending
-		var warnName string
-		if needWarn && len(a.lastCalls) > 0 {
+		if needWarn {
+			// 警告要指名**触发重复的那条**（上面记下的 warnName）。旧写法取
+			// lastCalls 末位：混合批 [A,A,B] 会说"你连续 N 次调用 B"，而 B 只调过一次
+			// （2026-11-13 四方审计 R5）。
 			a.warned = true
-			warnName = a.lastCalls[len(a.lastCalls)-1].Name
 		}
 		sequenceBroken := !a.isSameRunLocked(opt.DoomWarnAfter)
 		a.mu.Unlock()

@@ -51,7 +51,7 @@ type CompressOpts struct {
 // 2026-11-05：删掉旧"最多 3 轮、比较基准长度、取最短一轮"的迭代压缩 ——
 // 摘要长度改由 context.summary_max_chars 硬截断管（manager 里截），
 // 旧的"不劣于输入"约束不再需要，也就不留这套代码。
-// 带工具调用 → 无工具白名单重发一次（仍带工具就用第一次的结果），保持原行为。
+// 带工具调用 → 无工具白名单重发一次；重发成功就用重发的，重发失败才保留第一次结果），保持原行为。
 func CompressOnce(ctx context.Context, client llm.LlmClient, prefix []types.Message, scope string, instruction string, opts CompressOpts) (*CompressResult, error) {
 	req := make([]types.Message, len(prefix), len(prefix)+1)
 	copy(req, prefix)

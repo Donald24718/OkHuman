@@ -43,16 +43,11 @@ func TestAssembleBatchMerged(t *testing.T) {
 		t.Fatalf("kind=%q n=%d，want merged/3", kind, n)
 	}
 	// M 是**拼接后那条**的长度（含【第 i 条】与换行）——早先按各条原文相加，
-	// 报出来的数字比实际发给 agent 的少（2026-11-12 复审指出，测试跟着更正）。
+	// 报出来的数字比实际发给 agent 的少（2026-11-12 审查指出，测试跟着更正）。
 	wantLabel := fmt.Sprintf("3 条合并 / %d 字符", utf16Count(msg))
 	if label == nil || *label != wantLabel {
 		t.Fatalf("label=%v，want %q", label, wantLabel)
 	}
-}
-
-// qBg 测试夹具：正文按后台完成通知入队。
-func qBg(text string) types.QueuedMessage {
-	return types.QueuedMessage{Text: text, Kind: types.QueueKindBGNotice}
 }
 
 // qq 测试夹具：把裸正文包成 user 队列条目（bg_notice 用 qBg 显式标）。

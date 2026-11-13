@@ -43,7 +43,7 @@ func (ap *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	ap.state.mu.Lock()
 	queued := queuedTexts(ap.state.MessageQueue)
-	qItems := queuedItems(ap.state.MessageQueue)
+	qItems := copyQueue(ap.state.MessageQueue)
 	running := a.Lock.Running() || ap.state.ActiveDrain != nil
 	session := int(a.SessionNo.Load())
 	bgPending := a.BG().Count()
@@ -130,6 +130,12 @@ func (ap *App) handleStripInjects(w http.ResponseWriter, r *http.Request) {
 
 // ---------- /reset：新会话 ----------
 
+func (ap *App) injectInFlight(id string) bool {
+	ap.state.mu.Lock()
+	defer ap.state.mu.Unlock()
+	return ap.state.injectInFlight[id]
+}
+
 func (ap *App) handleInject(w http.ResponseWriter, r *http.Request) {
 	a := ap.state.Agent
 	b := tryReadJSON(r)
@@ -149,21 +155,26 @@ func (ap *App) handleInject(w http.ResponseWriter, r *http.Request) {
 	ap.state.mu.Lock()
 	pending := append([]InjectInfo(nil), ap.state.Injects...)
 	ap.state.mu.Unlock()
-	kept := make([]InjectInfo, 0, len(pending))
+	// 只记下要摘除的 ID，不回写快照：并发的另一个 /inject 可能在这中间加过附件，
+	// 回写快照会把别人刚加的那条抹掉（2026-11-13 第四轮 A2：16 路并发只剩 8 条）。
+	dropped := make(map[string]bool)
 	for _, x := range pending {
-		if sessionHasInjectRef(a.CM(), x.ID) {
-			kept = append(kept, x)
-		} else {
-			// 预算修复（2026-09-12 破案）：只清"会话里已无引用"的侧车（被压缩吃掉的）
-			inject.DropInjectFile(dir, x.ID)
+		if ap.injectInFlight(x.ID) || sessionHasInjectRef(a.CM(), x.ID) {
+			continue
 		}
+		// 预算修复（2026-09-12 破案）：只清"会话里已无引用"的侧车（被压缩吃掉的附件留着就是永久占用）
+		inject.DropInjectFile(dir, x.ID)
+		dropped[x.ID] = true
 	}
 	ap.state.mu.Lock()
-	ap.state.InjectSeq++
+	ap.state.InjectSeq++ // 序号只增；列表的摘除按 ID 在同一次锁里做（A2）
 	id := fmt.Sprintf("inj-%d", ap.state.InjectSeq)
-	ap.state.Injects = kept
-	overLimit := len(kept) > INJECT_MAX
-	n := len(kept)
+	if ap.state.injectInFlight == nil {
+		ap.state.injectInFlight = map[string]bool{}
+	}
+	ap.state.injectInFlight[id] = true // 在飞：别的并发请求这一轮不许扫掉它
+	n := len(ap.state.Injects)
+	overLimit := n > INJECT_MAX
 	ap.state.mu.Unlock()
 	if overLimit {
 		fmt.Fprintf(os.Stderr, "[inject] 活跃附件 %d 超软上限 %d（引用仍在会话，保留不清）\n", n, INJECT_MAX)
@@ -189,7 +200,17 @@ func (ap *App) handleInject(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	ap.state.mu.Lock()
-	ap.state.Injects = append(ap.state.Injects, InjectInfo{ID: id, Bytes: len(payload), CreatedAt: time.Now().UnixMilli(), Note: notePtr})
+	cur := ap.state.Injects
+	if len(dropped) > 0 {
+		next := make([]InjectInfo, 0, len(cur))
+		for _, x := range cur {
+			if !dropped[x.ID] {
+				next = append(next, x)
+			}
+		}
+		cur = next
+	}
+	ap.state.Injects = append(cur, InjectInfo{ID: id, Bytes: len(payload), CreatedAt: time.Now().UnixMilli(), Note: notePtr})
 	ap.state.mu.Unlock()
 	label := "附件 " + id
 	if notePtr != nil && *notePtr != "" {
@@ -202,5 +223,8 @@ func (ap *App) handleInject(w http.ResponseWriter, r *http.Request) {
 			types.RefPart(id),
 		},
 	})
+	ap.state.mu.Lock()
+	delete(ap.state.injectInFlight, id) // 已进会话，之后按引用判据清扫
+	ap.state.mu.Unlock()
 	writeJSON(w, 200, map[string]interface{}{"ok": true, "id": id})
 }

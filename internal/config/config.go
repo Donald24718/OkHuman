@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -108,6 +109,50 @@ const DefaultHeartbeatPrompt = "（心跳：系统检测到你已空闲——最
 
 // Default 出厂默认（2026-09-14 易迁移：data 目录默认 $HOME/.okhuman；
 // 部署可用 config/default.json 或 OKHUMAN_DATA_DIR 环境变量覆盖）
+// KnownKeys 某配置段允许写的键（取自结构体的 json tag）。POST /config 用它拒绝打错字的键：
+// 未知键此前会被原样接受并落进 user.json，用户以为改了，其实什么都没生效
+// （2026-11-13 四方审计 E3）。别名（*_ms）在调用前已由 NormalizeTimeUnits 换算掉。
+func KnownKeys(section string) map[string]bool {
+	out := map[string]bool{}
+	rt := reflect.TypeOf(Config{})
+	for i := 0; i < rt.NumField(); i++ {
+		if jsonName(rt.Field(i).Tag.Get("json")) != section {
+			continue
+		}
+		st := rt.Field(i).Type
+		if st.Kind() == reflect.Pointer {
+			st = st.Elem()
+		}
+		if st.Kind() != reflect.Struct {
+			return out // 非对象段：不校验（返回空集 = 调用方跳过）
+		}
+		// 段里若有嵌套结构，这里只列到一层、嵌套键会被误拒 → 整段跳过校验。
+		// 现状所有段都是扁平的；真要加嵌套时，改成生成 a.b 再放开。
+		for j := 0; j < st.NumField(); j++ {
+			if k := st.Field(j).Type.Kind(); k == reflect.Struct || k == reflect.Map {
+				return map[string]bool{}
+			}
+		}
+		for j := 0; j < st.NumField(); j++ {
+			if n := jsonName(st.Field(j).Tag.Get("json")); n != "" {
+				out[n] = true
+			}
+		}
+		return out
+	}
+	return out
+}
+
+func jsonName(tag string) string {
+	if tag == "" || tag == "-" {
+		return ""
+	}
+	if i := strings.IndexByte(tag, ','); i >= 0 {
+		return tag[:i]
+	}
+	return tag
+}
+
 func Default() *Config {
 	home, _ := os.UserHomeDir()
 	if home == "" {
@@ -137,7 +182,7 @@ func Load(root string) (*Config, error) {
 		}
 		var patch map[string]interface{}
 		if err := json.Unmarshal(data, &patch); err != nil {
-			return nil, fmt.Errorf("配置 %s 解析失败：%v", f, err)
+			return nil, fmt.Errorf("配置 %s 解析失败：%w", f, err)
 		}
 		for _, n := range NormalizeTimeUnits(patch) {
 			fmt.Fprintf(os.Stderr, "[config] 单位迁移：%s\n", n)
@@ -241,7 +286,7 @@ func DeepMerge(cfg *Config, patch map[string]interface{}) *Config {
 // 这里三条规则都是踩过坑加的（2026-11-12 从 main 挪进来：规则住在 main 里时，
 // config 的测试覆盖不到，而它决定的正是"下次重启生效的是什么"）：
 //  1. 读不懂就不写：user.json 是半截 JSON（外部编辑中断/掉电写一半）时拒绝保存。
-//     旧写法静默按空基线合并写回，会把用户的端口/模型/上下文上限一次清空 ——
+//     旧写法静默按空基线合并写回，会把主人的端口/模型/上下文上限一次清空 ——
 //     8451 那次"端口被偷"就是这个形态。
 //  2. 剥冗余叶子的基线 = Default() + config/default.json，不是裸 Default()（2026-09-15 修）：
 //     default.json 覆盖过的键，user 里"等于出厂默认"的值正是把它掰回来的覆盖，删掉即
@@ -262,7 +307,7 @@ func SaveUserPatch(root string, patch map[string]interface{}) error {
 	} else {
 		var d interface{}
 		if uerr := json.Unmarshal(raw, &d); uerr != nil {
-			return fmt.Errorf("config/user.json 解析失败（%v），拒绝在看不懂的配置上合并写入：%s", uerr, file)
+			return fmt.Errorf("config/user.json 解析失败（%w），拒绝在看不懂的配置上合并写入：%s", uerr, file)
 		}
 		m, ok := d.(map[string]interface{})
 		if !ok {

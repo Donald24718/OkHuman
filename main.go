@@ -193,7 +193,12 @@ func main() {
 		os.Exit(0)
 	}()
 
-	sessSnap, _ := persist.LoadSessionFile(dataDir)
+	sessSnap, sessErr := persist.LoadSessionFile(dataDir)
+	if sessErr != nil {
+		// 文件在、但形状不被接受：以前静默当"无会话"，整个会话悄悄归零且日志里
+		// 一行都没有（2026-11-13 四方审计）。旧文件保留在原地，先让人看得见发生了什么。
+		log(fmt.Sprintf("[persist] 会话文件存在但未被接受，本次从空会话开始（旧文件保留在 %s）：%v", dataDir, sessErr))
+	}
 	if sessSnap != nil {
 		a.SessionNo.Store(int32(sessSnap.No))
 		a.CM().Restore(sessSnap.State)

@@ -2,10 +2,10 @@ package tools
 
 // guard —— bash 元工具的硬拦：只拦「存在几乎同成本、且更安全写法」的灾难形状。
 //
-// 无逃生门（2026-11-08 用户定）：不给 agent 留 --force 出口；要放开只能改这里的代码。
+// 无逃生门（2026-11-08 主人定）：不给 agent 留 --force 出口；要放开只能改这里的代码。
 // 准入条件（2026-11-08 议定）：只有能低成本替换成更安全写法的形状才进硬拦。
 // 语义上必须如此、改写不降低风险的（rsync --delete / git reset --hard / mkfs / dd /
-// docker down -v / systemctl restart）不在此拦——它们走参数校验、副作用预览，或该问用户。
+// docker down -v / systemctl restart）不在此拦——它们走参数校验、副作用预览，或该问主人。
 // 只拦形状不拦意图：同一危险换成 xargs rm / python shutil.rmtree 就看不见，别把它当保证。
 // 0 依赖：只用标准库 + 系统自带的 bash / systemctl。
 
@@ -36,8 +36,11 @@ func (g guardFinding) String() string {
 var (
 	reComment = regexp.MustCompile(`^\s*#`)
 	// rm 的递归+强制 flag（分开写或合并写都算）
-	reRM     = regexp.MustCompile(`(?:^|[;&|(` + "\t" + `\s])rm\s`)
-	reRMrf   = regexp.MustCompile(`\s-(?:[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*|[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*)\b|\s--recursive\b[\s\S]*\s--force\b`)
+	reRM   = regexp.MustCompile(`(?:^|[;&|(` + "\t" + `\s])rm\s`)
+	reRMrf = regexp.MustCompile(`\s-(?:[a-zA-Z]*[rR][a-zA-Z]*[fF][a-zA-Z]*|[a-zA-Z]*[fF][a-zA-Z]*[rR][a-zA-Z]*)\b` +
+		`|\s--recursive\b[\s\S]*\s--force\b|\s--force\b[\s\S]*\s--recursive\b` +
+		`|\s(?:-[a-zA-Z]*[rR][a-zA-Z]*)\b[\s\S]*\s(?:-[a-zA-Z]*[fF][a-zA-Z]*\b|--force\b)` +
+		`|\s(?:-[a-zA-Z]*[fF][a-zA-Z]*)\b[\s\S]*\s(?:-[a-zA-Z]*[rR][a-zA-Z]*\b|--recursive\b)`) // 递归/强制字母大小写都算（第四轮 A3）
 	reRmRoot = regexp.MustCompile(`(?:^|\s)(?:/|/\*)(?:\s|$)|--no-preserve-root`)
 	// 变量紧跟斜杠 = 空值塌缩成 / 的指纹（$d/、${d}/、"$d/"、"$d/sub"）。
 	// 不带斜杠的 rm -rf $v 不拦：空值时 rm 自己报「缺少操作数」，不会删根。
@@ -46,7 +49,9 @@ var (
 	reChmodRoot  = regexp.MustCompile(`(?:^|[;&|\s])(?:chmod|chown)\b[^\n]*\s-[a-zA-Z]*R[a-zA-Z]*\b`)
 	reSysRoot    = regexp.MustCompile(`(?:^|\s)(?:/|/bin|/boot|/dev|/etc|/home|/lib64|/lib|/media|/mnt|/opt|/proc|/run|/srv|/sys|/usr|/var)(?:\s|$)`)
 	reKillGroup  = regexp.MustCompile(`(?:^|[;&|\s])kill(?:all)?\b[^\n]*(?:\s-?\w+\s)*(?:\s(?:0|-1|--\s-1))(?:\s|$)`)
-	reForcePush  = regexp.MustCompile(`(?:^|[;&|\s])git\s+push\b[^\n]*(?:\s-f\b|--force\b)|\s-f\s.*git\s+push`)
+	reGitPush    = regexp.MustCompile(`(?:^|\s)git\s+(?:-\S+(?:\s+[^\s-]\S*)?\s+)*push\b`)
+	reForceFlag  = regexp.MustCompile(`\s(?:-f\b|--force\b)`)
+	reSegSplit   = regexp.MustCompile(`[;|&\n]+`) // 一条命令一段
 	// 重定向截断：只认字面路径（含变量/通配的一律放过，避免猜错）。
 	// 只认字面绝对路径（含变量/通配的一律放过，避免猜错）。2026-11-12 修：旧式
 	// `[^>2&]\s>\s` 要求 > 前必须有一个非 >2& 字符，于是行首的 `> /path`、带 fd 的
@@ -58,7 +63,13 @@ var (
 )
 
 // guardCommand：扫这段命令（含它显式执行、且本会话写过的 .sh）。返回阻断理由与附带提醒。
+// reLineCont 反斜杠续行：`git push \` 换行 `-f` 与写成一行是同一个命令，
+// 不接起来就会按两段分别看形状，各自的半个都认不出来（2026-11-13 四方审计 F3）。
+var reLineCont = regexp.MustCompile(`\\\r?\n[ \t]*`)
+
 func guardCommand(command string) (blocked *guardFinding, notes []string) {
+	command = reLineCont.ReplaceAllString(command, " ")
+	command = stripMessageBodies(command) // 说明文字不是待执行的命令
 	seen := map[string]bool{}
 	var scan func(text string)
 	scan = func(text string) {
@@ -100,6 +111,49 @@ func guardCommand(command string) (blocked *guardFinding, notes []string) {
 	return blocked, notes
 }
 
+// listedBefore 破坏性动作之前是否先列出了范围。只看"整条命令里有没有 -print"会放过
+// `find … -delete -print`：先删完再列，等于删之前什么也没看见（2026-11-13 审计 F1）。
+// stripMessageBodies 去掉 -m / --message / -F 后面的引号内容：那是要写进 commit 或 tag
+// 的说明文字，不是待执行的命令。2026-11-13 两次实况：我在提交说明里写下删根与强推的形状，
+// 被 guard 当成命令拦下；写"该不该拦"的测试时，那条命令本身又被拦了一次。
+var reMsgBody = regexp.MustCompile("(?s)\\s(?:-m|--message|-F)\\s+(?:\"(?:[^\"\\\\]|\\\\.)*\"|'(?:[^'\\\\]|\\\\.)*')")
+
+func stripMessageBodies(command string) string {
+	return reMsgBody.ReplaceAllString(command, " ")
+}
+
+// forcePushRequested 只在"同一条命令"里同时出现 push 与强制旗标时判强推。跨段不算
+// （2026-11-13 第四轮 A4）：管道后面 grep 带的 -f、或前一条命令带的强制旗标，都不属于
+// 这次 push。误报把普通 push 拦下、还建议换带租约的强推，等于把人往更危险的方向引
+// ——这一例里误报比漏报更糟。
+func forcePushRequested(cmd string) bool {
+	for _, seg := range reSegSplit.Split(cmd, -1) {
+		if !reGitPush.MatchString(seg) || !reForceFlag.MatchString(seg) {
+			continue
+		}
+		if strings.Contains(seg, "--force-with-lease") {
+			continue // 带租约的强推不覆盖别人已推的提交
+		}
+		return true
+	}
+	return false
+}
+
+func listedBefore(cmd, action string) bool {
+	i := strings.Index(cmd, action)
+	if i < 0 {
+		return true
+	}
+	// 只认同一条命令里的列出：`find . -print >/dev/null; find . -delete` 里后一条
+	// 没列出过，不能拿前一条的 -print 背书。
+	if j := strings.LastIndexAny(cmd[:i], ";|&\n"); j >= 0 {
+		cmd = cmd[j+1 : i]
+	} else {
+		cmd = cmd[:i]
+	}
+	return strings.Contains(cmd, "-print")
+}
+
 func matchLine(line string) *guardFinding {
 	t := strings.TrimSpace(line)
 	switch {
@@ -112,16 +166,16 @@ func matchLine(line string) *guardFinding {
 			return &guardFinding{ID: "rm-empty-var", Why: "变量紧跟 `/`：变量为空时删的就是 `/`（少个符号删全盘）",
 				Span: clip(t), Fix: `rm -rf "${d:?}/"（空值立刻报错退出，等价于抛异常）`}
 		}
-	case reFindDel.MatchString(t) && !strings.Contains(t, "-print"):
+	case reFindDel.MatchString(t) && !listedBefore(t, "-delete"):
 		return &guardFinding{ID: "find-delete", Why: "`find … -delete` 没有先列出，范围只在脑子里",
 			Span: clip(t), Fix: `find … -print | xargs -r -d'\n' rm —— 先看见再删`}
 	case reChmodRoot.MatchString(t) && reSysRoot.MatchString(t):
 		return &guardFinding{ID: "chmod-recursive-system-root", Why: "`-R` 打到系统根，影响整台机器",
-			Span: clip(t), Fix: `限定到具体子目录；需要更大范围请让用户确认`}
+			Span: clip(t), Fix: `限定到具体子目录；需要更大范围请让主人确认`}
 	case reKillGroup.MatchString(t):
 		return &guardFinding{ID: "kill-whole-group", Why: "`kill 0` / `kill -1` 把信号打给整个进程组，常把自己也带走",
 			Span: clip(t), Fix: `先 pgrep -af 拿具体 PID，再 kill <pid>，然后复核为 0`}
-	case reForcePush.MatchString(t) && !strings.Contains(t, "--force-with-lease"):
+	case forcePushRequested(t):
 		return &guardFinding{ID: "git-push-force", Why: "`git push -f` 会覆盖别人已推的提交，远端不可回退",
 			Span: clip(t), Fix: `git push --force-with-lease（远端变了就拒绝，不覆盖）`}
 	}

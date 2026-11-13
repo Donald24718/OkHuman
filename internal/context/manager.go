@@ -135,13 +135,6 @@ func (m *Manager) SetSystemPrompt(p string) {
 	m.mu.Unlock()
 }
 
-// SystemPrompt 当前系统提示词
-func (m *Manager) SystemPrompt() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.systemPrompt
-}
-
 // snapshotLocked 当前会话的深快照（持锁调用）：Messages 为新切片（元素拷贝），
 // Summary 共享指针（TEntry 一经创建不再原地修改）。调用方可长期持有快照并发
 // 读取——与 AddMessage 的 append / 压缩的切片重切互不干扰（无共享可变结构）。
@@ -161,13 +154,6 @@ func (m *Manager) Session() *types.SessionState {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.snapshotLocked()
-}
-
-// CfgOf 当前压缩参数
-func (m *Manager) CfgOf() Cfg {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.cfg
 }
 
 // GetSeq / SetSeq 落盘序列号
@@ -278,13 +264,6 @@ func (m *Manager) composeLocked() []types.Message {
 	return msgs
 }
 
-// EstimateTotalTokens 总 token 估算：system + summary + 全部消息
-func (m *Manager) EstimateTotalTokens() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.estimateTotalLocked()
-}
-
 // AddMessage 追加一条消息（user/assistant/tool）；追加后检查总 token 超阈值
 // → 压最旧一批为 summary。压缩内部错误已自行兜底（硬截断/下轮再试），不返回 error。
 func (m *Manager) AddMessage(e *types.RawEntry) {
@@ -337,7 +316,7 @@ func (m *Manager) maybeCompress() {
 // 用途：重置会话前保住旧会话原文——重置整体换掉 Manager，除压缩存档外旧会话无处可寻。
 // 只读会话不改结构，故与任何路径都安全（持 mu 快照写文件）。
 // 返回第三个值 = 写失败原因：那是旧会话原文除压缩存档外**唯一**的全文存档，
-// 静默失败 = 事后无处可寻（2026-11-13 复审指出，旧版至少响应里还看得见占位串）。
+// 静默失败 = 事后无处可寻（2026-11-13 交叉审查指出，旧版至少响应里还看得见占位串）。
 func (m *Manager) DumpSessionRecord(reason string) (string, int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -371,7 +350,27 @@ func (m *Manager) estimateTotalLocked() int {
 // 摘要窗口；窗口超过 cfg.KeepSummaries 就从头部丢弃（不级联合并）。
 // 失败兜底：空闲超时重试共 3 次 → 仍失败 hardTruncate；空输出/其他错误 →
 // session 不变（下一轮消息再试，原文已落盘不丢）。
-func (m *Manager) doCompress(batch []types.RawEntry) {
+// compressOutcome 一次压缩的真实结果。CompressNow 据此决定返回给用户的 ok 与文案：
+// 旧实现无条件回 true，模型报错/空输出时用户看到"已提交压缩…新增 1 条总结"，
+// 而会话其实一点没变（2026-11-13 交叉审查）。
+type compressOutcome struct {
+	// keepWin 是锁内取到的窗口配置。出锁后拼 detail 若直接读 m.cfg，会与 SetCfg 的写
+	// 构成 data race（2026-11-13 第四轮 A1，-race 实抓：SetCfg 写 / CompressNow 读）。
+	keepWin    int
+	Changed    bool   // 会话是否真的被改动（含硬截断这种降级）
+	Summarized bool   // 是否由模型生成了总结（硬截断只放占位 stub，不算）
+	Note       string // 失败或降级的原因（可为空）
+}
+
+// batchSeqRange 最旧 nBatch 条消息的真实 seq 区间。totalSeq 是累计计数（只增不减）、
+// nMsg 是压缩前的会话条数，因此当前会话覆盖 totalSeq-nMsg+1..totalSeq，最旧那一批的
+// 起点与它相同、终点再往前推 nBatch-1（2026-11-13 第四轮审计 N6）。
+func batchSeqRange(totalSeq, nMsg, nBatch int) (int, int) {
+	from := totalSeq - nMsg + 1
+	return from, from + nBatch - 1
+}
+
+func (m *Manager) doCompress(batch []types.RawEntry) compressOutcome {
 	m.mu.Lock()
 	ts := m.recordTsLocked()
 	recordPath, recErr := m.writeSessionRecordLocked(ts, "压缩")
@@ -382,8 +381,11 @@ func (m *Manager) doCompress(batch []types.RawEntry) {
 	maxChars, keepWin := m.cfg.SummaryMaxChars, m.cfg.KeepSummaries
 	nMsg := len(m.session.Messages)
 	nSum := len(m.session.Summaries)
-	seqTo := m.seq
-	seqFrom := seqTo - len(batch) + 1
+	// 批次的真实 seq 区间：m.seq 是累计条数（只增不减），当前会话 N 条对应真实 seq
+	// 是 seq-N+1..seq，最旧 B 条是 seq-N+1..seq-N+B。旧公式写成 seq-B+1..seq，
+	// 系统性偏出 keep 窗条数 → 每条总结的注入头"覆盖 seq a-b"、压缩指令、/history、
+	// /status 全是错值（2026-11-13 第四轮 N6，错自 cfc5315）。
+	seqFrom, seqTo := batchSeqRange(m.seq, nMsg, len(batch))
 	m.mu.Unlock()
 
 	instruction := fmt.Sprintf(
@@ -402,25 +404,30 @@ func (m *Manager) doCompress(batch []types.RawEntry) {
 		if err != nil {
 			if _, ok := err.(*llm.IdleTimeoutError); !ok {
 				m.emit(scope, "压缩失败："+err.Error(), "", false, beforeChars, nil)
-				return
+				return compressOutcome{keepWin: keepWin, Note: "压缩请求失败：" + err.Error()}
 			}
 			if attempt >= maxAttempts {
 				m.mu.Lock()
 				m.hardTruncateLocked(recordPath)
 				m.mu.Unlock()
-				return
+				return compressOutcome{keepWin: keepWin, Changed: true, Note: fmt.Sprintf(
+					"连续 %d 次空闲超时：已放弃 LLM 压缩，改为硬截断（没有生成总结）", maxAttempts)}
 			}
 			m.emit(scope, fmt.Sprintf("压缩空闲超时（%dms 无响应），重试 %d/%d", streamIdleMS, attempt, maxAttempts), "", false, beforeChars, nil)
 			continue
 		}
 		if res.Text == "" {
 			m.emit(scope, "压缩失败：模型空输出", "", false, beforeChars, nil)
-			return
+			return compressOutcome{keepWin: keepWin, Note: "模型空输出，没有生成总结"}
 		}
 		m.mu.Lock()
-		if len(batch) > 0 && len(batch) <= len(m.session.Messages) {
-			m.session.Messages = m.session.Messages[len(batch):]
+		if len(batch) == 0 || len(batch) > len(m.session.Messages) {
+			// 内部不一致：没有原文可删（或批次大于会话）。此时若继续放 summary，
+			// 上下文只会**变长**却报"压缩成功"，所以直接退出（2026-11-13 四方审计）。
+			m.mu.Unlock()
+			return compressOutcome{keepWin: keepWin, Note: "内部不一致：待压批次与实际会话不匹配，会话未改动"}
 		}
+		m.session.Messages = m.session.Messages[len(batch):]
 		origChars := textutil.UTF16Len(res.Text)
 		// 提醒行本身也计入上限：先算出提醒，再按 剩余空间 截正文 ——
 		// 保证"注入的这条正文"始终 ≤ summary_max_chars，不靠事后超一点。
@@ -440,7 +447,7 @@ func (m *Manager) doCompress(batch []types.RawEntry) {
 		// 总结正文落盘 session-summaries/（与 records 存档同名基座配对）；写失败不阻断压缩
 		var summaryPath string
 		// 每轮先复位再尝试：只在出错时赋值的话，任何一次历史写失败会一直挂在
-		// CompressNow 的 detail 上（对照 lastRecordErr 每轮必赋值）。2026-11-13 复审指出。
+		// CompressNow 的 detail 上（对照 lastRecordErr 每轮必赋值）。（2026-11-13 交叉审查指出。）
 		m.lastSummaryErr = nil
 		if recErr == nil {
 			var sumErr error
@@ -477,7 +484,7 @@ func (m *Manager) doCompress(batch []types.RawEntry) {
 				d.SeqFrom, d.SeqTo, d.OrigChars, d.SummaryFile, d.RecordFile)
 		}
 		m.emit(scope, detail, body, truncated, beforeChars, res.Thinking)
-		return
+		return compressOutcome{keepWin: keepWin, Changed: true, Summarized: true}
 	}
 }
 
@@ -549,12 +556,25 @@ func (m *Manager) CompressNow() (string, bool) {
 	if len(batch) == 0 {
 		return fmt.Sprintf("无可压内容（全部 %d 条都在保留预算内）；要腾出空间只能缩摘要窗口，请用 /reset 或调 context.keep_summaries", n), false
 	}
-	m.doCompress(batch)
+	out := m.doCompress(batch)
+	if !out.Changed {
+		return "压缩未完成：" + out.Note + "（会话未改变，没有新增总结）", false
+	}
 	m.mu.Lock()
 	rec, sum := m.lastRecordPath, m.lastSummaryPath
 	recErr, sumErr := m.lastRecordErr, m.lastSummaryErr
 	m.mu.Unlock()
-	detail := fmt.Sprintf("已提交压缩：%d 条最旧消息 → 新增 1 条总结（压缩前 %d 字符，窗口保留 %d 条）", len(batch), before, m.cfg.KeepSummaries)
+	if !out.Summarized {
+		// 降级路径（硬截断）：改了会话，但没有总结，不能按"已压缩"说话
+		s := out.Note
+		if rec != "" {
+			s += "\n全文存档：" + rec
+		} else if recErr != nil {
+			s += "\n全文存档写入失败：" + recErr.Error()
+		}
+		return s, true
+	}
+	detail := fmt.Sprintf("已提交压缩：%d 条最旧消息 → 新增 1 条总结（压缩前 %d 字符，窗口保留 %d 条）", len(batch), before, out.keepWin)
 	if rec != "" {
 		detail += "\n全文存档：" + rec
 	} else if recErr != nil {

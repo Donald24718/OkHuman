@@ -67,7 +67,9 @@ func fakeUsage() types.Usage {
 // newFakeID 工具调用 id（fake_<6 位随机>，对应 TS Math.random().toString(36).slice(2, 8)）
 func newFakeID() string {
 	b := make([]byte, 3)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("fake_fb%x", time.Now().UnixNano())
+	}
 	return "fake_" + hex.EncodeToString(b)
 }
 

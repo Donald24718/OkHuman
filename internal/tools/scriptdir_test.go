@@ -109,6 +109,8 @@ func countIn(dir string) int {
 	return len(ms)
 }
 
+// TestSelfIDDeclaredToToolChild 身份声明走环境：跑工具的实例告诉子进程"我是谁"，
+// 插件（agent-wire 等）据此知道回信投哪、等待记录落哪，不必猜父进程。
 func TestSelfIDDeclaredToToolChild(t *testing.T) {
 	prev, _ := selfID.Load().([]string)
 	// 先清掉继承来的同名变量：这测试常由 agent 的 bash 工具跑，那个环境里就带着这两条声明，

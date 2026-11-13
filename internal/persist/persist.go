@@ -110,7 +110,7 @@ type Persistence struct {
 	// enqMu 保证入队顺序 = 调用顺序；logCh 由唯一一个 writer 消费，
 	// 于是落盘顺序 = 入队顺序 = 调用顺序。
 	enqMu   sync.Mutex
-	logCh   chan string
+	logCh   chan logEntry
 	dropped atomic.Int64
 }
 
@@ -118,11 +118,21 @@ type Persistence struct {
 // 也绝不能无界吃内存（磁盘慢/满时队列会堆）。
 const logQueueSize = 4096
 
+// logFlushWait FlushLog 等冲刷请求被处理到的上限；超时就不再等（退出路径不能卡死）。
+const logFlushWait = 2 * time.Second
+
+// logEntry 队列里的一条：要么是一行日志，要么是一次冲刷请求（flush 非 nil）。
+// 冲刷请求本身不写文件；单写手按序消费，所以它被处理到 = 它前面的都已落盘。
+type logEntry struct {
+	line  string
+	flush chan struct{}
+}
+
 func Init(dir string) (*Persistence, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	p := &Persistence{dir: dir, logCh: make(chan string, logQueueSize)}
+	p := &Persistence{dir: dir, logCh: make(chan logEntry, logQueueSize)}
 	go p.logWriter()
 	return p, nil
 }
@@ -139,7 +149,7 @@ func (p *Persistence) Log(msg string) {
 	fmt.Println(line)
 	p.enqMu.Lock()
 	select {
-	case p.logCh <- line:
+	case p.logCh <- logEntry{line: line}:
 	default:
 		p.dropped.Add(1)
 	}
@@ -148,17 +158,36 @@ func (p *Persistence) Log(msg string) {
 
 // logWriter 唯一的日志写手：串行消费队列，保证落盘顺序。
 func (p *Persistence) logWriter() {
-	for line := range p.logCh {
+	for e := range p.logCh {
 		if d := p.dropped.Swap(0); d > 0 {
 			p.appendLogLine(fmt.Sprintf("[log] 日志队列已满，丢弃 %d 行（保主流程，不阻塞）", d))
 		}
-		p.appendLogLine(line)
+		if e.flush != nil {
+			close(e.flush)
+			continue
+		}
+		p.appendLogLine(e.line)
 	}
 }
 
-// FlushLog 等队列排空（进程退出/被重启前调用，避免丢最后几行）。
+// FlushLog 等已排队的日志真正落盘（进程退出/被重启前调用，避免丢最后几行）。
 // 只等不关：关了之后的 Log 会 panic。
+//
+// 做法是往队列里投一个冲刷请求：写手按序消费，它被处理到时说明前面的都已写完。
+// 旧的写法是轮询 len(logCh) —— 那只看队列长度，写手已经把最后一条取出去、还没写完时
+// 长度就是 0 了，于是 FlushLog 会提前返回、最后一行没落盘（2026-11-13 复审指出）。
+// 队列满（此刻 Log 本身也在丢行）时投不进去，退化为原来的有界轮询。
 func (p *Persistence) FlushLog() {
+	ack := make(chan struct{})
+	select {
+	case p.logCh <- logEntry{flush: ack}:
+		select {
+		case <-ack:
+		case <-time.After(logFlushWait):
+		}
+		return
+	default:
+	}
 	for i := 0; len(p.logCh) > 0 && i < 500; i++ {
 		time.Sleep(2 * time.Millisecond)
 	}
@@ -189,7 +218,13 @@ func (p *Persistence) SaveSession(snap *Snapshot) error {
 	return AtomicWriteFile(filepath.Join(p.dir, SessionFile), string(data))
 }
 
-// LoadSessionFile 加载会话（无文件/损坏 → nil）。
+// LoadSessionFile 加载会话。返回值三种情况必须分得开（2026-11-13 四方审计 R4/#15）：
+//
+//	无文件 → (nil, nil)：正常的首次启动；
+//	文件存在但形状不被接受 → (nil, error)：调用方要留痕，旧文件仍留在盘上；
+//	正常 → (snapshot, nil)。
+//
+// 以前损坏也回 (nil, nil) → 半截文件被当"无会话"，整个会话静默归零、日志一行没有。
 // 唯一形状：{ no, seq, state: { id, summaries:[…], messages:[…] } }。
 // 校验口径：no/seq 必须数字；summaries 若存在必须是数组、每项 content 必须是字符串
 // （任一项形状异常 → 整份拒载，与 validEntry 同口径）；每条消息 role 必须 string，
@@ -199,32 +234,38 @@ func (p *Persistence) SaveSession(snap *Snapshot) error {
 // 结果是"零条摘要"，不报错（下次压缩按新规则从头建）。
 func LoadSessionFile(dir string) (*Snapshot, error) {
 	data, err := os.ReadFile(filepath.Join(dir, SessionFile))
-	if err != nil {
+	if os.IsNotExist(err) {
 		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("读会话文件失败：%w", err)
 	}
 	var d struct {
 		No  *int             `json:"no"`
 		Seq *int             `json:"seq"`
 		St  *json.RawMessage `json:"state"`
 	}
-	if err := json.Unmarshal(data, &d); err != nil || d.No == nil || d.Seq == nil || d.St == nil {
-		return nil, nil
+	if err := json.Unmarshal(data, &d); err != nil {
+		return nil, fmt.Errorf("顶层 JSON 不合法：%w", err)
+	}
+	if d.No == nil || d.Seq == nil || d.St == nil {
+		return nil, fmt.Errorf("顶层缺少 no/seq/state 字段")
 	}
 	var st map[string]interface{}
 	if err := json.Unmarshal(*d.St, &st); err != nil || st == nil {
-		return nil, nil
+		return nil, fmt.Errorf("state 不是对象")
 	}
 	msgs, ok := st["messages"].([]interface{})
 	if !ok {
-		return nil, nil
+		return nil, fmt.Errorf("state.messages 不是数组")
 	}
 	sums, err := summariesFromJSON(st)
 	if err != nil {
-		return nil, nil
+		return nil, fmt.Errorf("summaries：%w", err)
 	}
-	for _, e := range msgs {
+	for i, e := range msgs {
 		if !validEntry(e) {
-			return nil, nil
+			return nil, fmt.Errorf("第 %d 条消息形状不被接受（role 须为字符串，content 须为字符串或数组）", i)
 		}
 	}
 	snap := &Snapshot{No: *d.No, Seq: *d.Seq, State: &types.SessionState{ID: 1, Summaries: sums}}

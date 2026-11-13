@@ -90,20 +90,6 @@ func TestContextStatsSummaries(t *testing.T) {
 	}
 }
 
-// extractBetween 取 s 中 pre 与 post 之间的子串（测试指针路径提取用）
-func extractBetween(s, pre, post string) string {
-	i := strings.Index(s, pre)
-	if i < 0 {
-		return ""
-	}
-	rest := s[i+len(pre):]
-	j := strings.Index(rest, post)
-	if j < 0 {
-		return ""
-	}
-	return rest[:j]
-}
-
 // TestSummaryFilePairing（2026-09-25，2026-11-05 改口径）：压缩后总结正文落盘
 // session-summaries/，与 session-records/ 同名基座成对；两条路径存在条目字段里，
 // 注入时由 RenderSummary 渲染成指针（正文与指针分开存：正文是唯一计量口径）。

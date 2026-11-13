@@ -10,7 +10,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"okhuman/internal/config"
 	"okhuman/internal/llm"
@@ -24,9 +23,6 @@ func (cutClient) CompleteStream(_ context.Context, _ []types.Message, _ []types.
 	onDelta(types.Delta{Text: "半截正文ABC"})
 	return nil, errors.New("上游流被掐断")
 }
-
-func sleep(ms int) { time.Sleep(time.Duration(ms) * time.Millisecond) }
-
 func TestPartialShowsInHistory(t *testing.T) {
 	cfg := config.Default()
 	cfg.Data.Dir = t.TempDir()

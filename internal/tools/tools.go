@@ -48,9 +48,9 @@ var (
 
 // SetSelfID 向工具子进程声明"跑它的是哪个实例"：OKHUMAN_SELF_URL（回信/请求的去处）与
 // OKHUMAN_DATA_DIR（本实例的数据目录）。同机多实例共用同一份插件时，插件靠 config 里的
-// 身份字段会认错人（2026-11-11 实测：副本实例用了生产实例的配置，回信投进了另一个实例、
-// 等待记录落在同一个目录）。声明由拥有身份的一方给出，插件不必去猜父进程是谁。
-var selfID atomic.Value // []string，形如 ["OKHUMAN_SELF_URL=http://127.0.0.1:<port>", ...]
+// self 会认错人（2026-11-11 实测：8452 用了 8451 的 config，回信投进了 8451、等待记录
+// 落在同一个目录）。声明由拥有身份的一方给出，插件不必去猜父进程是谁。
+var selfID atomic.Value // []string，形如 ["OKHUMAN_SELF_URL=http://127.0.0.1:8451", ...]
 
 func SetSelfID(port int, dataDir string) {
 	e := []string{}
@@ -160,7 +160,7 @@ func buildTools(fgMS, timeoutMS int) []types.ToolSpec {
 				fmt.Sprintf("前台等待 %d 秒未完成自动转后台（你收到通知后继续干活，结果在轮内下一个工具调用间隙或下一次 run 带回来）；命令总时长超 %d 秒被强制终止（整个命令进程组）。", fgSec, toSec) +
 				fmt.Sprintf("起长驻服务（python 服务器等）必须离开本工具的进程组，否则会被 %d 秒超时连带杀掉。默认写法（立即返回不占管道，且活得过本进程重启）：systemd-run --user --unit=<唯一名> --collect --property=StandardOutput=append:<日志> <启动命令>，之后 systemctl --user 查/停；日志别落 tmpfs。", toSec) +
 				"无 user manager（systemd-run 报 Failed to connect to bus）才退回 setsid 三件套：(setsid <启动命令> < /dev/null > <日志> 2>&1 &)——三件套缺一不可（少重定向会挂死 Wait）；setsid 只换会话不换 cgroup：本进程所在单元被重启时它连坐被杀，本进程崩溃时它成孤儿带着旧配置继续跑。" +
-				"命令会先过一道静态检查（guard）：`rm -rf $d/`、`rm -rf /`、`find … -delete`（未先 -print）、`chmod/chown -R` 打到系统根、`kill 0`、`git push -f`、`> 覆盖已存在的文件`——命中就不执行，并给出更安全写法（没有绕过开关）。它只认形状，换个写法就看不见（`xargs rm`、python `shutil.rmtree`）；同理这些也不会因改写变安全，得你自己判断：`rsync --delete`、`git reset --hard`、`git clean -fdx`、`docker … --volumes`、`mkfs/dd/删卷`、改另一台机器——其中不可逆又无法预览的先问用户。",
+				"命令会先过一道静态检查（guard）：`rm -rf $d/`、`rm -rf /`、`find … -delete`（未先 -print）、`chmod/chown -R` 打到系统根、`kill 0`、`git push -f`、`> 覆盖已存在的文件`——命中就不执行，并给出更安全写法（没有绕过开关）。它只认形状，换个写法就看不见（`xargs rm`、python `shutil.rmtree`）；同理这些也不会因改写变安全，得你自己判断：`rsync --delete`、`git reset --hard`、`git clean -fdx`、`docker … --volumes`、`mkfs/dd/删卷`、改另一台机器——其中不可逆又无法预览的先问主人。",
 			Parameters: types.ToolParameters{
 				Type: "object",
 				Properties: map[string]interface{}{
@@ -271,9 +271,9 @@ func toolBash(args map[string]interface{}) (string, error) {
 	}
 	// 超时标记用 atomic.Bool（2026-09-14 审计修：旧裸 bool 由 AfterFunc
 	// goroutine 写、主 goroutine 读，无同步 → 数据竞争）
-	var killed atomic.Bool
+	fired := make(chan struct{})
 	timer := time.AfterFunc(time.Duration(timeoutSec)*time.Second, func() {
-		killed.Store(true)
+		close(fired)
 		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
 			_ = cmd.Process.Kill() // 组已不存在时兜底杀顶层
 		}
@@ -281,6 +281,8 @@ func toolBash(args map[string]interface{}) (string, error) {
 	defer timer.Stop()
 
 	waitErr := cmd.Wait()
+	timer.Stop() // 先停表再判定：否则"恰好在上限那一刻正常完成"的命令会被标成被强杀
+	timedOut := killedByLimit(fired, waitErr)
 	code := 0
 	if waitErr != nil {
 		if ee, ok := waitErr.(*exec.ExitError); ok {
@@ -293,7 +295,7 @@ func toolBash(args map[string]interface{}) (string, error) {
 	if len(guardNotes) > 0 { // 不拦，只把看不见的连带后果说出来（一次输出，不多一轮）
 		head = strings.Join(guardNotes, "\n") + "\n" + head
 	}
-	if killed.Load() {
+	if timedOut {
 		// 光说"已超时"不够：模型分不清"命令自己失败"与"被上限杀掉"，会误判重试。
 		// 给出上限值与出路（脱离进程组 / 调大配置）。
 		head += fmt.Sprintf("（超过 %d 秒上限被强制终止；要跑更久：systemd-run --user 或 setsid 完全脱离进程组，或调大配置 tools.timeout_sec）", timeoutSec)
@@ -359,6 +361,22 @@ func requireStr(args map[string]interface{}, key string) (string, bool) {
 }
 
 // randHex n 字节的十六进制随机串（临时脚本文件名去重用）
+// killedByLimit 这次工具输出是否"被时长上限杀掉"。只看计时器会误报：进程自己退出后
+// 计时器仍可能触发（2026-11-13 四方审计 R6）。要求两条同时成立：计时器开过火，
+// 且进程是被动信号结束（Wait 返回信号退出，ExitCode 为负）。
+func killedByLimit(fired <-chan struct{}, waitErr error) bool {
+	select {
+	case <-fired:
+	default:
+		return false
+	}
+	ee, ok := waitErr.(*exec.ExitError)
+	if !ok {
+		return false
+	}
+	return ee.ExitCode() < 0
+}
+
 func randHex(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {

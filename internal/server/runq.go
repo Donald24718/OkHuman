@@ -25,6 +25,14 @@ func broadcastEvent(state *AppState, e types.AgentEvent) {
 		state.mu.Unlock()
 	}
 	payload := fmt.Sprintf("event: %s\ndata: %s\n\n", strOf(e["type"]), jsonStr(e))
+	// StartLen 必须在**取 state.mu 之前**读会话（2026-11-13 四方审计 R1）：另一条路径
+	// （Manager.Compose 持 cm.mu → inject 解析失败 → onFail）要取 state.mu，两边各持一半
+	// 就是死锁环，且没有超时可救。这里允许微竞：run_start 广播紧在 AddMessage(user)
+	// 之前，此刻的消息数就是"本轮之前的历史长度"，与原来在锁内读的语义一致。
+	startLen := 0
+	if e["type"] == "run_start" && state.Agent != nil {
+		startLen = len(state.Agent.CM().Session().Messages)
+	}
 	state.mu.Lock()
 	// 轮次缓冲（重放用）：run_start 起新缓冲（round=当前 session），其间逐帧追加；
 	// run_end 保留（结束后才连上的订阅者仍能重放该轮）。/reset 使 session 变化后
@@ -35,7 +43,7 @@ func broadcastEvent(state *AppState, e types.AgentEvent) {
 		// StartLen：run_start 广播在 AddMessage(user) 之前（agent.run 顺序），
 		// 此刻的消息数即"当前轮之前的历史长度"——/history 据此截断（2026-09-19 修复：
 		// 旧实现刷新时 /history 已含本轮已完成 LLM 调用的条目，重放又整轮重流 → 重复渲染）。
-		state.RoundBuf = &roundBuf{Round: int(state.Agent.SessionNo.Load()), Frames: []string{payload}, StartLen: len(state.Agent.CM().Session().Messages)}
+		state.RoundBuf = &roundBuf{Round: int(state.Agent.SessionNo.Load()), Frames: []string{payload}, StartLen: startLen}
 	} else if e["type"] == "run_end" {
 		// 轮次结束清缓冲（2026-09-19）：重放条件是 running，run_end 后 running=false，
 		// 保留旧缓冲只会让"刚结束瞬间"的 /history 截断与无重放错配（条目丢失）。
@@ -143,7 +151,7 @@ func assembleBatch(msgs []types.QueuedMessage) (message, kind string, label *str
 	}
 	msg := strings.Join(parts, "\n")
 	// 数的是**真正发给 agent 的那条拼接串**（含【第 i 条】前缀与分隔）；
-	// 早先只把各条原文相加，标签里的 M 偏小（2026-11-12 复审指出）。
+	// 早先只把各条原文相加，标签里的 M 偏小（2026-11-12 审查指出）。
 	l := fmt.Sprintf("%d 条合并 / %d 字符", len(msgs), textutil.UTF16Len(msg))
 	return msg, "merged", &l, len(msgs)
 }
@@ -176,7 +184,7 @@ func enqueueAndWake(state *AppState, a *AgentState, msg string, kind string, onE
 		// run 内部 panic 隔离（2026-09-14 审计修：旧实现 panic 直接崩掉整个
 		// HTTP 进程；现在转成错误结果——消息队列保留、下次入口重试，ActiveDrain
 		// 同步摘除避免后续入队挂在死 handle 上）
-		reply, ms, err := func() (string, int64, error) {
+		_, _, err := func() (string, int64, error) {
 			var r2 string
 			var m2 int64
 			var innerErr error
@@ -193,7 +201,6 @@ func enqueueAndWake(state *AppState, a *AgentState, msg string, kind string, onE
 			r2, m2, innerErr = runDrain(state, a, h, onEvent)
 			return r2, m2, innerErr
 		}()
-		h.res = drainResult{Reply: reply, MS: ms, Err: err}
 		if err != nil {
 			// 错误广播只在此处发生一次（drain 层，2026-08-31 修）：多个入口
 			// 共享同一 drain，若各自广播 → 错误卡重复出现。
@@ -241,10 +248,12 @@ func makeOnEvent(state *AppState, a *AgentState) func(types.AgentEvent) {
 	}
 }
 
-// queuedItems 队列条目的结构化投影（text + kind）：webui 据此分"系统通知 /
+// copyQueue 复制一份队列快照（读侧不持锁时用；MessageQueue 会被整体替换，
+// 但复制能避免与后续 append 共享底层数组）。此前它叫 queuedItems 并被描述成
+// "结构化投影（text + kind）"——那层投影早已不存在，函数只是恒等拷贝。系统通知 /
 // 用户"气泡，不必再在前端硬编码前缀去猜。旧的 queued 字段照旧输出
 // （queuedTexts），外部消费者协议不变——新增字段向后兼容。
-func queuedItems(qs []types.QueuedMessage) []types.QueuedMessage {
+func copyQueue(qs []types.QueuedMessage) []types.QueuedMessage {
 	if len(qs) == 0 {
 		return nil
 	}
@@ -355,7 +364,7 @@ func startHeartbeat(state *AppState, a *AgentState, tickMS int) func() {
 			}
 			state.LastRunEnd.Store(now)
 			fmt.Fprintf(os.Stderr, "[heartbeat] 空闲 %d 分钟无 run → 主动开启一轮（阈值 %d 分钟）\n",
-				(now-last)/60000, hb.IntervalMin)
+				(now-last)/60000, hb.IntervalMinOrDefault())
 			// 心跳走 user：它只在空闲时起新轮（heartbeatDue 见 running 直接
 			// 不触发），不会搭车 → 行为与改动前逐字一致。
 			enqueueAndWake(state, a, hb.Prompt, types.QueueKindUser, makeOnEvent(state, a))

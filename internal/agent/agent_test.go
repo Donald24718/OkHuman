@@ -13,16 +13,6 @@ import (
 	"okhuman/internal/types"
 )
 
-// newTestAgent 建带 FakeLLM 的 agent（压缩阈值拉满，测试内不触发压缩）
-func newTestAgent(steps []llm.FakeStep) (*Agent, *llm.FakeLLM) {
-	fake := llm.NewFakeLLM(steps)
-	cm := ctxmgr.NewManager(fake, ctxmgr.Cfg{
-		MaxTokens: 1000000, KeepRecentChars: 60000, HardTruncChars: 50000,
-		StreamIdleMS: 30000, CharsPerToken: 2,
-	}, "系统提示", t0TempDir())
-	return New(fake, "系统提示", cm), fake
-}
-
 func t0TempDir() string { return "/tmp/okhuman-agent-test" }
 func testRunOpt() RunOptions {
 	return RunOptions{

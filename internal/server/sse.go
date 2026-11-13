@@ -1,7 +1,6 @@
 package server
 
 import (
-	"fmt"
 	"net/http"
 	"sync"
 )
@@ -59,10 +58,6 @@ func (c *sseConn) close() {
 
 // noFlusher 是不支持 Flush 时的退路（nil 接口调用会在 goroutine 里 panic）。
 type noFlusher struct{}
-
-func (c *sseConn) push(event string, data interface{}) {
-	c.write(fmt.Sprintf("event: %s\ndata: %s\n\n", event, jsonStr(data)))
-}
 
 func (c *sseConn) write(payload string) {
 	c.mu.Lock()

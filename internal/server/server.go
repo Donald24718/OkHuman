@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -51,7 +52,7 @@ type noisyCounter struct {
 // 同源策略——而那道屏障对"简单请求"不设防：POST + Content-Type: text/plain 不触发
 // preflight，任何网页上的 JS 都能把 /enqueue、/config、/reset、/inject 打到
 // http://127.0.0.1:8451，服务器照样执行（响应读不到，副作用已经发生）。本机 agent
-// 有 bash 能力，于是"用户打开了一个恶意网页"可以直接变成"实例被人下指令"。
+// 有 bash 能力，于是"主人打开了一个恶意网页"可以直接变成"实例被人下指令"。
 // DNS rebinding 还能把 Host 变成 evil.example 指到本机。
 //
 // 规则：Host 必须是本机地址（挡住 rebinding）；带 Origin 的请求必须来自本机同源
@@ -77,15 +78,22 @@ func (ap *App) handleReset(w http.ResponseWriter, r *http.Request) {
 	// 互斥，等当前轮完全结束后才原子换运行时（在飞的是长工具时最长等其结束）。
 	a.Agent().Stop()
 	recordPath, recordedMsgs, recordErr := "", 0, error(nil)
+	injErr := error(nil)
 	a.Lock.Run(func() error {
 		// 重置前先把旧会话全文落盘（2026-10-18 用户定）：下面整体换掉 Manager，
 		// 旧会话原文除压缩存档外就无处可寻了。放在换入之前 → 文件名带的还是旧会话号。
 		recordPath, recordedMsgs, recordErr = a.CM().DumpSessionRecord("重置会话")
+		// 收件目录随会话清空。删除失败必须看得见，而且这时**不能**把 InjectSeq 归零：
+		// 新附件会从 inj-1 重新编号，盖住残留的旧侧车（与当年"重启后附件编号复用"同形态）。
+		// 2026-11-13 四方审计 #16。
+		injErr = os.RemoveAll(ap.injectDirOf())
 		a.SessionNo.Add(1)
 		ap.state.mu.Lock()
 		ap.state.MessageQueue = nil // 未发消息随会话清除（2026-08-31）
 		ap.state.Injects = nil      // 上下文注入附件随会话清除（2026-09-11）
-		ap.state.InjectSeq = 0
+		if injErr == nil {
+			ap.state.InjectSeq = 0 // 只有收件目录真被清空才重新从 1 编号
+		}
 		ap.state.RoundBuf = nil // 轮次事件缓冲随会话清除（重放不再带旧轮）
 		ap.state.RunSeq = 0     // 会话内轮次计数随会话清除（新会话从 1 重新计）
 		ap.state.mu.Unlock()
@@ -97,7 +105,6 @@ func (ap *App) handleReset(w http.ResponseWriter, r *http.Request) {
 		if res := ap.resolver.Load(); res != nil {
 			res.ClearCache("")
 		}
-		_ = os.RemoveAll(ap.injectDirOf())
 		ap.reconfigureResolver()
 		// 重建三件套并整体原子换入（2026-09-14 审计修：/inject 等不持运行锁的
 		// 路径经 CM()/Agent()/BG() 访问器取当前运行时，换入后自动指向新会话）
@@ -114,6 +121,9 @@ func (ap *App) handleReset(w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	})
+	if injErr != nil {
+		ap.state.logf("[reset] 收件目录清空失败：%v（附件计数保持递增，避免新附件盖住残留侧车）", injErr)
+	}
 	if recordPath != "" {
 		ap.state.logf("[reset] 旧会话全文已落盘：%s（%d 条消息）", recordPath, recordedMsgs)
 	} else if recordErr != nil {
@@ -130,6 +140,12 @@ func (ap *App) handleReset(w http.ResponseWriter, r *http.Request) {
 				return ""
 			}
 			return recordErr.Error()
+		}(),
+		"inject_error": func() string { // 收件目录没清干净也必须看得见
+			if injErr == nil {
+				return ""
+			}
+			return injErr.Error()
 		}(),
 	})
 }
@@ -320,7 +336,7 @@ var noisyGetPaths = map[string]bool{
 	"/queue": true, "/status": true, "/health": true, "/history": true, "/events/poll": true,
 }
 
-// noisyLogWindow 高频端点汇总行的最小间隔（2026-10-19 用户定：一小时一行）。
+// noisyLogWindow 高频端点汇总行的最小间隔（2026-10-19 主人定：一小时一行）。
 // 按时间窗而不是按次数：按次数（曾定 3000）依赖速率恒定，WebUI 多开一个标签页
 // 或关掉，换算就失真；按时间窗则与速率无关，且每行报的是这一小时内的次数，
 // 速率涨跌一眼能看出来。每个端点独立计时，互不影响。
@@ -342,8 +358,9 @@ var numChecks = map[string]func(interface{}) bool{
 	"stream_idle_sec":    func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 && n <= 3600 },      // ≤1h（秒）
 	"max_response_bytes": func(v interface{}) bool { n, ok := v.(float64); return ok && n >= 1024 && n <= 4<<30 }, // 1KB–4GiB（字节）
 	"max_tokens":         func(v interface{}) bool { n, ok := v.(float64); return ok && n > 100 },
-	// keep_summaries：摘要窗口条数。0/负数 = 完全不保留摘要（失忆）；>20 无意义且
-	// 会成倍吃上下文，所以给一个宽但有限的界。
+	// keep_summaries：摘要窗口条数。下限 1：0/负值在语义上是"压掉原文却一条摘要都不留"，这个组合
+	// 没人要，而且会被 context.NormalizeCfg 静默兜成 5 —— 所以直接拒绝，不接受后再偷偷改写。
+	// 上限 20：摘要本身也吃上下文，更多只会成倍挤掉原文。
 	"keep_summaries": func(v interface{}) bool { n, ok := v.(float64); return ok && n >= 1 && n <= 20 },
 	// summary_max_chars：单条摘要正文硬上限。过小（<1000）会把摘要压成索引，
 	// 过大（>200k）则"摘要比原文预算还长"，自相矛盾。
@@ -541,6 +558,16 @@ func (ap *App) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, 400, map[string]interface{}{"error": fmt.Sprintf("%s.%s 类型非法：%s（需 %s）", section, k, string(vb), tc.want)})
 				return
 			}
+			if kk := config.KnownKeys(section); len(kk) > 0 && !kk[k] {
+				names := make([]string, 0, len(kk))
+				for n := range kk {
+					names = append(names, n)
+				}
+				sort.Strings(names)
+				writeJSON(w, 400, map[string]interface{}{"error": fmt.Sprintf(
+					"未知配置键：%s.%s（这一段可写：%s）", section, k, strings.Join(names, ", "))})
+				return
+			}
 			if chk, ok := numChecks[k]; ok && !chk(v) {
 				vb, _ := json.Marshal(v)
 				writeJSON(w, 400, map[string]interface{}{"error": fmt.Sprintf("%s.%s 数值非法：%s", section, k, string(vb))})
@@ -630,7 +657,7 @@ func (ap *App) handleQueue(w http.ResponseWriter, r *http.Request) {
 	a := ap.state.Agent
 	ap.state.mu.Lock()
 	queued := queuedTexts(ap.state.MessageQueue)
-	qItems := queuedItems(ap.state.MessageQueue) // 同一把锁内取快照（锁外读队列 = 竞态）
+	qItems := copyQueue(ap.state.MessageQueue) // 同一把锁内取快照（锁外读队列 = 竞态）
 	running := a.Lock.Running() || ap.state.ActiveDrain != nil
 	ap.state.mu.Unlock()
 	// 快照取一次（2026-09-14 审计修：旧代码每次迭代都调 Session() 取活引用，

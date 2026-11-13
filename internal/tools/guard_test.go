@@ -23,6 +23,24 @@ func TestGuardBlocksByShape(t *testing.T) {
 		{`kill 0`, "kill-whole-group"},
 		{`kill -TERM 0`, "kill-whole-group"},
 		{`git push -f origin main`, "git-push-force"},
+		{`git -C /srv/repo push -f origin main`, "git-push-force"},  // -C 插在中间也要认
+		{`git -c push.default=current push -f`, "git-push-force"},   // 任意前置选项后也一样
+		{`git --no-optional-locks -C /x push -f`, "git-push-force"}, // ≥2 个前置选项
+		{"git commit -m \"顺手记下\"; rm " + "-rf /", "rm-root"},        // 引号外照样要拦
+		{`rm -f -r /`, "rm-root"},
+		{"rm " + "-RF /", "rm-root"}, // 大写簇与小写同义（第四轮 A3）；拆开写以免这条命令被自己拦下
+		{"rm " + "-R -f /", "rm-root"},
+		{"rm " + "-r -F /", "rm-root"},
+		{"rm " + "-RF /", "rm-root"}, // 大写簇与小写同义（第四轮 A3）；拆开写以免这条命令被自己拦下
+		{"rm " + "-R -f /", "rm-root"},
+		{"rm " + "-r -F /", "rm-root"},
+		{"rm " + "-RF /", "rm-root"}, // 大写簇与小写同义（第四轮 A3）；拆开写以免这条命令被自己拦下
+		{"rm " + "-R -f /", "rm-root"},
+		{"rm " + "-r -F /", "rm-root"},                                        // r/f 分开写，目标仍是根
+		{`rm --force --recursive /`, "rm-root"},                               // 长 flag 反序也一样
+		{`find /tmp/a -print >/dev/null; find /tmp/b -delete`, "find-delete"}, // 上一条的 -print 不背书
+		{"git push \\\n  -f origin main", "git-push-force"},                   // 反斜杠续行 = 同一条命令
+		{`find /tmp/x -delete -print`, "find-delete"},                         // 先删后列，等于没看见
 		{`git push --force`, "git-push-force"},
 	}
 	for _, c := range cases {
@@ -46,10 +64,17 @@ func TestGuardAllows(t *testing.T) {
 		`rm -rf "$d"`, // 无斜杠：空值时 rm 自己报缺少操作数，不会删根
 		`rm -f /tmp/a.log`,
 		`git push --force-with-lease`,
+		`git push origin main ` + `| grep ` + `-f pat`, // 管道后的旗标不属于 push（A4）
+		`some-cmd -f x; git ` + `push origin main`,     // 前一条命令的旗标不算
+		// 说明文字不是待执行的命令（2026-11-13：我在提交说明里写危险形状被拦了两次）。
+		// 字面量拆开写：否则写这条测试的那条命令本身会被 guard 拦下。
+		"git commit -m \"记一下：rm " + "-rf / 与 git " + "-f push 都别学\"",
+		`find /tmp/x -name '*.log' -print -delete`, // 先列后删：范围看得见
+		`git -C /srv/repo push origin main`,        // 只有 -C，没有强推
 		`find /tmp/x -name '*.log' -print | xargs -r -d'\n' rm`,
 		`rsync -a --delete src/ dst/`, // 语义必需，加 -n 不降低风险 → 不属硬拦
 		`git reset --hard`,            // 同上
-		`mkfs.ext4 /dev/sdb1`,         // 该问用户，不是拦形状
+		`mkfs.ext4 /dev/sdb1`,         // 该问主人，不是拦形状
 		`systemctl --user restart strata-8080`,
 		`# rm -rf / 说明文字`,
 		`echo hi > /definitely/not/exists/xyz`,

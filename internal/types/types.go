@@ -58,11 +58,15 @@ func (p *ContentPart) UnmarshalJSON(b []byte) error {
 		return fmt.Errorf("part 须带非空 type 字段")
 	}
 	p.Type = t
-	if v, ok := m["text"]; ok {
-		_ = json.Unmarshal(v, &p.Text)
-	}
-	if v, ok := m["ref"]; ok {
-		_ = json.Unmarshal(v, &p.Ref)
+	// text/ref 与上面的 type 同一口径：类型不对就报错。以前 _ = 把错误丢掉，
+	// {"text":123} 会被解析成空文本 → 这条消息按 0 字符计预算、拼给模型的正文里
+	// 这段直接消失，且与保留下来的 Raw 字节不一致（2026-11-13 第四轮审计）。
+	for name, dst := range map[string]*string{"text": &p.Text, "ref": &p.Ref} {
+		if v, ok := m[name]; ok {
+			if err := json.Unmarshal(v, dst); err != nil {
+				return fmt.Errorf("part.%s 字段类型非法: %w", name, err)
+			}
+		}
 	}
 	p.Raw = append(json.RawMessage(nil), b...)
 	return nil
@@ -81,22 +85,17 @@ func RefPart(id string) ContentPart {
 }
 
 // FromPartMap 从通用 map 构造（server/persist 解析路径；map marshal 键序归一，
-// 内容逐字节确定 → 前缀稳定）
+// FromPartMap 从已解码的 map 构造 part。规则只有一份实现：转成 JSON 后走
+// ContentPart.UnmarshalJSON（2026-11-13 第四轮 A5：这里曾自己实现一遍，对非字符串的
+// text/ref 静默当空串，与 UnmarshalJSON 的报错口径分叉——同一个坏形状一边拒一边收）。
 func FromPartMap(m map[string]interface{}) (ContentPart, error) {
-	t, ok := m["type"].(string)
-	if !ok || t == "" {
-		return ContentPart{}, fmt.Errorf("part 须为带非空 type 的对象")
-	}
-	raw, err := json.Marshal(m)
+	b, err := json.Marshal(m)
 	if err != nil {
 		return ContentPart{}, err
 	}
-	p := ContentPart{Type: t, Raw: raw}
-	if v, ok := m["text"].(string); ok {
-		p.Text = v
-	}
-	if v, ok := m["ref"].(string); ok {
-		p.Ref = v
+	var p ContentPart
+	if err := p.UnmarshalJSON(b); err != nil {
+		return ContentPart{}, err
 	}
 	return p, nil
 }
@@ -270,6 +269,20 @@ func StringPtr(s string) *string { return &s }
 func AsParts(c Content) []ContentPart {
 	if p, ok := c.([]ContentPart); ok {
 		return p
+	}
+	// 从磁盘/请求解码回来的 content 是 []interface{}（Go 不知道我们要 ContentPart）。
+	// 只认第一种会让重启后的附件消息静默变成空正文：按 0 字符计预算、拼给模型时
+	// 整段消失，而且没有任何报错（2026-11-13 第四轮审计）。
+	if arr, ok := c.([]interface{}); ok {
+		b, err := json.Marshal(arr)
+		if err != nil {
+			return nil
+		}
+		var ps []ContentPart
+		if err := json.Unmarshal(b, &ps); err != nil {
+			return nil
+		}
+		return ps
 	}
 	return nil
 }

@@ -29,7 +29,8 @@ type ClientConfig struct {
 	APIKey    string
 	TimeoutMS int // 整体请求超时（complete 非流式用；流式另有空闲超时）
 	// StreamIdleMS 主循环流式空闲超时（2026-10-18 A5，来自 llm.stream_idle_sec）：
-	// CompleteStream 传 idleMs=0 时用这个值，不再回落到 max(timeout_ms, 10 分钟)。
+	// CompleteStream 传 idleMs=0 时用这个值；**未配置或 ≤0 时仍回落到 max(llm.timeout_sec, 10 分钟)**
+	// （见 idleFallback）。default.json 不含 stream_idle_sec，所以回落就是默认生效路径。。
 	StreamIdleMS int
 	// MaxResponseBytes 单次响应总量上限（字节，0 → DefaultMaxResponseBytes）
 	MaxResponseBytes int64
@@ -48,9 +49,6 @@ func (c *OpenAiClient) SetLogger(fn func(string)) { c.logf = fn }
 func NewOpenAiClient(cfg ClientConfig) *OpenAiClient {
 	return &OpenAiClient{cfg: cfg, http: &http.Client{}}
 }
-
-// Config 返回当前构造参数（热更新比对用）
-func (c *OpenAiClient) Config() ClientConfig { return c.cfg }
 
 // ---------- 响应体量闸（2026-10-18 健壮性修 A） ----------
 //
@@ -208,21 +206,11 @@ func (c *OpenAiClient) newReq(ctx context.Context, data []byte) (*http.Request, 
 
 func newCallID() string {
 	var b [4]byte
-	_, _ = rand.Read(b[:])
+	if _, err := rand.Read(b[:]); err != nil {
+		// 熵源失败不能静默：全零 id 会让同一轮的多个 tool_call 互撞（应答错配）
+		return fmt.Sprintf("call_fb%x", time.Now().UnixNano())
+	}
 	return "call_" + hex.EncodeToString(b[:])
-}
-
-// ---------- 非流式（压缩请求用） ----------
-
-type wireMessage struct {
-	Content          *string        `json:"content"`
-	ReasoningContent *string        `json:"reasoning_content"`
-	ToolCalls        []wireToolCall `json:"tool_calls"`
-}
-
-type wireToolCall struct {
-	ID       *string       `json:"id"`
-	Function *wireFunction `json:"function"`
 }
 
 type wireFunction struct {

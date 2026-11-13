@@ -36,6 +36,17 @@ func NewResolver(dir string, onFail func(id, reason string)) *Resolver {
 }
 
 // Resolve id → parts。永不返回 nil（失败时返回确定性错误存根）。
+func (r *Resolver) failLocked(id, reason string) []types.ContentPart {
+	DropInjectFile(r.dir, id)
+	if r.onFail != nil {
+		r.onFail(id, reason)
+	}
+	stub := []types.ContentPart{types.TextPart(fmt.Sprintf("（附件 %s 载入失败，已移除：%s）", id, reason))}
+	r.stubCache[id] = stub
+	fmt.Printf("[inject] %s 载入失败（%s）→ 已移除，报错已回传 LLM\n", id, reason)
+	return stub
+}
+
 func (r *Resolver) Resolve(id string) []types.ContentPart {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -46,40 +57,28 @@ func (r *Resolver) Resolve(id string) []types.ContentPart {
 		return hit
 	}
 	p := filepath.Join(r.dir, id+".json")
-	var reason string
 	if _, err := os.Stat(p); err != nil {
-		reason = "侧车文件缺失"
-	} else {
-		data, err := os.ReadFile(p)
-		if err != nil {
-			reason = "侧车内容损坏或为空"
-		} else {
-			var v []interface{}
-			if err := json.Unmarshal(data, &v); err != nil || len(v) == 0 {
-				reason = "侧车内容损坏或为空"
-			} else {
-				parts, ok := parseParts(v)
-				if !ok {
-					reason = "侧车内容损坏或为空"
-				} else {
-					r.cache[id] = parts
-					return parts
-				}
-			}
-		}
+		return r.failLocked(id, "侧车文件缺失")
 	}
-	if reason != "" {
-		DropInjectFile(r.dir, id)
-		if r.onFail != nil {
-			r.onFail(id, reason)
-		}
-		stub := []types.ContentPart{types.TextPart(fmt.Sprintf("（附件 %s 载入失败，已移除：%s）", id, reason))}
-		r.stubCache[id] = stub
-		fmt.Printf("[inject] %s 载入失败（%s）→ 已移除，报错已回传 LLM\n", id, reason)
-		return stub
+	data, err := os.ReadFile(p)
+	if err != nil || len(data) == 0 {
+		return r.failLocked(id, "侧车内容损坏或为空")
 	}
-	return nil
+	var v []interface{}
+	if err := json.Unmarshal(data, &v); err != nil || len(v) == 0 {
+		return r.failLocked(id, "侧车内容损坏或为空")
+	}
+	parts, ok := parseParts(v)
+	if !ok {
+		return r.failLocked(id, "侧车内容损坏或为空")
+	}
+	r.cache[id] = parts
+	return parts
 }
+
+// failLocked 侧车不可用时的收口：删掉侧车、留一段会回传给 LLM 的说明、通知调用方。
+// 调用方必须持 r.mu。（此前这里是"设 reason + 层层 else + 末尾一个走不到的 return nil"，
+// 2026-11-13 复审指出那个尾巴不可达。）
 
 func parseParts(v []interface{}) ([]types.ContentPart, bool) {
 	parts := make([]types.ContentPart, 0, len(v))
@@ -117,7 +116,7 @@ func (r *Resolver) ClearCache(id string) {
 // 返回 (是否真的改写, 失败原因)。侧车不存在或已经是剥离提示 → (false, nil)：
 // 那是"没什么可剥"，不是失败。写盘失败（盘满/只读/权限）→ (false, err)，
 // 由调用方（POST /strip-injects）把原因回给用户——早先这里折成 bool，
-// 网页上只会说"剥了 0 个"，看不出是只读还是满了（2026-11-12 复审指出）。
+// 网页上只会说"剥了 0 个"，看不出是只读还是满了（2026-11-12 审查指出）。
 func StripSidecar(dir, id string) (bool, error) {
 	p := filepath.Join(dir, id+".json")
 	old, err := os.ReadFile(p)

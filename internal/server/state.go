@@ -115,6 +115,10 @@ type AppState struct {
 	LastRunEnd atomic.Int64
 	InjectSeq  int
 	Injects    []InjectInfo
+	// injectInFlight 标记"已分配 ID、还没写进会话"的注入。清扫判据是"会话里已无引用"，
+	// 对正在飞的那条必然为真——并发 /inject 会互相把它扫掉（2026-11-13 第四轮 A2：
+	// 12 路并发实测一条不剩）。字段由 state.mu 保护。
+	injectInFlight map[string]bool
 
 	// Log 落盘日志回调（main 注入 persist.Log）。2026-10-18 健壮性修 D：server 层
 	// 此前没有 logger，关键操作（手动剥离附件、重置会话落盘、附件载入失败）只能
@@ -210,10 +214,9 @@ type agentRuntime struct {
 
 // AgentState 单个 agent 的全部运行时状态（单实例）
 
-// drainHandle 活动 drain 句柄（enqueueAndWake 返回；等待 done 后读 res）
+// drainHandle 活动 drain 句柄（enqueueAndWake 返回；done 关闭即本轮结束））
 type drainHandle struct {
 	done chan struct{}
-	res  drainResult
 }
 
 // llmCfgOf config.LLMCfg → llm.ClientConfig
@@ -284,11 +287,5 @@ func pushCompressLog(a *AgentState, e ctxmgr.CompressEvent) {
 // ---------- run 入口（对应 TS runOpt / drainLoop / startDrain；Go 侧 2026-09-14 起为 runBatch / runDrain / enqueueAndWake） ----------
 
 // runOpt 本实例的 run 选项（用户消息 / 插件经 POST /enqueue 投递共用；每轮现取最新配置）
-
-type drainResult struct {
-	Reply string
-	MS    int64
-	Err   error
-}
 
 // AppState 单实例服务状态
