@@ -49,7 +49,7 @@ case <-time.After(FgTimeoutMS):        // 超时 → 转后台，不取消
 |---|---|
 | `Settled` / `SettledAt` | 结果是否已回来 |
 | `OK` | 成功/失败（结果以工具失败前缀开头即判失败）|
-| `Result` | 结果副本，表内最多存 256 KB（供 `/backgrounds` 查看）|
+| `Result` | 结果副本，表内最多存 256 KB（供 `/status` 的 `backgrounds` 字段查看）|
 | `DurationMs` | 从转后台到出结果的耗时 |
 | `Notified` | 完成通知是否已入队 |
 
@@ -143,7 +143,7 @@ KV 缓存代价，也不多发一次 LLM 调用。
 `tool_call` → `tool_result`（可能带 `backgrounded`）→ `bg_start` → `user_piggyback` →
 `doom_warn` / `doom_stop` → `done`（心跳到点则多一条 `user` 入队，走同一套事件流）
 
-**查在飞任务**：`GET /backgrounds` → `{"count":N,"running":bool,"tasks":[{call_id,tool,started_at,settled,ok,duration_ms,result_chars}]}`
+**查在飞任务**：`GET /status` 的 `backgrounds` 字段 → `{"count":N,"running":bool,"tasks":[{call_id,tool,started_at,settled,ok,duration_ms,result_chars}]}`
 
 ---
 
