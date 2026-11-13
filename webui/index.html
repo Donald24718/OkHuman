@@ -1159,7 +1159,7 @@ async function manualCompress() {
   meta.textContent = "手动压缩中…（进度见下方压缩卡片）";
   try {
     const j = await apiPost("/compress", {});
-    if (j.did) toast("已压缩：" + (j.detail || ""), false);
+    if (j.ok) toast("已压缩：" + (j.detail || ""), false);
     else toast("未压缩：" + (j.detail || "无可压内容"));
     loadStatus();
   } catch (e) {
@@ -1180,7 +1180,12 @@ async function manualStripInjects() {
   try {
     const j = await apiPost("/strip-injects", {});
     const ids = j.stripped || [];
-    toast(ids.length ? `已剥离 ${ids.length} 个附件：${ids.join(", ")}` : "没有可剥离的附件");
+    const fails = j.failed || [];
+    if (fails.length) {
+      toast(`剥离附件：成功 ${ids.length} 个，失败 ${fails.length} 个：${fails.join("；")}`, true);
+    } else {
+      toast(ids.length ? `已剥离 ${ids.length} 个附件：${ids.join(", ")}` : "没有可剥离的附件");
+    }
     loadStatus();
   } catch (e) {
     toast("剥离附件失败：" + e.message, true);

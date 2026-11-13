@@ -5,6 +5,7 @@ package prompt
 // 目录不存在 / 无 .md → 回退内置默认提示词（fallback=true，服务不因此失败）。
 
 import (
+	"okhuman/internal/textutil"
 	"os"
 	"path/filepath"
 	"sort"
@@ -145,7 +146,7 @@ func LoadPromptDir(dir string) *Loaded {
 			continue
 		}
 		text := string(data)
-		files = append(files, File{Name: name, Chars: len([]rune(text))})
+		files = append(files, File{Name: name, Chars: textutil.UTF16Len(text)})
 		chunks = append(chunks, text)
 	}
 	// 一个都没读到：回退内置默认，而不是交出空串。空提示词 = agent 没有身份、

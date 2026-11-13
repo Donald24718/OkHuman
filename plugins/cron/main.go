@@ -2,10 +2,10 @@
 //
 // 职责：管理并触发一个或多个 OkHuman 实例的定时任务。
 //   - 每个实例独立维护自己的 CronStore（落 <插件>/data/<inst-id>/cron.json，实时原子写）
-//   - 到点把任务 prompt 作为 user 消息 POST 到该实例的 /chat（同步等完整 reply）
+//   - 到点把任务 prompt 作为 user 消息 POST 到该实例的 /enqueue（入队即返，不等整轮）
 //   - 自带 HTTP 管理 API（/cron/*，按 inst 区分实例）+ 独立管理页（/）
 //
-// 与 OkHuman 零代码耦合：只依赖 HTTP 接口 POST /chat { message } → { reply }。
+// 与 OkHuman 零代码耦合：只依赖 HTTP 接口 POST /enqueue { message } → { position }。
 // 配置：config.json（插件目录）。运行：./okhuman-cron（前台常驻）。
 package main
 
@@ -978,7 +978,7 @@ func main() {
 			if errMsg == "实例不存在" || errMsg == "任务不存在" {
 				writeErr(w, 404, errMsg)
 			} else {
-				writeErr(w, 500, errMsg) // 触发失败（实例 /chat 报错）不是 404
+				writeErr(w, 500, errMsg) // 触发失败（实例 /enqueue 报错）不是 404
 			}
 			return
 		}

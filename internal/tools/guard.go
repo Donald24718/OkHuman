@@ -15,13 +15,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
-	"time"
 )
 
 // 本进程启动时刻：只有此后被改过的 .sh 才算「我这个会话写的」，才扫。
-var procStart = time.Now()
+// 变量在 tools.go 里声明（包里唯一一份，与 CleanupStaleScripts 同一时刻）。
 
 type guardFinding struct {
 	ID   string
@@ -50,7 +48,11 @@ var (
 	reKillGroup  = regexp.MustCompile(`(?:^|[;&|\s])kill(?:all)?\b[^\n]*(?:\s-?\w+\s)*(?:\s(?:0|-1|--\s-1))(?:\s|$)`)
 	reForcePush  = regexp.MustCompile(`(?:^|[;&|\s])git\s+push\b[^\n]*(?:\s-f\b|--force\b)|\s-f\s.*git\s+push`)
 	// 重定向截断：只认字面路径（含变量/通配的一律放过，避免猜错）。
-	reTrunc = regexp.MustCompile(`[^>2&]\s>\s(/[^\s"'$<>*;&|)]+)`)
+	// 只认字面绝对路径（含变量/通配的一律放过，避免猜错）。2026-11-12 修：旧式
+	// `[^>2&]\s>\s` 要求 > 前必须有一个非 >2& 字符，于是行首的 `> /path`、带 fd 的
+	// `2> /path`、以及不带空格的 `>/path` 全部漏掉（这条守卫正是拦“重定向清空已有文件”）。
+	// `>>` 追加仍不拦：第二个 > 的前一个字符是 >，第一个 > 后面又不是路径。
+	reTrunc = regexp.MustCompile(`(?:^|[^>])\s*(?:\d)?\s*>\s*(/[^\s"'$<>*;&|)]+)`)
 	// 我在执行一个脚本：bash x.sh / sh x.sh / ./x.sh
 	reRunScript = regexp.MustCompile(`(?:^|[;&|\s])(?:bash|sh|zsh|dash)\s+([^\s"';]+\.sh)|\./([^\s"';]+\.sh)`)
 )
@@ -124,9 +126,14 @@ func matchLine(line string) *guardFinding {
 			Span: clip(t), Fix: `git push --force-with-lease（远端变了就拒绝，不覆盖）`}
 	}
 	// 重定向截断已存在的文件：> 一执行就先清空，失败时内容已经没了
-	for _, m := range reTrunc.FindAllStringSubmatch(t, -1) {
-		p := m[1]
+	for _, m := range reTrunc.FindAllStringSubmatchIndex(t, -1) {
+		p := t[m[2]:m[3]]
 		if strings.HasPrefix(p, "/dev/") {
+			continue
+		}
+		// 通配/花括号目标不判：reTrunc 的字符类停在元字符处，截下来的前缀会撞上另一个
+		// 已存在的同名文件（重定向到 "/tmp/a*.txt" 被按前缀 "/tmp/a" 拦下，2026-11-13 实测）。
+		if m[3] < len(t) && strings.ContainsRune("*?[{", rune(t[m[3]])) {
 			continue
 		}
 		if st, err := os.Stat(p); err == nil && st.Mode().IsRegular() && st.Size() > 0 {
@@ -192,5 +199,3 @@ func clip(s string) string {
 	}
 	return s
 }
-
-var _ = strconv.Itoa // 保留：测试与将来参数校验共用

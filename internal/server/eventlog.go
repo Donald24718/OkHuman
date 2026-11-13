@@ -163,7 +163,7 @@ func (el *eventLog) latestSeq() int {
 	return el.nextSeq - 1
 }
 
-// splitFrames 把缓冲里的一批帧拼成一次 socket 写入（/events 协议不变）
+// joinFrames 把缓冲里的一批帧拼成一次 socket 写入（/events 协议不变）
 func joinFrames(bs []eventBatch) string {
 	var b strings.Builder
 	for _, x := range bs {

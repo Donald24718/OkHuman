@@ -9,6 +9,10 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+
+	"okhuman/internal/persist"
 )
 
 // Config 全部可调参数
@@ -149,7 +153,12 @@ func Load(root string) (*Config, error) {
 		cfg.LLM.Model = v
 	}
 	if v := os.Getenv("OKHUMAN_PORT"); v != "" {
-		if n, err := parseInt(v); err == nil {
+		n, err := parseInt(v)
+		if err != nil {
+			// 不能静默忽略：写错端口却照常起，人只会看到"实例跑到别的端口上了"
+			// （2026-11-12 审查：parseInt 修严之后，旧毛病从"当成 8451"变成"整个变量被忽略"）。
+			fmt.Fprintf(os.Stderr, "[config] OKHUMAN_PORT=%q 不是端口号，已忽略（保持 %d）\n", v, cfg.Server.Port)
+		} else {
 			cfg.Server.Port = n
 		}
 	}
@@ -204,29 +213,104 @@ func NormalizeTimeUnits(patch map[string]interface{}) []string {
 	return notes
 }
 
+// IntervalMinOrDefault 空闲心跳阈值；未配或配成非正数时退回默认值。
+// 两处消费方（/status 可观测字段、触发判定）此前各写一遍 "if <=0 取默认"，
+// 默认值一改就只改一边（2026-11-12 归并）。
+func (h HeartbeatCfg) IntervalMinOrDefault() int {
+	if h.IntervalMin <= 0 {
+		return Default().Heartbeat.IntervalMin
+	}
+	return h.IntervalMin
+}
+
 func parseInt(s string) (int, error) {
-	var n int
-	_, err := fmt.Sscanf(s, "%d", &n)
-	return n, err
+	// 不用 fmt.Sscanf：它会把尾部垃圾吞掉（"8451x" 当成 8451），端口这类值写错
+	// 就会静默绑到别处（2026-11-12 审查）。
+	return strconv.Atoi(strings.TrimSpace(s))
 }
 
 // DeepMerge 把 patch 深合并进 cfg（热更新 / 补丁落盘共用）。
 // 返回新 Config（不修改原对象）；patch 非对象值直接覆盖。
 func DeepMerge(cfg *Config, patch map[string]interface{}) *Config {
 	NormalizeTimeUnits(patch)
-	merged := cfgToMap(cfg)
-	mergeMap(merged, patch)
-	out := Default()
-	applyMap(out, merged)
-	return out
+	return deepMergeConfig(cfg, patch)
 }
 
-// ApplyPatchInPlace 热更新用：patch 深合并进 cfg 自身（单实例全局活对象语义）
-func ApplyPatchInPlace(cfg *Config, patch map[string]interface{}) {
-	NormalizeTimeUnits(patch)
-	merged := cfgToMap(cfg)
-	mergeMap(merged, patch)
-	applyMap(cfg, merged)
+// 并发：本函数的读-改-写不是原子的，**调用方负责串行化**（main.cfgSaveMu 持有）。
+// SaveUserPatch 把补丁合并进 <root>/config/user.json —— 热更新唯一的落盘路径。
+// 这里三条规则都是踩过坑加的（2026-11-12 从 main 挪进来：规则住在 main 里时，
+// config 的测试覆盖不到，而它决定的正是"下次重启生效的是什么"）：
+//  1. 读不懂就不写：user.json 是半截 JSON（外部编辑中断/掉电写一半）时拒绝保存。
+//     旧写法静默按空基线合并写回，会把用户的端口/模型/上下文上限一次清空 ——
+//     8451 那次"端口被偷"就是这个形态。
+//  2. 剥冗余叶子的基线 = Default() + config/default.json，不是裸 Default()（2026-09-15 修）：
+//     default.json 覆盖过的键，user 里"等于出厂默认"的值正是把它掰回来的覆盖，删掉即
+//     静默改变生效配置（实例身份被偷成别的端口 → 重启撞端口崩死）。
+//  3. 原子写，错误如实返回（调用方必须处理，不能只说"已保存"）。
+//
+// 时间单位不在这里换算：调用方先过 DeepMerge，它对传入 patch 就地 NormalizeTimeUnits，
+// 所以到这里的键已是 *_sec。
+func SaveUserPatch(root string, patch map[string]interface{}) error {
+	file := filepath.Join(root, "config", "user.json")
+	var cur map[string]interface{}
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("config/user.json 读不了，拒绝保存（以免覆盖原配置）：%w", err)
+		}
+		// 文件不存在 = 首次保存，空基线是对的
+	} else {
+		var d interface{}
+		if uerr := json.Unmarshal(raw, &d); uerr != nil {
+			return fmt.Errorf("config/user.json 解析失败（%v），拒绝在看不懂的配置上合并写入：%s", uerr, file)
+		}
+		m, ok := d.(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("config/user.json 顶层不是对象，拒绝写入：%s", file)
+		}
+		cur = m
+	}
+	next := map[string]interface{}{}
+	mergeMap(next, cur)
+	mergeMap(next, patch)
+
+	var base map[string]interface{}
+	if b, err := json.Marshal(Default()); err == nil {
+		var m map[string]interface{}
+		if json.Unmarshal(b, &m) == nil {
+			base = m
+		}
+	}
+	if s, err := os.ReadFile(filepath.Join(root, "config", "default.json")); err == nil {
+		var ds map[string]interface{}
+		if json.Unmarshal(s, &ds) == nil {
+			mergeMap(base, ds)
+		}
+	}
+	for secName, sec := range next {
+		secM, ok := sec.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		bsec, _ := base[secName].(map[string]interface{})
+		for k, v := range secM {
+			if bv, exists := bsec[k]; exists && jsonEqualRaw(v, bv) {
+				delete(secM, k)
+			}
+		}
+		if len(secM) == 0 {
+			delete(next, secName)
+		}
+	}
+	return persist.WriteJSONPath(file, next)
+}
+
+// jsonEqualRaw 两值 JSON 相等（同类型同值）。只用于上面"这个键的生效值和基线一样吗"，
+// 两个入参都来自 JSON 解码后的 map，所以按序列化结果比是等价的。
+func jsonEqualRaw(a, b interface{}) bool {
+	ab, err1 := json.Marshal(a)
+	bb, err2 := json.Marshal(b)
+	return err1 == nil && err2 == nil && string(ab) == string(bb)
 }
 
 // ---------- map 层深合并（与 TS deepMerge 同语义） ----------
@@ -278,37 +362,4 @@ func migrateContext(ctx *ContextCfg) {
 	if ctx.AttachmentTokens < 0 {
 		ctx.AttachmentTokens = 0
 	}
-}
-
-// DiffAgainstBase 补丁差集（2026-08-30）：patch 中"与 base 值相同"的叶子键剔除。
-// 只处理二层 {section: {key: value}} 对象。用途：user.json 落盘保持最小。
-func DiffAgainstBase(base *Config, patch map[string]interface{}) map[string]interface{} {
-	baseMap := cfgToMap(base)
-	out := map[string]interface{}{}
-	for s, secVal := range patch {
-		sec, ok := secVal.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		bsec, _ := baseMap[s].(map[string]interface{})
-		if bsec == nil {
-			bsec = map[string]interface{}{}
-		}
-		kept := map[string]interface{}{}
-		for k, v := range sec {
-			if !jsonEqual(bsec[k], v) {
-				kept[k] = v
-			}
-		}
-		if len(kept) > 0 {
-			out[s] = kept
-		}
-	}
-	return out
-}
-
-func jsonEqual(a, b interface{}) bool {
-	ab, aerr := json.Marshal(a)
-	bb, berr := json.Marshal(b)
-	return aerr == nil && berr == nil && string(ab) == string(bb)
 }

@@ -2,6 +2,7 @@ package context
 
 import (
 	"fmt"
+	"okhuman/internal/textutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,7 +68,7 @@ func TestContextStatsSummaries(t *testing.T) {
 	if st.SummaryCount != 2 {
 		t.Fatalf("SummaryCount 应为 2，实得 %d", st.SummaryCount)
 	}
-	want := utf16Len("第一条总结 abcdef") + utf16Len("第二条 中文")
+	want := textutil.UTF16Len("第一条总结 abcdef") + textutil.UTF16Len("第二条 中文")
 	if st.SummaryChars != want {
 		t.Fatalf("SummaryChars=%d 应为累加 %d", st.SummaryChars, want)
 	}
@@ -177,12 +178,15 @@ func TestDumpSessionRecord(t *testing.T) {
 		MaxTokens: 1000000, KeepRecentChars: 60000, HardTruncChars: 50000,
 		StreamIdleMS: 30000, CharsPerToken: 2,
 	}, "系统提示词ABC", dir)
-	if p, n := m.DumpSessionRecord("重置会话"); p != "" || n != 0 {
+	if p, n, _ := m.DumpSessionRecord("重置会话"); p != "" || n != 0 {
 		t.Fatalf("空会话不该落盘：%s n=%d", p, n)
 	}
 	m.AddMessage(&types.RawEntry{Role: "user", Content: "待留下的原文甲"})
 	m.AddMessage(&types.RawEntry{Role: "assistant", Content: "待留下的原文乙"})
-	path, n := m.DumpSessionRecord("重置会话")
+	path, n, derr := m.DumpSessionRecord("重置会话")
+	if derr != nil {
+		t.Fatalf("存档失败：%v", derr)
+	}
 	if n != 2 {
 		t.Fatalf("消息条数 = %d，期望 2", n)
 	}

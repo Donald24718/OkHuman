@@ -78,10 +78,3 @@ func TestComposeLocked(t *testing.T) {
 		t.Fatalf("user 消息应原样（无时间戳）: %q", u)
 	}
 }
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}

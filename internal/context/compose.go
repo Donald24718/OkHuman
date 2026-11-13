@@ -11,11 +11,12 @@ package context
 // 附件降级（2026-09-13 的"4xx 请求级降级"）已于 2026-10-18 随三级回退阶梯一并
 // 删除：触发条件写死 400/413/415 是按 llama.cpp 行为定的，换后端不成立。
 // 现在附件的剥离只有显式路径：WebUI「剥离全部注入附件」→ POST /strip-injects
-// → inject.PersistDemotion 永久回写侧车（见 server.handleStripInjects）。
+// → inject.StripSidecar 永久回写侧车（见 server.handleStripInjects）。
 
 import (
 	"fmt"
 	"math"
+	"okhuman/internal/textutil"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -51,26 +52,6 @@ func RenderSummary(idx, total int, sm types.SummaryEntry) string {
 	return strings.Join(b, "\n")
 }
 
-// TruncateUTF16 按 utf16 计数截断（与 keep_recent_chars / summary_max_chars 同口径）。
-// 第二个返回值 = 是否发生截断。
-func TruncateUTF16(s string, n int) (string, bool) {
-	if n <= 0 || utf16Len(s) <= n {
-		return s, false
-	}
-	total := 0
-	for i, r := range s {
-		w := 1
-		if r > 0xFFFF {
-			w = 2
-		}
-		if total+w > n {
-			return s[:i], true
-		}
-		total += w
-	}
-	return s, false
-}
-
 // ToolResultMarker 孤儿 tool 降级 user 文本的前缀（与旧 TS 版一致，供对比）
 const ToolResultMarker = "[工具结果"
 
@@ -83,7 +64,7 @@ var resolveInject atomic.Pointer[inject.Resolver]
 func ConfigureInjectResolver(r *inject.Resolver) { resolveInject.Store(r) }
 
 // ClearResolverCacheEntry 清全局解析器的指定 id 缓存——侧车文件被改写后必须调
-// （/strip-injects 手动剥离、/drop 删侧车），否则解析器内存缓存继续返回旧 parts，
+// （/strip-injects 手动剥离（/drop 已删）），否则解析器内存缓存继续返回旧 parts，
 // "已剥离/已删"的附件下一轮照样发出去。
 func ClearResolverCacheEntry(id string) {
 	if r := resolveInject.Load(); r != nil {
@@ -159,20 +140,6 @@ func resolveContentParts(parts []types.ContentPart) []types.ContentPart {
 	return out
 }
 
-// utf16Len 字符数（UTF-16 code units，对齐 TS text.length 口径——所有预算/
-// 统计统一用它，中文 BMP 字符各计 1、代理对计 2）
-func utf16Len(s string) int {
-	n := 0
-	for _, r := range s {
-		if r >= 0x10000 {
-			n += 2
-		} else {
-			n++
-		}
-	}
-	return n
-}
-
 // Est 估算口径：字符↔token 比例 + 单个附件的 token 成本。
 // 附件成本在配置里就是按 token 写的（context.attachment_tokens），这里换算成字符
 // 只是为了和"字符预算"（keep_recent_chars / hard_trunc_chars）同一把尺子。
@@ -200,12 +167,12 @@ func (e Est) attachChars() int {
 // contentChars 内容字符数（string=长度；parts=文本总长 + 每个非文本 part 按配置折算）
 func contentChars(c types.Content, e Est) int {
 	if s, ok := c.(string); ok {
-		return utf16Len(s)
+		return textutil.UTF16Len(s)
 	}
 	n := 0
 	for _, p := range types.AsParts(c) {
 		if p.Type == "text" {
-			n += utf16Len(p.Text)
+			n += textutil.UTF16Len(p.Text)
 		} else {
 			n += e.attachChars()
 		}
@@ -213,14 +180,20 @@ func contentChars(c types.Content, e Est) int {
 	return n
 }
 
+// MessageChars 单条消息的字符数——对外也只这一把尺子。
+// 曾经展示层（/status 的 raw_tail）自己另算一遍、附件按写死的 1000 字符计，
+// 而这里按配置 context.attachment_tokens 换算：同一次响应里两个数就漂移了
+// （2026-11-12 审查）。要字符数就调这个，别再在调用方拼一遍。
+func (e Est) MessageChars(m types.RawEntry) int { return messageChars(m, e) }
+
 // messageChars 消息字符数（content + tool_calls name+args + reasoning）
 func messageChars(m types.RawEntry, e Est) int {
 	n := contentChars(m.Content, e)
 	for _, tc := range m.ToolCalls {
-		n += len(tc.Function.Name) + len(tc.Function.Arguments)
+		n += textutil.UTF16Len(tc.Function.Name) + textutil.UTF16Len(tc.Function.Arguments)
 	}
 	if m.ReasoningContent != nil {
-		n += utf16Len(*m.ReasoningContent)
+		n += textutil.UTF16Len(*m.ReasoningContent)
 	}
 	return n
 }
@@ -232,7 +205,7 @@ func sessionChars(session *types.SessionState, est Est) int {
 		n += messageChars(e, est)
 	}
 	for _, sm := range session.Summaries {
-		n += utf16Len(sm.Content)
+		n += textutil.UTF16Len(sm.Content)
 	}
 	return n
 }
@@ -242,25 +215,20 @@ func EstimateTokens(text string, cpl float64) int {
 	if cpl <= 0 {
 		cpl = 1.5
 	}
-	return int(math.Ceil(float64(utf16Len(text)) / cpl))
+	return int(math.Ceil(float64(textutil.UTF16Len(text)) / cpl))
 }
 
-// EstimateMessageTokens 单条消息估算 token（assistant 加 tool_calls name+args 与 reasoning）
+// EstimateMessageTokens 单条消息估算 token = 字符数 / cpl。
+// 字符计数一律走 messageChars —— 同一个口径只留一处。此前这里自己又写了一遍，
+// 且只在 role=="assistant" 时计 tool_calls/reasoning、tool_calls 还按字节计（2026-11-12
+// 四方审查发现）：两条路径已经漂移，压缩预算循环走的那条会把中文参数多算 3 倍。
+// 现在非 assistant 却带 tool_calls 的条目也会被计入 —— 宁可多算也不少算。
 func EstimateMessageTokens(m types.RawEntry, e Est) int {
-	chars := contentChars(m.Content, e)
-	if m.Role == "assistant" {
-		for _, tc := range m.ToolCalls {
-			chars += utf16Len(tc.Function.Name) + utf16Len(tc.Function.Arguments)
-		}
-		if m.ReasoningContent != nil {
-			chars += utf16Len(*m.ReasoningContent)
-		}
-	}
 	cpl := e.Cpl
 	if cpl <= 0 {
 		cpl = 1.5
 	}
-	return int(math.Ceil(float64(chars) / cpl))
+	return int(math.Ceil(float64(messageChars(m, e)) / cpl))
 }
 
 // ContextStats /health 的上下文统计
@@ -301,7 +269,7 @@ func ContextStatsOf(session *types.SessionState, cpl float64, attachTokens int, 
 	var summaryTokens, summaryChars, truncCnt int
 	stats := make([]SummaryStat, 0, len(session.Summaries))
 	for _, sm := range session.Summaries {
-		ch := utf16Len(sm.Content)
+		ch := textutil.UTF16Len(sm.Content)
 		summaryChars += ch
 		summaryTokens += EstimateTokens(sm.Content, cpl)
 		if sm.Truncated {

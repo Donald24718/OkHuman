@@ -104,10 +104,7 @@ func TestStripInjectsAndManualCompress(t *testing.T) {
 	}
 
 	// 3) 攒几条消息（否则全在保留预算内，手动压缩无事可做）
-	var chat map[string]interface{}
-	if code := do(http.MethodPost, "/chat", map[string]interface{}{"message": "压缩前先说一句话，让会话里有足够多的老消息可供压缩"}, &chat); code != 200 {
-		t.Fatalf("/chat code=%d body=%v", code, chat)
-	}
+	runTurn(t, srv, "压缩前先说一句话，让会话里有足够多的老消息可供压缩")
 
 	// 4) 手动压缩：不等阈值，立刻压最旧一批。
 	//    同时订阅 /events —— 主人 2026-10-18 指出：点按钮后聊天区必须像自动压缩那样
@@ -168,7 +165,7 @@ func TestStripInjectsAndManualCompress(t *testing.T) {
 		t.Fatalf("/compress code=%d body=%v", res.code, res.body)
 	}
 	cmp = res.body
-	if did, _ := cmp["did"].(bool); !did {
+	if did, _ := cmp["ok"].(bool); !did {
 		t.Fatalf("/compress 应真的压了: %v", cmp)
 	}
 	sums := a.CM().Session().Summaries

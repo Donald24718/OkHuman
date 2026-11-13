@@ -49,7 +49,7 @@ func (l *RunLock) Running() bool { return l.running.Load() }
 //
 // 释放动作全部在 defer 内（2026-10-18 健壮性修）：旧实现把"running=false + 唤醒
 // idleWaiters + 归还令牌"写在 fn() 之后，fn panic 时整段被跳过 → 令牌永久占住、
-// running 恒 true，此后所有 run（/chat /enqueue /reset /compress / 心跳 / 后台通知）
+// running 恒 true，此后所有 run（/enqueue /reset /compress / 心跳 / 后台通知）
 // 永久阻塞，实例只能重启（实测：panic 穿过 Run 后 Running() 仍为 true，第二次 Run
 // 永久阻塞）。server 层的 recover 只把 panic 转成一条错误消息，救不了这把锁。
 // 这里不 recover——保持"panic 由上层统一隔离并报错"的既有语义，只保证锁一定归还。

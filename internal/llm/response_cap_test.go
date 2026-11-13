@@ -61,21 +61,6 @@ func TestStreamUnderCapOK(t *testing.T) {
 	}
 }
 
-// 非流式路径同样有闸（此前直接 Decode 整个 body）
-func TestCompleteResponseTooLarge(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"role":"assistant","content":"%s"}}]}`, strings.Repeat("y", 20000))
-	}))
-	defer srv.Close()
-	c := NewOpenAiClient(ClientConfig{BaseURL: srv.URL, Model: "m", TimeoutMS: 10000, MaxResponseBytes: 2048})
-	_, err := c.Complete(context.Background(), []types.Message{{Role: "user", Content: "hi"}}, nil)
-	var tl *ResponseTooLargeError
-	if !errors.As(err, &tl) {
-		t.Fatalf("非流式应报体量超限，实得：%v", err)
-	}
-}
-
 // tool_calls 槽位闸：总量闸管字节，海量小帧仍能把按 index 建的槽位表撑大
 func TestStreamToolCallSlotsCap(t *testing.T) {
 	var b strings.Builder

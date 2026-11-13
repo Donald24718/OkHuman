@@ -18,9 +18,6 @@ type recordingCut struct {
 	n    int
 }
 
-func (r *recordingCut) Complete(context.Context, []types.Message, []types.ToolSpec) (*types.Response, error) {
-	return nil, errors.New("unused")
-}
 func (r *recordingCut) CompleteStream(_ context.Context, msgs []types.Message, _ []types.ToolSpec, onDelta func(types.Delta), _ int) (*types.Response, error) {
 	r.mu.Lock()
 	cp := append([]types.Message(nil), msgs...)

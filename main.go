@@ -7,16 +7,17 @@
 //
 // 多 agent 不再内置：一个 OkHuman 进程 = 一个 agent；需要多个 agent 时
 // 起多个实例（不同端口），各自独立落盘目录、独立上下文。定时任务由独立插件仓
-// 经 POST /chat 触发本实例。
+// 经 POST /enqueue 投递本实例。
 //
 // 环境变量 OKHUMAN_FAKE=1 时用 FakeLLM（不烧 token，脚本化行为，测试用）。
 package main
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"okhuman/internal/textutil"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -40,19 +41,36 @@ func fatalf(format string, args ...interface{}) {
 	os.Exit(1)
 }
 
-// utf16Len UTF-16 code units 长度（对齐 TS text.length）
-func utf16Len(s string) int {
-	n := 0
-	for _, r := range s {
-		if r >= 0x10000 {
-			n += 2
-		} else {
-			n++
+// promptDirFromArgs 取命令行里那个**可选的**提示词目录（第一个非 flag 参数）并解析成
+// 绝对路径；没有参数则返回空串。空串或以 "-" 开头按用法错误处理（与旧内联写法同语义）。
+// 2026-11-12 从 main() 抽出：这段有三条优先级、最容易写错，且不该只能靠启动来验。
+func promptDirFromArgs(args []string) (string, error) {
+	const usage = "非法启动参数：%s（格式：可选一个提示词目录绝对路径）"
+	for _, arg := range args {
+		if arg == "" || strings.HasPrefix(arg, "-") {
+			return "", fmt.Errorf(usage, arg)
 		}
+		abs, err := filepath.Abs(arg)
+		if err != nil {
+			return "", fmt.Errorf(usage, arg)
+		}
+		return abs, nil
 	}
-	return n
+	return "", nil
 }
 
+// resolvePromptDir 提示词目录优先级：命令行给的目录 > config 里的绝对目录 >
+// root + config 里的相对目录（旧布局：default 即项目根 prompts/）。
+func resolvePromptDir(argDir, root, cfgDir string) string {
+	switch {
+	case argDir != "":
+		return argDir
+	case strings.HasPrefix(cfgDir, "/"):
+		return cfgDir
+	default:
+		return filepath.Join(root, cfgDir)
+	}
+}
 func main() {
 	// root = 可执行文件目录（TS: fileURLToPath(new URL("..", import.meta.url)) = 项目根）
 	exe, err := os.Executable()
@@ -74,32 +92,26 @@ func main() {
 
 	// ---------- 可选提示词目录（命令行第一个非 flag 参数） ----------
 	// 指定则覆盖 cfg.system_prompt.dir（解析为绝对路径）；缺省用 config 里的相对目录。
-	var promptDirRel string
-	for _, arg := range os.Args[1:] {
-		if arg == "" || strings.HasPrefix(arg, "-") {
-			fatalf("非法启动参数：%s（格式：可选一个提示词目录绝对路径）", arg)
-		}
-		abs, err := filepath.Abs(arg)
-		if err != nil {
-			fatalf("非法启动参数：%s（格式：可选一个提示词目录绝对路径）", arg)
-		}
-		promptDirRel = abs
-		break
+	promptDirAbs, err := promptDirFromArgs(os.Args[1:])
+	if err != nil {
+		fatalf("%v", err)
 	}
 
 	// ---------- 端口冲突回退（2026-09-15）：配置端口被占用 → 依次 +1 直到成功 ----------
-	// 用一次性 listener 探测（bind 成功 = 可用，随即关闭）；末尾真实服务器再绑同一端口。
-	// 探测→真实窗口毫秒级，本机仅并发启动另一个 OkHuman 才可能抢占，届时以 EADDRINUSE 明确报错。
-	// 端口若被顶走，落盘目录后缀 -<port>（下段）随实际绑定端口走，保持"一端口一目录"。
+	// 端口：直接绑到可用端口，并把绑定得到的 listener 留着交给 Serve —— 不再“探测→关闭→再监听”。
+	// 旧写法两者之间有窗口，同机并启时另一个实例可能抢走，表现为随机换端口。
+	// 占用判定用 errors.Is(EADDRINUSE)：错误文案随 Go 版本/平台变，字符串匹配不可靠。
+	// 端口若被顶走，落盘目录后缀 -<port>（下段）随实际绑定端口走，保持“一端口一目录”。
 	host := cfg.Server.Host
 	port := cfg.Server.Port
+
+	var ln net.Listener
 	for {
-		ln, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+		ln, err = net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 		if err == nil {
-			_ = ln.Close()
-			break
+			break // 直接留着这个 listener 交给 Serve：不再“关掉再重听”，免得中间被抢
 		}
-		if strings.Contains(strings.ToLower(err.Error()), "in use") {
+		if errors.Is(err, syscall.EADDRINUSE) {
 			port++
 			fmt.Fprintf(os.Stderr, "[server] 端口 %d 被占用，试 %d\n", port-1, port)
 			continue
@@ -159,15 +171,7 @@ func main() {
 
 	// 提示词：命令行目录 > config 的 system_prompt.dir（相对项目根）
 	// 命令行的绝对路径目录直接读；config 相对目录走旧布局（default 即根 prompts/）
-	var promptDir string
-	switch {
-	case promptDirRel != "":
-		promptDir = promptDirRel
-	case strings.HasPrefix(cfg.SystemPrompt.Dir, "/"):
-		promptDir = cfg.SystemPrompt.Dir
-	default:
-		promptDir = filepath.Join(root, cfg.SystemPrompt.Dir)
-	}
+	promptDir := resolvePromptDir(promptDirAbs, root, cfg.SystemPrompt.Dir)
 	loaded := prompt.LoadPromptDir(promptDir)
 
 	promptFiles := make([]server.PromptFileInfo, 0, len(loaded.Files))
@@ -210,8 +214,8 @@ func main() {
 	switch {
 	case loaded.Fallback:
 		promptSrc = "built-in default"
-	case promptDirRel != "":
-		promptSrc = fmt.Sprintf("%s/（%s）", promptDirRel, strings.Join(fileNames, ", "))
+	case promptDirAbs != "":
+		promptSrc = fmt.Sprintf("%s/（%s）", promptDirAbs, strings.Join(fileNames, ", "))
 	default:
 		promptSrc = fmt.Sprintf("%s/（%s）", cfg.SystemPrompt.Dir, strings.Join(fileNames, ", "))
 	}
@@ -223,7 +227,7 @@ func main() {
 		restored = ""
 	}
 	log(fmt.Sprintf("[OkHuman] 就绪：prompt=%s（%d 字符） | llm=%s | session#%d%s | data=%s",
-		promptSrc, utf16Len(loaded.Prompt), cfg.LLM.BaseURL, int(a.SessionNo.Load()), restored, dataDir))
+		promptSrc, textutil.UTF16Len(loaded.Prompt), cfg.LLM.BaseURL, int(a.SessionNo.Load()), restored, dataDir))
 
 	// ---------- 服务状态（单实例） ----------
 	appState := server.NewAppState(cfg, root, a)
@@ -236,7 +240,9 @@ func main() {
 			// （会话号回退 + 旧消息"复活"）。
 			a.CM().AddPersistListener(newPersistSave(p,
 				func() int { return int(a.SessionNo.Load()) }, int(a.SessionNo.Load()), log))
-			_ = p.SaveSession(&persist.Snapshot{No: int(a.SessionNo.Load()), Seq: a.CM().GetSeq(), State: a.CM().Session()})
+			if err := p.SaveSession(&persist.Snapshot{No: int(a.SessionNo.Load()), Seq: a.CM().GetSeq(), State: a.CM().Session()}); err != nil {
+				p.Log("[persist] 会话快照写入失败（下一次变更会再试）：" + err.Error())
+			}
 			log(fmt.Sprintf("[OkHuman] 会话已重置 #%d，落盘监听已重挂（空会话已落盘）", int(a.SessionNo.Load())))
 		},
 		// 只负责写盘并把错误如实返回；留痕与响应由 server 层统一做（见 handleConfigPost），
@@ -271,47 +277,12 @@ func main() {
 		Handler:           app,
 		ReadHeaderTimeout: 30 * time.Second,
 	}
-	if err := srv.ListenAndServe(); err != nil {
+	if err := srv.Serve(ln); err != nil {
 		fatalf("http 服务退出：%v", err)
 	}
 }
 
 // ---------- 全局配置补丁落盘（WebUI 配置页保存后，2026-08-29） ----------
-
-// deepMergeMaps 普通对象深合并（patch 覆盖 dst，嵌套对象递归）
-func deepMergeMaps(dst, patch map[string]interface{}) map[string]interface{} {
-	out := make(map[string]interface{}, len(dst)+len(patch))
-	for k, v := range dst {
-		out[k] = v
-	}
-	for k, v := range patch {
-		if pv, ok := v.(map[string]interface{}); ok {
-			if dv, ok2 := out[k].(map[string]interface{}); ok2 {
-				out[k] = deepMergeMaps(dv, pv)
-				continue
-			}
-		}
-		out[k] = v
-	}
-	return out
-}
-
-// jsonEqual 两值 JSON 相等（Object.is 语义：同类型同值）
-func jsonEqual(a, b interface{}) bool {
-	if af, ok := a.(float64); ok {
-		bf, ok2 := b.(float64)
-		return ok2 && af == bf
-	}
-	if as, ok := a.(string); ok {
-		bs, ok2 := b.(string)
-		return ok2 && as == bs
-	}
-	if ab, ok := a.(bool); ok {
-		bb, ok2 := b.(bool)
-		return ok2 && ab == bb
-	}
-	return false
-}
 
 // saveGlobalConfigPatch 读 user.json → 深合并补丁 → 剔"等于出厂默认"的叶子键
 // （文件保持最小）→ 原子写回
@@ -336,71 +307,16 @@ func newPersistSave(p *persist.Persistence, currentNo func() int, bornNo int, lo
 			logf(fmt.Sprintf("[persist] 丢弃迟到的会话写入：监听器属于会话 #%d，当前会话 #%d（seq=%d）", bornNo, cur, seq))
 			return
 		}
-		_ = p.SaveSession(&persist.Snapshot{No: bornNo, Seq: seq, State: s})
+		if err := p.SaveSession(&persist.Snapshot{No: bornNo, Seq: seq, State: s}); err != nil {
+			logf("[persist] 会话快照写入失败（下一次变更会再试）：" + err.Error())
+		}
 	}
 }
 
-// saveGlobalConfigPatch 把补丁合并进 config/user.json。返回写盘错误（调用方必须
-// 如实上报，不能只说"已保存"——见 OnConfigSaved）。
+// saveGlobalConfigPatch 落盘一次配置补丁。合并 / 剥冗余 / 拒绝半截 JSON 这些规则在
+// config.SaveUserPatch（那里能被测试覆盖），这里只保证"读-改-写"整段串行。
 func saveGlobalConfigPatch(root string, patch map[string]interface{}) error {
 	cfgSaveMu.Lock()
 	defer cfgSaveMu.Unlock()
-	file := filepath.Join(root, "config", "user.json")
-	var cur map[string]interface{}
-	raw, err := os.ReadFile(file)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("config/user.json 读不了，拒绝保存（以免覆盖原配置）：%w", err)
-		}
-		// 文件不存在 = 首次保存，空基线是对的
-	} else {
-		var d interface{}
-		if uerr := json.Unmarshal(raw, &d); uerr != nil {
-			// 2026-10-19 修：以前解析失败静默把 cur 留空继续合并写回 →
-			// 半截 JSON（外部编辑中断/掉电写一半）会让主人原有的全部配置
-			// （端口、模型、上下文上限）被一次无关的保存清空，下次重启就变成
-			// 默认端口/默认模型——正是此前发生过的那类"端口被偷"事故形态。
-			// 读不懂就不写：让调用方如实报错，人去查文件，比机器猜着覆盖安全。
-			return fmt.Errorf("config/user.json 解析失败（%v），拒绝在看不懂的配置上合并写入：%s", uerr, file)
-		}
-		m, ok := d.(map[string]interface{})
-		if !ok {
-			return fmt.Errorf("config/user.json 顶层不是对象，拒绝写入：%s", file)
-		}
-		cur = m
-	}
-	next := deepMergeMaps(cur, patch)
-
-	// 清理"冗余"的叶子键，文件保持最小。
-	// 基线 = 不含 user.json 的生效值（DEFAULTS+default.json），不是裸 DEFAULTS（2026-09-15 修）：
-	// default.json 覆盖过的键，user 里"等于出厂默认"的值正是把它掰回来的覆盖，删掉即静默
-	// 改变生效配置（曾发生过：user.json 里的 server.port 被删，实例身份被 default.json
-	// 偷成别的实例的端口，下次重启撞端口崩死）。
-	var base map[string]interface{}
-	if b, err := json.Marshal(config.Default()); err == nil {
-		_ = json.Unmarshal(b, &base)
-	}
-	if s, err := os.ReadFile(filepath.Join(root, "config", "default.json")); err == nil {
-		var ds map[string]interface{}
-		if json.Unmarshal(s, &ds) == nil {
-			base = deepMergeMaps(base, ds)
-		}
-	}
-	for s, sec := range next {
-		secM, ok := sec.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		bsec, _ := base[s].(map[string]interface{})
-		for k, v := range secM {
-			if bv, exists := bsec[k]; exists && jsonEqual(v, bv) {
-				delete(secM, k)
-			}
-		}
-		if len(secM) == 0 {
-			delete(next, s)
-		}
-	}
-	out, _ := json.MarshalIndent(next, "", "  ")
-	return persist.AtomicWriteFile(file, string(out))
+	return config.SaveUserPatch(root, patch)
 }

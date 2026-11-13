@@ -72,7 +72,7 @@ open http://127.0.0.1:8451/
 | browser | browserctl 轻 CLI 驱动本地 chromium（CDP）：导航、定位、填表、点击、取文本、截图；`errors` / `count` / `eval` 让 agent 写完前端自己开浏览器验 |
 | computer | 给 agent 装"手"：整屏截图注入 + X11 鼠标键盘事件 |
 | gpu-window | 独占型 GPU 的「让卡窗口」：按客户实例 `/status` 判定空闲才让重负载进程占卡，`protected` 服务不被挤走 |
-| cron | 定时任务（:8601），到点把 prompt 作为 user 消息 POST 到对应实例 /chat |
+| cron | 定时任务（:8601），到点把 prompt 作为 user 消息 POST 到对应实例 /enqueue |
 | okmon | 进程监控 + 启停管理（webui :8496） |
 | qq-channel | QQ 官方渠道桥：QQ 消息 ↔ agent 双向转发（独立常驻进程，无监听端口）；`attach <文件>` 子命令按实例声明选 bot（不必手抄 app_id）；入站附件按实例分收件口 |
 | lan-bridge | 把只绑 `127.0.0.1` 的实例透出到局域网的反向代理（token → HttpOnly cookie）；**挂多个实例时机器请求必须点名 `inst=<实例 id>`**，缺或错一律 400（不静默落默认实例）；人走 `/` 落地页 + `/pick` 切换 |

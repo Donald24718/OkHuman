@@ -70,6 +70,6 @@ go build -o okhuman-cron .                     # 改完源码必须重编（改�
 ## 解耦契约自检
 
 - [x] 独立进程、独立二进制，不 import 任何 OkHuman 模块
-- [x] 与主进程只有一条线：`POST {实例}/chat`
+- [x] 与主进程只有一条线：`POST {实例}/enqueue`
 - [x] 数据全在本目录 `data/`
 - [x] 挂掉只断定时任务，主进程与其他插件不受影响

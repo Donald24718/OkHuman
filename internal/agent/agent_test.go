@@ -51,13 +51,6 @@ func (c *failOnceClient) failIfDue() error {
 	return nil
 }
 
-func (c *failOnceClient) Complete(ctx context.Context, messages []types.Message, tools []types.ToolSpec) (*types.Response, error) {
-	if e := c.failIfDue(); e != nil {
-		return nil, e
-	}
-	return c.inner.Complete(ctx, messages, tools)
-}
-
 func (c *failOnceClient) CompleteStream(ctx context.Context, messages []types.Message, tools []types.ToolSpec, onDelta func(types.Delta), idleMs int) (*types.Response, error) {
 	if e := c.failIfDue(); e != nil {
 		return nil, e

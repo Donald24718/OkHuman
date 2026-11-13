@@ -18,9 +18,8 @@ package context
 import (
 	"context"
 	"fmt"
-	"os"
+	"okhuman/internal/textutil"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -61,7 +60,7 @@ type Cfg struct {
 // NormalizeCfg 兜底归一：窗口条数或摘要上限取到非法值时退回安全默认。
 // 为什么要在这里兜，而不只靠 /config 的校验：config/user.json 直接改文件会绕过
 // numChecks，而 keep_summaries=0 会让"窗口"变成不限制、summary_max_chars=0
-// 会让 TruncateUTF16 变成不截断 —— 两个都是静默失效。
+// 会让 textutil.UTF16Truncate 变成不截断 —— 两个都是静默失效。
 func NormalizeCfg(c Cfg) Cfg {
 	if c.KeepSummaries < 1 {
 		c.KeepSummaries = 5
@@ -85,16 +84,19 @@ type Manager struct {
 	// 最近一次压缩落盘的两个文件（session-records 全文存档 / session-summaries 总结）。
 	// 手动压缩（CompressNow）把这两个路径报给调用方，UI 才能直接给出文件位置。
 	lastRecordPath, lastSummaryPath string
-	systemPrompt                    string
-	session                         *types.SessionState
-	seq                             int
-	sessionNo                       int
-	recordDir                       string
-	runCtx                          *context.Context // 当前 run 的中止信号（压缩流用；/stop 时连压缩一起中止）
-	compressL                       []func(CompressEvent)
-	deltaL                          []func(string, types.Delta)
-	persistL                        []func(*types.SessionState, int)
-	selfInfo                        SelfInfo // 自我生命感知输入（动态注入 2026-09-20）
+	// 写存档/总结失败的原因（路径为空时用它说明为什么空；手动压缩会把这句报给调用方）
+	lastRecordErr, lastSummaryErr error
+	systemPrompt                  string
+	session                       *types.SessionState
+	seq                           int
+	sessionNo                     int
+	recordDir                     string
+	runCtx                        *context.Context // 当前 run 的中止信号（压缩流用；/stop 时连压缩一起中止）
+	compressL                     []listener[func(CompressEvent)]
+	deltaL                        []listener[func(string, types.Delta)]
+	persistL                      []listener[func(*types.SessionState, int)]
+	listenSeq                     int      // 监听器编号（按 id 注销，不按函数指针）
+	selfInfo                      SelfInfo // 自我生命感知输入（动态注入 2026-09-20）
 }
 
 // NewManager 新建（空会话）
@@ -207,47 +209,49 @@ func (m *Manager) SetRunSignal(ctx *context.Context) {
 
 // AddCompressListener 订阅压缩事件；返回注销函数
 func (m *Manager) AddCompressListener(fn func(CompressEvent)) func() {
-	m.mu.Lock()
-	m.compressL = append(m.compressL, fn)
-	m.mu.Unlock()
-	return func() {
-		m.mu.Lock()
-		m.compressL = removeFn(m.compressL, fn)
-		m.mu.Unlock()
-	}
+	return subscribe(m, &m.compressL, fn)
 }
 
 // AddCompressDeltaListener 订阅压缩思考流（compress_delta 事件）；返回注销函数
 func (m *Manager) AddCompressDeltaListener(fn func(string, types.Delta)) func() {
-	m.mu.Lock()
-	m.deltaL = append(m.deltaL, fn)
-	m.mu.Unlock()
-	return func() {
-		m.mu.Lock()
-		m.deltaL = removeFn(m.deltaL, fn)
-		m.mu.Unlock()
-	}
+	return subscribe(m, &m.deltaL, fn)
 }
 
 // AddPersistListener 订阅会话变更（落盘监听）；返回注销函数
 func (m *Manager) AddPersistListener(fn func(*types.SessionState, int)) func() {
+	return subscribe(m, &m.persistL, fn)
+}
+
+// listener 一条订阅（带编号）。
+type listener[T any] struct {
+	id int
+	fn T
+}
+
+// subscribe 追加一条订阅，返回只注销这一条的函数。
+// 为什么按 id、不按旧实现的 reflect 函数代码指针比对：那是"函数能比较"的假象。
+// 实测（本机 go1.24，2026-11-12）：同一个字面量产生的闭包会被编译器克隆、代码指针**不同**
+// （所以本仓库现有注册点没被咬到），但**同一个 func 值注册两次**、以及**同一个方法的两次
+// 方法值**（x.H）指针**相同** → 注销其一会把另一条一起删掉。按 id 注销没有这类歧义，
+// 也不依赖编译器的克隆行为。
+func subscribe[T any](m *Manager, l *[]listener[T], fn T) func() {
 	m.mu.Lock()
-	m.persistL = append(m.persistL, fn)
+	m.listenSeq++
+	id := m.listenSeq
+	*l = append(*l, listener[T]{id: id, fn: fn})
 	m.mu.Unlock()
 	return func() {
 		m.mu.Lock()
-		m.persistL = removeFn(m.persistL, fn)
+		*l = unsubscribeByID(*l, id)
 		m.mu.Unlock()
 	}
 }
 
-// removeFn 从监听器列表移除 fn（返回新列表；函数类型不可 == 比较，用 reflect 指针）
-func removeFn[T any](l []T, fn T) []T {
-	fnPtr := reflect.ValueOf(fn).Pointer()
-	out := make([]T, 0, len(l))
-	for _, f := range l {
-		if reflect.ValueOf(f).Pointer() != fnPtr {
-			out = append(out, f)
+func unsubscribeByID[T any](l []listener[T], id int) []listener[T] {
+	out := make([]listener[T], 0, len(l))
+	for _, e := range l {
+		if e.id != id {
+			out = append(out, e)
 		}
 	}
 	return out
@@ -317,17 +321,7 @@ func (m *Manager) maybeCompress() {
 		return
 	}
 	// 字符预算：从最新往前累积 ≤ keep_recent_chars 的最大条数（至少 1）
-	keep := 1
-	acc := messageChars(m.session.Messages[n-1], m.est)
-	for i := n - 2; i >= 0; i-- {
-		c := messageChars(m.session.Messages[i], m.est)
-		if acc+c > m.cfg.KeepRecentChars {
-			break
-		}
-		acc += c
-		keep++
-	}
-	batch := m.session.Messages[:n-keep]
+	batch := m.session.Messages[:n-m.keepWindowLocked()]
 	m.mu.Unlock()
 
 	if len(batch) == 0 {
@@ -342,14 +336,20 @@ func (m *Manager) maybeCompress() {
 // ctx-<会话号>-<时间戳>-seq<N>.txt），返回 (路径, 消息条数)；空会话不落盘返回 ("", 0)。
 // 用途：重置会话前保住旧会话原文——重置整体换掉 Manager，除压缩存档外旧会话无处可寻。
 // 只读会话不改结构，故与任何路径都安全（持 mu 快照写文件）。
-func (m *Manager) DumpSessionRecord(reason string) (string, int) {
+// 返回第三个值 = 写失败原因：那是旧会话原文除压缩存档外**唯一**的全文存档，
+// 静默失败 = 事后无处可寻（2026-11-13 复审指出，旧版至少响应里还看得见占位串）。
+func (m *Manager) DumpSessionRecord(reason string) (string, int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	n := len(m.session.Messages)
 	if n == 0 && len(m.session.Summaries) == 0 {
-		return "", 0
+		return "", 0, nil
 	}
-	return m.writeSessionRecordLocked(m.recordTsLocked(), reason), n
+	p, err := m.writeSessionRecordLocked(m.recordTsLocked(), reason)
+	if err != nil {
+		return "", n, err
+	}
+	return p, n, nil
 }
 
 // estimateTotalLocked 估算总 token（持锁调用）
@@ -374,8 +374,8 @@ func (m *Manager) estimateTotalLocked() int {
 func (m *Manager) doCompress(batch []types.RawEntry) {
 	m.mu.Lock()
 	ts := m.recordTsLocked()
-	recordPath := m.writeSessionRecordLocked(ts, "压缩")
-	m.lastRecordPath = recordPath
+	recordPath, recErr := m.writeSessionRecordLocked(ts, "压缩")
+	m.lastRecordPath, m.lastRecordErr = recordPath, recErr
 	beforeChars := sessionChars(m.session, m.est)
 	prefix := m.composeLocked()
 	streamIdleMS := m.cfg.StreamIdleMS
@@ -421,7 +421,7 @@ func (m *Manager) doCompress(batch []types.RawEntry) {
 		if len(batch) > 0 && len(batch) <= len(m.session.Messages) {
 			m.session.Messages = m.session.Messages[len(batch):]
 		}
-		origChars := utf16Len(res.Text)
+		origChars := textutil.UTF16Len(res.Text)
 		// 提醒行本身也计入上限：先算出提醒，再按 剩余空间 截正文 ——
 		// 保证"注入的这条正文"始终 ≤ summary_max_chars，不靠事后超一点。
 		note := ""
@@ -430,20 +430,25 @@ func (m *Manager) doCompress(batch []types.RawEntry) {
 			note = fmt.Sprintf("\n（正文已按 %d 字符上限硬截断，截断前 %d 字符）", maxChars, origChars)
 		}
 		room := maxChars
-		if n2 := maxChars - utf16Len(note); truncated && n2 > 0 {
+		if n2 := maxChars - textutil.UTF16Len(note); truncated && n2 > 0 {
 			room = n2
 		}
-		body, _ := TruncateUTF16(res.Text, room)
+		body, _ := textutil.UTF16Truncate(res.Text, room)
 		if truncated {
 			body = strings.TrimSpace(body) + note
 		}
 		// 总结正文落盘 session-summaries/（与 records 存档同名基座配对）；写失败不阻断压缩
 		var summaryPath string
-		if recordPath != "[记录写入失败]" {
-			summaryPath = m.writeSummaryFileLocked(ts, body, origChars, truncated, beforeChars, recordPath)
-		}
-		if summaryPath == "[记录写入失败]" {
-			summaryPath = ""
+		// 每轮先复位再尝试：只在出错时赋值的话，任何一次历史写失败会一直挂在
+		// CompressNow 的 detail 上（对照 lastRecordErr 每轮必赋值）。2026-11-13 复审指出。
+		m.lastSummaryErr = nil
+		if recErr == nil {
+			var sumErr error
+			summaryPath, sumErr = m.writeSummaryFileLocked(ts, body, origChars, truncated, beforeChars, recordPath)
+			if sumErr != nil {
+				summaryPath = ""
+				m.lastSummaryErr = sumErr
+			}
 		}
 		m.lastSummaryPath = summaryPath
 		entry := types.SummaryEntry{Content: body, CreatedAt: time.Now().UnixMilli(),
@@ -463,7 +468,7 @@ func (m *Manager) doCompress(batch []types.RawEntry) {
 			truncNote = fmt.Sprintf("（超 %d 上限已硬截断，原 %d 字符）", maxChars, origChars)
 		}
 		detail := fmt.Sprintf("%d 条最早消息（seq %d-%d）→ 新 1 条总结，正文 %d 字符%s；摘要窗口保留 %d 条",
-			len(batch), seqFrom, seqTo, utf16Len(body), truncNote, keepWin)
+			len(batch), seqFrom, seqTo, textutil.UTF16Len(body), truncNote, keepWin)
 		if summaryPath != "" {
 			detail += "，总结文本已落盘"
 		}
@@ -481,8 +486,8 @@ func (m *Manager) emitCompressDelta(scope string, d types.Delta) {
 	m.mu.Lock()
 	l := m.deltaL
 	m.mu.Unlock()
-	for _, fn := range l {
-		fn(scope, d)
+	for _, e := range l {
+		e.fn(scope, d)
 	}
 }
 
@@ -506,16 +511,13 @@ func (m *Manager) llmLocked() llm.LlmClient {
 // CompressNow 手动压缩（WebUI「手动压缩上下文」按钮）：不等 token 阈值，按
 // keep_recent_chars 预算把最旧一批交给 LLM 压成 summary——与 maybeCompress 同
 // 一套分批口径与同一条压缩路径，只是触发由人做。返回 (说明, 是否真的压了)。
-// 持 changeMu 与在飞 run 的 AddMessage 串行；server 侧另有一道"run 进行中拒绝"
-// 的闸（避免在 run 中途换掉会话结构）。
-func (m *Manager) CompressNow() (string, bool) {
-	m.changeMu.Lock()
-	defer m.changeMu.Unlock()
-	m.mu.Lock()
+// keepWindowLocked 从最新往前累积、不超过 keep_recent_chars 的最大条数（至少 1 条）。
+// 调用方需持 m.mu。自动压缩与手动 /compress 原本各写一遍同样的循环，两处边界一改
+// 就会只改一边（2026-11-12 归并）。
+func (m *Manager) keepWindowLocked() int {
 	n := len(m.session.Messages)
 	if n == 0 {
-		m.mu.Unlock()
-		return "会话为空，没有可压缩的内容", false
+		return 0
 	}
 	keep := 1
 	acc := messageChars(m.session.Messages[n-1], m.est)
@@ -527,7 +529,21 @@ func (m *Manager) CompressNow() (string, bool) {
 		acc += c
 		keep++
 	}
-	batch := m.session.Messages[:n-keep]
+	return keep
+}
+
+// 持 changeMu 与在飞 run 的 AddMessage 串行；server 侧另有一道"run 进行中拒绝"
+// 的闸（避免在 run 中途换掉会话结构）。
+func (m *Manager) CompressNow() (string, bool) {
+	m.changeMu.Lock()
+	defer m.changeMu.Unlock()
+	m.mu.Lock()
+	n := len(m.session.Messages)
+	if n == 0 {
+		m.mu.Unlock()
+		return "会话为空，没有可压缩的内容", false
+	}
+	batch := m.session.Messages[:n-m.keepWindowLocked()]
 	before := sessionChars(m.session, m.est)
 	m.mu.Unlock()
 	if len(batch) == 0 {
@@ -536,13 +552,18 @@ func (m *Manager) CompressNow() (string, bool) {
 	m.doCompress(batch)
 	m.mu.Lock()
 	rec, sum := m.lastRecordPath, m.lastSummaryPath
+	recErr, sumErr := m.lastRecordErr, m.lastSummaryErr
 	m.mu.Unlock()
 	detail := fmt.Sprintf("已提交压缩：%d 条最旧消息 → 新增 1 条总结（压缩前 %d 字符，窗口保留 %d 条）", len(batch), before, m.cfg.KeepSummaries)
-	if rec != "" && rec != "[记录写入失败]" {
+	if rec != "" {
 		detail += "\n全文存档：" + rec
+	} else if recErr != nil {
+		detail += "\n全文存档写入失败：" + recErr.Error()
 	}
-	if sum != "" && sum != "[记录写入失败]" {
+	if sum != "" {
 		detail += "\n总结文本：" + sum
+	} else if sumErr != nil {
+		detail += "\n总结文本写入失败：" + sumErr.Error()
 	}
 	return detail, true
 }
@@ -570,7 +591,7 @@ func (m *Manager) hardTruncateLocked(recordPath string) {
 		m.session.Messages = m.session.Messages[n-keep:]
 	}
 	ref := "[完整会话原文已存档：" + recordPath + " —— 上下文压缩失败已硬截断，需要被截掉的细节时用 bash cat/grep 抓回]"
-	if recordPath == "[记录写入失败]" {
+	if recordPath == "" {
 		ref = "[完整会话原文已存档 —— 上下文压缩失败已硬截断，需要被截掉的细节时用 bash 抓回]"
 	}
 	// 兜底不产生正文（没有 LLM 总结），只留一条带存档指针的条目；它同样受窗口约束。
@@ -592,27 +613,25 @@ func (m *Manager) recordTsLocked() string {
 // recordDir/session-summaries/<同名基座>.summary.txt（持锁调用）。与 session-records/
 // 存档不同文件夹、同名基座成对：总结供快速回忆任务轨迹（时间线/关键实体/完成状态），
 // 存档供按需抓回被压掉的细节。文件头带元信息（会话号/生成时间/轮数/前后字数/配对存档）。
-func (m *Manager) writeSummaryFileLocked(ts, text string, origChars int, truncated bool, beforeChars int, recordPath string) string {
+func (m *Manager) writeSummaryFileLocked(ts, text string, origChars int, truncated bool, beforeChars int, recordPath string) (string, error) {
 	iso := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
 	truncNote := "否"
 	if truncated {
-		truncNote = fmt.Sprintf("是（原 %d 字符 → 保留 %d 字符，上限 %d）", origChars, utf16Len(text), m.cfg.SummaryMaxChars)
+		truncNote = fmt.Sprintf("是（原 %d 字符 → 保留 %d 字符，上限 %d）", origChars, textutil.UTF16Len(text), m.cfg.SummaryMaxChars)
 	}
 	lines := []string{
 		fmt.Sprintf("# 压缩后总结 会话号=%d 生成=%s 硬截断=%s", m.sessionNo, iso, truncNote),
-		fmt.Sprintf("压缩前会话字符数=%d 本条正文字符数=%d（单实例：agent 由落盘目录 okhuman-<port>/ 标识）", beforeChars, utf16Len(text)),
+		fmt.Sprintf("压缩前会话字符数=%d 本条正文字符数=%d（单实例：agent 由落盘目录 okhuman-<port>/ 标识）", beforeChars, textutil.UTF16Len(text)),
 		"配对完整存档：" + recordPath,
 		"",
 		text,
 	}
 	dir := filepath.Join(m.recordDir, "session-summaries")
 	path := filepath.Join(dir, fmt.Sprintf("ctx-%d-%s-seq%d.summary.txt", m.sessionNo, ts, m.seq))
-	if err := os.MkdirAll(dir, 0o755); err == nil {
-		if err := persist.AtomicWriteFile(path, strings.Join(lines, "\n")); err == nil {
-			return path
-		}
+	if err := persist.WritePath(path, strings.Join(lines, "\n")); err != nil {
+		return "", err
 	}
-	return "[记录写入失败]"
+	return path, nil
 }
 
 // writeSessionRecordLocked 生成会话完整记录（recordDir/session-records/
@@ -624,7 +643,7 @@ func (m *Manager) writeSummaryFileLocked(ts, text string, origChars int, truncat
 // 人类可读的纯文本；结构固定：压缩后总结置顶 → system 提示词 → 消息按时间序。
 // 文件名毫秒精度 + seq 后缀（同毫秒不撞名）。ts 由调用方生成（doCompress 把同一 ts
 // 传给本函数与 writeSummaryFileLocked → 存档/总结同名基座配对）。
-func (m *Manager) writeSessionRecordLocked(ts, reason string) string {
+func (m *Manager) writeSessionRecordLocked(ts, reason string) (string, error) {
 	iso := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
 	var lines []string
 	lines = append(lines, fmt.Sprintf("# 会话完整记录 会话号=%d 生成=%s 触发=%s（单实例：agent 由落盘目录 okhuman-<port>/ 标识）", m.sessionNo, iso, reason))
@@ -672,12 +691,10 @@ func (m *Manager) writeSessionRecordLocked(ts, reason string) string {
 	}
 	dir := filepath.Join(m.recordDir, "session-records")
 	path := filepath.Join(dir, fmt.Sprintf("ctx-%d-%s-seq%d.txt", m.sessionNo, ts, m.seq))
-	if err := os.MkdirAll(dir, 0o755); err == nil {
-		if err := persist.AtomicWriteFile(path, strings.Join(lines, "\n")); err == nil {
-			return path
-		}
+	if err := persist.WritePath(path, strings.Join(lines, "\n")); err != nil {
+		return "", err
 	}
-	return "[记录写入失败]"
+	return path, nil
 }
 
 func joinNonEmpty(refs []string) string {
@@ -708,15 +725,15 @@ func (m *Manager) emitLocked(scope, detail, text string, truncated bool, beforeC
 		Scope:       scope,
 		Detail:      detail,
 		BeforeChars: beforeChars,
-		AfterChars:  utf16Len(text),
+		AfterChars:  textutil.UTF16Len(text),
 		Truncated:   truncated,
 		Window:      m.cfg.KeepSummaries,
 		Text:        text,
 		Thinking:    thinking,
 	}
 	l := m.compressL
-	for _, fn := range l {
-		fn(e)
+	for _, sub := range l {
+		sub.fn(e)
 	}
 }
 
@@ -728,7 +745,7 @@ func (m *Manager) emitPersist() {
 	state := m.snapshotLocked()
 	seq := m.seq
 	m.mu.Unlock()
-	for _, fn := range l {
-		fn(state, seq)
+	for _, e := range l {
+		e.fn(state, seq)
 	}
 }

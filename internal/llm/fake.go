@@ -15,7 +15,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"regexp"
+	"okhuman/internal/textutil"
 	"sync"
 	"time"
 
@@ -47,24 +47,17 @@ func NewFakeLLM(steps []FakeStep) *FakeLLM {
 	return &FakeLLM{steps: steps, Requests: [][]types.Message{}}
 }
 
-var fakeCompressScopeRe = regexp.MustCompile(`^\s*\[压缩:(single|t1|t2|history)\]`)
-
-// compressScope 末条消息的压缩 scope（非压缩请求 → "", false）
-// 压缩请求特征：末尾消息以 [压缩:scope] 开头（与主循环 tools 一致，2026-08-30 改）。
+// compressScope 末条消息的压缩 scope（非压缩请求 → "", false）。
+// 解析在 types 里与生成方共用一份字面量（见 types.CompressMarkerPrefix）。
 func (f *FakeLLM) compressScope(messages []types.Message) (string, bool) {
 	if len(messages) == 0 {
 		return "", false
 	}
-	last := messages[len(messages)-1]
-	s, ok := last.Content.(string)
+	s, ok := messages[len(messages)-1].Content.(string)
 	if !ok {
 		return "", false
 	}
-	m := fakeCompressScopeRe.FindStringSubmatch(s)
-	if m == nil {
-		return "", false
-	}
-	return m[1], true
+	return types.CompressScopeOf(s)
 }
 
 func fakeUsage() types.Usage {
@@ -88,11 +81,10 @@ func deepCopyMessages(ms []types.Message) []types.Message {
 	return out
 }
 
-// nextStep 消费一个主循环步骤（耗尽 → 占位文本步）。
-// 占位文本必须带停止指令（2026-10-17）：收笔判定无次数上限，模型不给停止指令就
-// 一直追问——夹具若返回不含指令的文本，步骤耗尽后就是无限追问 + 上下文无限增长，
-// 一路吃到 OOM（实测 TestThinkingOnlyStopLoop 少给一步，60s 超时才炸在 deepCopyMessages）。
-// 带指令 → 耗尽即收笔：少写步骤的测试由请求数/事件数断言明确报错，而不是挂死。
+// nextStep 消费一个主循环步骤（耗尽 → 交一个纯文本步，不带 tool_calls）。
+// 为什么这样就能收笔：run 循环是"模型不再要工具就结束"，纯文本步 → 本轮自然结束。
+// 旧的"必须带停止指令"要求（2026-10-17）已随停止指令机制同日整体移除，那段
+// "无限追问 + OOM"的推理不再成立；夹具少给步骤现在表现为断言失败，而不是挂死。
 func (f *FakeLLM) nextStep() FakeStep {
 	if len(f.steps) == 0 {
 		return FakeStep{Type: "text", Text: "（FakeLLM 步骤耗尽）"}
@@ -162,7 +154,8 @@ func sleepCtx(ctx context.Context, ms int) error {
 	}
 }
 
-// Complete 非流式（压缩请求走压缩路径；主循环按序消费步骤）
+// Complete 是 fake 自己的非流式出口：压缩请求统一走这里（Requests 只记一次），
+// 也有测试直接调。它**不是 LlmClient 契约的一部分**（契约只有 CompleteStream）。
 func (f *FakeLLM) Complete(ctx context.Context, messages []types.Message, tools []types.ToolSpec) (*types.Response, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -207,16 +200,12 @@ func (f *FakeLLM) CompleteStream(ctx context.Context, messages []types.Message, 
 	}
 	// 逐块（4 字符）增量，块间 sleep ChunkDelayMS（模拟生成耗时，/stop 测试用）
 	emit := func(s string, asText bool) error {
-		runes := []rune(s) // 按字符（rune）切块，对齐 TS slice 的 UTF-16 口径
-		for p := 0; p < len(runes); p += 4 {
+		// 按 UTF-16 code units 切 4 单元一块（全系统统一口径；按 rune 切时 emoji 只算 1，
+		// 块长与真实客户端看到的长度不一致）。代理对不会被切断。
+		for _, chunk := range textutil.UTF16Chunks(s, 4) {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			end := p + 4
-			if end > len(runes) {
-				end = len(runes)
-			}
-			chunk := string(runes[p:end])
 			if asText {
 				onDelta(types.Delta{Text: chunk})
 			} else {

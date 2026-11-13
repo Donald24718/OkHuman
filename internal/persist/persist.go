@@ -32,6 +32,27 @@ type Snapshot struct {
 	State *types.SessionState `json:"state"`
 }
 
+// WritePath 原子写 + 顺手保证父目录存在。此前 9 处调用点各自 open-code（现经此处写出的 8 处；
+// SaveState 例外——它写的是 Init 时已建好的目录，直接用 AtomicWriteFile）
+// "MkdirAll → AtomicWriteFile → 自己决定错误怎么办"，其中三处把 error 丢了
+// （2026-11-12 四方审查后修）。归口到这里：调用方只决定怎么报，不建目录、也不吞错误。
+func WritePath(path, data string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("建目录失败：%w", err)
+	}
+	return AtomicWriteFile(path, data)
+}
+
+// WriteJSONPath 先 MarshalIndent（缩进 2，与配置文件一致）再原子写。
+// marshal 失败也如实返回——调用方原来普遍写 `out, _ := json.MarshalIndent(...)`。
+func WriteJSONPath(path string, v interface{}) error {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return fmt.Errorf("序列化失败：%w", err)
+	}
+	return WritePath(path, string(b))
+}
+
 // AtomicWriteFile 原子写（唯一 tmp + rename）：读端永远看到完整文件。
 // tmp 名每次唯一（2026-09-14 审计修：旧固定 .tmp 名在并发 SaveSession 时
 // ——/inject 与在飞 run 各自触发落盘——互相覆盖，rename 失败会把 session.json

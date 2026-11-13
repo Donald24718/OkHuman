@@ -7,17 +7,17 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"time"
 	"testing"
+	"time"
 
 	"okhuman/internal/config"
 	"okhuman/internal/llm"
 )
 
 // TestHTTPEndToEnd（2026-09-14 审计修配套冒烟）：FakeLLM 驱动全链路——
-// /chat（队列 drain）→ /status → /config POST（COW 热更）→ /config GET（新值）
-// → /inject（侧车）→ /chat（resolve 注入）→ /reset（会话 2，三件套原子换入）
-// → /history（空）→ /chat（新会话续跑）。-race 下抓 COW/reset/队列路径的竞态。
+// /enqueue（队列 drain）→ /status → /config POST（COW 热更）→ /config GET（新值）
+// → /inject（侧车）→ /enqueue（resolve 注入）→ /reset（会话 2，三件套原子换入）
+// → /history（空）→ /enqueue（新会话续跑）。-race 下抓 COW/reset/队列路径的竞态。
 func TestHTTPEndToEnd(t *testing.T) {
 	cfg := config.Default()
 	cfg.Data.Dir = t.TempDir()
@@ -52,13 +52,9 @@ func TestHTTPEndToEnd(t *testing.T) {
 		return resp.StatusCode
 	}
 
-	// 1. /chat → 队列 drain → 回复一
-	var chat map[string]interface{}
-	if code := do(http.MethodPost, "/chat", map[string]interface{}{"message": "你好"}, &chat); code != 200 {
-		t.Fatalf("/chat code=%d body=%v", code, chat)
-	}
-	if chat["reply"] != "回复一" {
-		t.Fatalf("/chat reply=%v want 回复一", chat["reply"])
+	// 1. /enqueue → 队列 drain → 回复一（生产上行路径）
+	if got := runTurn(t, srv, "你好"); got != "回复一" {
+		t.Fatalf("reply=%q want 回复一", got)
 	}
 
 	// 2. /status：session=1、历史 2 条（user+assistant）、system_prompt fallback
@@ -109,12 +105,9 @@ func TestHTTPEndToEnd(t *testing.T) {
 		t.Fatalf("/attachments injects=%v want 1 条", injects)
 	}
 
-	// 6. /chat：compose 经 resolver 解析 inject_ref（侧车读取路径）
-	if code := do(http.MethodPost, "/chat", map[string]interface{}{"message": "看看附件"}, &chat); code != 200 {
-		t.Fatalf("/chat(2) code=%d", code)
-	}
-	if chat["reply"] != "回复二" {
-		t.Fatalf("/chat(2) reply=%v want 回复二", chat["reply"])
+	// 6. compose 经 resolver 解析 inject_ref（侧车读取路径）
+	if got := runTurn(t, srv, "看看附件"); got != "回复二" {
+		t.Fatalf("reply=%q want 回复二", got)
 	}
 
 	// 7. /reset：会话 2，运行时三件套原子换入
@@ -138,26 +131,20 @@ func TestHTTPEndToEnd(t *testing.T) {
 		t.Fatalf("history entries=%d want 0（reset 后应为空会话）", len(entries))
 	}
 
-	// 9. /chat：新会话继续跑（换入后的 CM/Agent 工作正常）
-	if code := do(http.MethodPost, "/chat", map[string]interface{}{"message": "重置后"}, &chat); code != 200 {
-		t.Fatalf("/chat(3) code=%d", code)
-	}
-	if chat["reply"] != "回复三" {
-		t.Fatalf("/chat(3) reply=%v want 回复三", chat["reply"])
+	// 9. 新会话继续跑（换入后的 CM/Agent 工作正常）
+	if got := runTurn(t, srv, "重置后"); got != "回复三" {
+		t.Fatalf("reply=%q want 回复三", got)
 	}
 
-	// 10. /queue + /backgrounds：reset 后计数归零
+	// 10. /queue + /status.backgrounds：reset 后计数归零
 	var q map[string]interface{}
 	do(http.MethodGet, "/queue", nil, &q)
 	if q["user_seq"] != float64(1) {
 		t.Fatalf("queue user_seq=%v want 1（新会话一条 user 消息）", q["user_seq"])
 	}
-	var bg map[string]interface{}
-	if code := do(http.MethodGet, "/backgrounds", nil, &bg); code != 200 {
-		t.Fatalf("/backgrounds code=%d", code)
-	}
-	if bg["count"] != float64(0) {
-		t.Fatalf("backgrounds count=%v want 0", bg["count"])
+	do(http.MethodGet, "/status", nil, &status)
+	if bgList, _ := status["backgrounds"].([]interface{}); len(bgList) != 0 {
+		t.Fatalf("backgrounds 应为空，得 %v", bgList)
 	}
 }
 
@@ -196,13 +183,14 @@ func TestHistoryTruncatedDuringRunningRound(t *testing.T) {
 		return len(h.Entries)
 	}
 
-	// 第一轮跑完（阻塞 /chat）
-	req, _ := http.NewRequest("POST", srv.URL+"/chat", strings.NewReader(`{"message":"m1"}`))
+	// 第一轮跑完（走 /enqueue 并等收口）
+	req, _ := http.NewRequest("POST", srv.URL+"/enqueue", strings.NewReader(`{"message":"m1"}`))
 	resp, err := srv.Client().Do(req)
 	if err != nil {
-		t.Fatalf("/chat#1: %v", err)
+		t.Fatalf("/enqueue#1: %v", err)
 	}
 	resp.Body.Close()
+	waitTurnDone(t, srv)
 	if n := getHistory(); n != 2 {
 		t.Fatalf("第一轮后 history=%d want 2", n)
 	}

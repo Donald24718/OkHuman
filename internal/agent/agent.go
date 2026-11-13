@@ -28,7 +28,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
+	"okhuman/internal/textutil"
 	"path/filepath"
 	"runtime/debug"
 	"sync"
@@ -201,7 +201,7 @@ func (a *Agent) CompressNowWithEvents(emit func(types.AgentEvent)) (string, bool
 	return a.cm.CompressNow()
 }
 
-// Run 处理一条用户消息（HTTP /chat 入口）：跑完整轮工具循环，返回最终文本。
+// Run 处理一条用户消息（HTTP /enqueue 入口）：跑完整轮工具循环，返回最终文本。
 // 调用方必须持有运行锁（同 agent 内串行）。
 func (a *Agent) Run(ctx context.Context, userText string, opt RunOptions) (string, error) {
 	return a.runUserMessage(ctx, userText, opt)
@@ -281,7 +281,7 @@ func (a *Agent) runUserMessage(ctx context.Context, userText string, opt RunOpti
 	start := types.AgentEvent{
 		"type":          "run_start",
 		"kind":          kind,
-		"message_chars": utf16Len(userText),
+		"message_chars": textutil.UTF16Len(userText),
 	}
 	if opt.Label != nil {
 		start["label"] = *opt.Label
@@ -361,14 +361,14 @@ func (a *Agent) FormatBackgroundNotice(task *types.PendingBackgroundTask, opt Ru
 	}
 	status = fmt.Sprintf("%s（耗时 %ss）", status, durSec)
 	head := fmt.Sprintf("%s——你此前调用 %s 时前台等待超时，已转入后台继续执行，现%s。结果如下：\n", bgNoticePrefix, task.ToolName, status)
-	if utf16Len(result) > opt.ResultLimit {
+	if textutil.UTF16Len(result) > opt.ResultLimit {
 		logPath := a.writeToolLog(opt, result)
-		tail := fmt.Sprintf("\n[已截断：完整结果 %d 字符在 %s，用 bash 的 cat / grep / tail 查看。]", utf16Len(result), logPath)
-		budget := opt.ResultLimit - utf16Len(head) - utf16Len(tail)
+		tail := fmt.Sprintf("\n[已截断：完整结果 %d 字符在 %s，用 bash 的 cat / grep / tail 查看。]", textutil.UTF16Len(result), logPath)
+		budget := opt.ResultLimit - textutil.UTF16Len(head) - textutil.UTF16Len(tail)
 		if budget < 0 {
 			budget = 0
 		}
-		return head + utf16Slice(result, budget) + tail
+		return head + textutil.UTF16Slice(result, budget) + tail
 	}
 	return head + result
 }
@@ -385,13 +385,13 @@ func (a *Agent) writeToolLog(opt RunOptions, full string) string {
 	dir := filepath.Join(opt.DataDir, "tool-results")
 	ts := time.Now().UTC().Format("2006-01-02_15-04-05")
 	path := filepath.Join(dir, fmt.Sprintf("tool-%s-%d.log", ts, toolLogSeq.Add(1)))
-	if err := os.MkdirAll(dir, 0o755); err == nil {
-		// 原子写（C2）：半截的工具全文 = 事后 cat 读到断的，正是排查时最需要完整的时候
-		if err := persist.AtomicWriteFile(path, full); err == nil {
-			return path
-		}
+	// 原子写（C2）：半截的工具全文 = 事后 cat 读到断的，正是排查时最需要完整的时候
+	if err := persist.WritePath(path, full); err != nil {
+		// 要把真实错误带出去：这条字符串会进会话与 LLM 上下文，只写"写入失败"等于
+		// 让人去猜是权限、磁盘满还是路径问题（2026-11-12 审查）。
+		return fmt.Sprintf("[文件写入失败：%v]", err)
 	}
-	return fmt.Sprintf("[文件写入失败：%s]", "写入失败")
+	return path
 }
 
 // llmCall 一次 LLM 调用（记 token 统计）。流式：delta 实时 emit（WebUI 边生成边显示）；
@@ -454,7 +454,7 @@ func (a *Agent) llmCall(ctx context.Context, emit func(types.AgentEvent), totals
 				rc = &partial.Thinking
 			}
 			a.cm.AddMessage(&types.RawEntry{Role: "assistant", Content: body, ReasoningContent: rc})
-			emit(types.AgentEvent{"type": "partial_kept", "chars": utf16Len(partial.Text)})
+			emit(types.AgentEvent{"type": "partial_kept", "chars": textutil.UTF16Len(partial.Text)})
 		}
 		return nil, err // 不猜、不降级、不重试：原样抛出，本轮终止
 	}
@@ -467,7 +467,8 @@ func (a *Agent) llmCall(ctx context.Context, emit func(types.AgentEvent), totals
 	return resp, nil
 }
 
-// streamOnce 一次流式调用（idleMs=0 → 客户端默认 max(timeout_ms,10min)）
+// streamOnce 一次流式调用（idleMs=0 → 客户端用自己的 StreamIdleMS，来自
+// llm.stream_idle_sec；2026-10-18 A5 起不再回落 max(timeout_ms,10min)）
 func (a *Agent) streamOnce(ctx context.Context, client llm.LlmClient, messages []types.Message, onDelta func(types.Delta), respOut **types.Response) error {
 	r, err := client.CompleteStream(ctx, messages, tools.Specs(), onDelta, 0)
 	if err == nil {
@@ -546,13 +547,13 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 			select {
 			case outcome := <-execDone:
 				raw := outcome.Text
-				totalChars := utf16Len(raw)
+				totalChars := textutil.UTF16Len(raw)
 				truncated := false
 				if totalChars > opt.ResultLimit {
 					// 截断：全文落 log 文件，正文留前 resultLimit 字符 + 一句 log 路径提示（模型用 bash 抓回）
 					logPath := a.writeToolLog(opt, raw)
 					truncated = true
-					raw = utf16Slice(raw, opt.ResultLimit) + fmt.Sprintf("\n[已截断：完整结果 %d 字符在 %s，用 bash 的 cat / grep / tail 查看。]", totalChars, logPath)
+					raw = textutil.UTF16Slice(raw, opt.ResultLimit) + fmt.Sprintf("\n[已截断：完整结果 %d 字符在 %s，用 bash 的 cat / grep / tail 查看。]", totalChars, logPath)
 				}
 				a.cm.AddMessage(&types.RawEntry{Role: "tool", ToolCallID: &tc.ID, Content: raw})
 				// content = 截断后 agent 实际回填给模型的内容（超长时 = 前 resultLimit 字符 + log 路径提示）
@@ -560,7 +561,7 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 			case <-time.After(time.Duration(opt.FgTimeoutMS) * time.Millisecond):
 				// 转后台（不取消）：立即回填通知，模型不必傻等
 				startedAt := time.Now().UnixMilli()
-				bgNotice := bgStartedNotice(roundMS(opt.FgTimeoutMS / 1000))
+				bgNotice := bgStartedNotice(opt.FgTimeoutMS / 1000)
 				a.cm.AddMessage(&types.RawEntry{Role: "tool", ToolCallID: &tc.ID, Content: bgNotice})
 				emit(types.AgentEvent{"type": "tool_result", "name": tc.Function.Name, "call_id": tc.ID, "truncated": false, "total_chars": 0, "backgrounded": true, "content": bgNotice})
 				emit(types.AgentEvent{"type": "bg_start", "call_id": tc.ID, "tool_name": tc.Function.Name, "timeout_ms": opt.FgTimeoutMS})
@@ -715,48 +716,4 @@ func stableKey(name string, args map[string]interface{}) string {
 func sJSON(v interface{}) string {
 	b, _ := json.Marshal(v)
 	return string(b)
-}
-
-func truncateStr(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return string(r[:n])
-}
-
-func roundMS(x int) int {
-	return int(float64(x) + 0.5)
-}
-
-// utf16Len 字符数（UTF-16 code units，对齐 TS text.length 口径）
-func utf16Len(s string) int {
-	n := 0
-	for _, r := range s {
-		if r >= 0x10000 {
-			n += 2
-		} else {
-			n++
-		}
-	}
-	return n
-}
-
-// utf16Slice 按 UTF-16 code units 截断（对齐 TS str.slice(0, n)）
-func utf16Slice(s string, n int) string {
-	if n <= 0 {
-		return ""
-	}
-	count := 0
-	for i, r := range s {
-		units := 1
-		if r >= 0x10000 {
-			units = 2
-		}
-		if count+units > n {
-			return s[:i]
-		}
-		count += units
-	}
-	return s
 }

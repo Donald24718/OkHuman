@@ -1,6 +1,7 @@
 package context
 
 import (
+	"okhuman/internal/textutil"
 	"strings"
 	"testing"
 
@@ -42,10 +43,10 @@ func TestSummaryHardTruncate(t *testing.T) {
 	if !e.Truncated {
 		t.Fatalf("未标 Truncated：%+v", e)
 	}
-	if e.OrigChars != utf16Len(long) {
-		t.Fatalf("OrigChars=%d 应为 %d", e.OrigChars, utf16Len(long))
+	if e.OrigChars != textutil.UTF16Len(long) {
+		t.Fatalf("OrigChars=%d 应为 %d", e.OrigChars, textutil.UTF16Len(long))
 	}
-	if got := utf16Len(e.Content); got > 1200 {
+	if got := textutil.UTF16Len(e.Content); got > 1200 {
 		t.Fatalf("正文（含提醒行）%d 超上限 1200", got)
 	}
 	if !strings.Contains(e.Content, "硬截断") {
@@ -106,8 +107,8 @@ func TestSummaryThinkingNotCounted(t *testing.T) {
 		t.Fatalf("没有摘要（压缩未触发）")
 	}
 	e := sess.Summaries[len(sess.Summaries)-1]
-	if e.OrigChars != utf16Len("短正文") {
-		t.Fatalf("OrigChars=%d，思考被计进正文了（应为 %d）", e.OrigChars, utf16Len("短正文"))
+	if e.OrigChars != textutil.UTF16Len("短正文") {
+		t.Fatalf("OrigChars=%d，思考被计进正文了（应为 %d）", e.OrigChars, textutil.UTF16Len("短正文"))
 	}
 	if strings.Contains(e.Content, "思考") {
 		t.Fatalf("正文里混进了思考：%q", e.Content)

@@ -156,31 +156,23 @@ func TestSlowSSEClientDoesNotStallRun(t *testing.T) {
 
 	done := make(chan string, 1)
 	go func() {
-		var out map[string]interface{}
-		postJSON(ap, "/chat", map[string]interface{}{"message": "触发一轮"}, &out)
-		b, _ := json.Marshal(out)
-		done <- string(b)
+		// 错误经返回值传回主 goroutine（t.Fatal 不能在 goroutine 里调）
+		reply, err := runTurnErr(srv, "触发一轮")
+		if err != nil {
+			done <- "ERR:" + err.Error()
+			return
+		}
+		done <- reply
 	}()
 	select {
 	case body := <-done:
-		if !strings.Contains(body, "reply") {
-			t.Fatalf("run 未正常完成：%s", body[:min(300, len(body))])
+		if strings.HasPrefix(body, "ERR:") || body != big {
+			t.Fatalf("run 未正常完成：%s", short(body))
 		}
 	case <-time.After(90 * time.Second): // race 检测器下慢好几倍，别把慢当成卡
 		t.Fatal("run 被不读的 /events 客户端卡住（修 B 未生效）")
 	}
 }
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// 编译期确保 http/httptest 引用被用到（部分测试文件共享包级 import）
-var _ = http.MethodGet
-var _ = httptest.NewServer
 
 // 单次 poll 的批次上限：落后很多时不让客户端一次被整窗（最多 3MB）帧砸住，
 // 分批给、游标只推进已给的部分，客户端连续取就能追平（且不报缺口——没被挤掉）。

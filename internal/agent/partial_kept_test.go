@@ -16,9 +16,6 @@ import (
 
 type cutStream struct{}
 
-func (cutStream) Complete(context.Context, []types.Message, []types.ToolSpec) (*types.Response, error) {
-	return nil, errors.New("unused")
-}
 func (cutStream) CompleteStream(_ context.Context, _ []types.Message, _ []types.ToolSpec, onDelta func(types.Delta), _ int) (*types.Response, error) {
 	onDelta(types.Delta{Thinking: "先想一段"})
 	onDelta(types.Delta{Text: "已经生成的半截正文丢了就找不回来"})

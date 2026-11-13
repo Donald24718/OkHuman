@@ -526,7 +526,6 @@ type QQChannel struct {
 	agentLim      *WindowLimiter
 	tokenFile     string
 	onStream      func(string) error
-	onMessage     func(string) (string, error)
 	onAttachments func(string) error           // 2026-09-15 方向A：附件落盘后 /inject 路径文本通知
 	onCommand     func(string) (string, error) // 2026-10-18：QQ 侧 /stop /restart
 	sendReplyFn   func(string, string) error   // 回复出口（默认 = sendReply；测试可注入）
@@ -549,7 +548,7 @@ type QQChannel struct {
 }
 
 func NewQQChannel(shared SharedCfg, bot BotCfg, dataDir string,
-	onStream func(string) error, onMessage func(string) (string, error),
+	onStream func(string) error,
 	onAttachments func(string) error, onCommand func(string) (string, error),
 	logf func(string)) *QQChannel {
 	c := &QQChannel{
@@ -561,7 +560,6 @@ func NewQQChannel(shared SharedCfg, bot BotCfg, dataDir string,
 		tokenFile:     filepath.Join(dataDir, "channels", "qq", "tokens", bot.AppID+".json"),
 		inboxDir:      inboxDirFor(bot),
 		onStream:      onStream,
-		onMessage:     onMessage,
 		onAttachments: onAttachments,
 		onCommand:     onCommand,
 		logf:          logf,
@@ -1035,26 +1033,15 @@ func (c *QQChannel) handleMessage(m *qqMsg) {
 	if c.shared.AckMessage != "" {
 		_ = c.sendReply(c.bot.ChannelID, c.shared.AckMessage)
 	}
-	// 8'. 流式模式（桥始终提供 onStream）
-	if c.onStream != nil {
-		if err := c.onStream(text); err != nil {
-			c.logf("onStream 异常（不回复）：" + err.Error())
-		}
+	// 8. 上行只有一条路：/enqueue（+ /events 下行）。同步 /chat 已从主程序删除，
+	// 那段"桥没接 onStream 就同步问一轮"的兜底也就无处可去（2026-11-12）。
+	if c.onStream == nil {
+		c.logf("内部错误：该 bot 未接 onStream，消息未投递")
 		return
 	}
-	// 8. agent 一轮（异常只记日志、不回复、不崩）
-	reply, err := c.onMessage(text)
-	if err != nil {
-		c.logf("onMessage 异常（不回复）：" + err.Error())
-		return
+	if err := c.onStream(text); err != nil {
+		c.logf("onStream 异常（不回复）：" + err.Error())
 	}
-	// 9. 空回复不发
-	replyText := strings.TrimSpace(reply)
-	if replyText == "" {
-		return
-	}
-	// 10. 分块回复
-	_ = c.sendReply(chID, replyText)
 }
 
 // 私聊（C2C）消息处理：与 handleMessage 同构，差异在 sender 抽取与 c2c:<openid> 匹配
@@ -1133,26 +1120,14 @@ func (c *QQChannel) handleC2CMessage(m *qqMsg) {
 	if c.shared.AckMessage != "" {
 		_ = c.sendReply("c2c:"+sender, c.shared.AckMessage)
 	}
-	// 8'. 流式模式
-	if c.onStream != nil {
-		if err := c.onStream(text); err != nil {
-			c.logf("onStream 异常（不回复）：" + err.Error())
-		}
+	// 8. 同 handleMessage：只走 /enqueue，没有同步兜底
+	if c.onStream == nil {
+		c.logf("内部错误：该 bot 未接 onStream，消息未投递")
 		return
 	}
-	// 8. agent 一轮
-	reply, err := c.onMessage(text)
-	if err != nil {
-		c.logf("onMessage 异常（不回复）：" + err.Error())
-		return
+	if err := c.onStream(text); err != nil {
+		c.logf("onStream 异常（不回复）：" + err.Error())
 	}
-	// 9. 空回复不发
-	replyText := strings.TrimSpace(reply)
-	if replyText == "" {
-		return
-	}
-	// 10. 分块回复
-	_ = c.sendReply("c2c:"+sender, replyText)
 }
 
 // 2026-09-15 方向A：附件（桥已下载落盘）→ 实例 /inject 路径文本通知，agent 自己去看
@@ -2018,42 +1993,6 @@ func makeOnStream(instanceURL, instanceID string, logf func(string)) func(string
 	}
 }
 
-// 兜底（无 /events 场景/旧实例）：同步 /chat
-func makeOnMessage(instanceURL, instanceID string) func(string) (string, error) {
-	return func(text string) (string, error) {
-		base := strings.TrimRight(instanceURL, "/")
-		b, _ := json.Marshal(map[string]string{"message": text})
-		req, _ := http.NewRequest("POST", base+"/chat", bytes.NewReader(b))
-		req.Header.Set("Content-Type", "application/json")
-		client := &http.Client{Timeout: 120 * time.Second}
-		res, err := client.Do(req)
-		if err != nil {
-			return "", err
-		}
-		defer res.Body.Close()
-		body, _ := io.ReadAll(res.Body)
-		if res.StatusCode < 200 || res.StatusCode >= 300 {
-			var j struct {
-				Error *string `json:"error"`
-			}
-			_ = json.Unmarshal(body, &j)
-			detail := "（无错误详情）"
-			if j.Error != nil && *j.Error != "" {
-				detail = *j.Error
-			}
-			return "", fmt.Errorf("实例 %s /chat %d：%s", instanceID, res.StatusCode, detail)
-		}
-		var j struct {
-			Reply *string `json:"reply"`
-		}
-		_ = json.Unmarshal(body, &j)
-		if j.Reply == nil {
-			return "", fmt.Errorf("实例 %s /chat 返回缺 reply 字段", instanceID)
-		}
-		return *j.Reply, nil
-	}
-}
-
 // ---------- QQ 侧控制指令（2026-10-18）----------
 
 // agentCommandOf 识别整条消息是否为控制指令。必须整条 = 指令（"/stop 一下" 不算），
@@ -2536,7 +2475,6 @@ func main() {
 		botID := bot.AppID
 		ch := NewQQChannel(cfg.Shared, bot, cfg.Shared.DataDir,
 			makeOnStream(instURL, instanceID, logf),
-			makeOnMessage(instURL, instanceID),
 			makeOnAttachments(instURL, instanceID),
 			makeOnCommand(instURL, instanceID, logf),
 			func(m string) { logf("[bot=" + botID + "] " + m) })

@@ -97,7 +97,7 @@ func parseParts(v []interface{}) ([]types.ContentPart, bool) {
 	return parts, true
 }
 
-// ClearCache 清缓存（/drop 或 /reset 后调用；传 id 只清该条）
+// ClearCache 清缓存（/reset 或 /strip-injects 后调用；传 id 只清该条）
 func (r *Resolver) ClearCache(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -114,28 +114,39 @@ func (r *Resolver) ClearCache(id string) {
 // 那时由"LLM 4xx 自动降级"触发，现只由 WebUI「剥离全部注入附件」/ POST
 // /strip-injects 显式触发）。此后 Resolve 拿到的是提示，原附件内容不再进请求。
 // 提示文本确定性（无时间戳无随机数）→ 同一 id 每次解析逐字一致 → KV 前缀稳定。
-// 返回侧车是否存在并被改写。
-func StripSidecar(dir, id string) bool {
+// 返回 (是否真的改写, 失败原因)。侧车不存在或已经是剥离提示 → (false, nil)：
+// 那是"没什么可剥"，不是失败。写盘失败（盘满/只读/权限）→ (false, err)，
+// 由调用方（POST /strip-injects）把原因回给用户——早先这里折成 bool，
+// 网页上只会说"剥了 0 个"，看不出是只读还是满了（2026-11-12 复审指出）。
+func StripSidecar(dir, id string) (bool, error) {
 	p := filepath.Join(dir, id+".json")
 	old, err := os.ReadFile(p)
 	if err != nil {
-		return false
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
 	}
 	stub := []types.ContentPart{types.TextPart(fmt.Sprintf("附件 %s 已按用户手动指令剥离，原附件内容不再发送", id))}
 	b, err := json.Marshal(stub)
 	if err != nil {
-		return false
+		return false, err
 	}
 	// 幂等（2026-10-19）：已经是剥离提示的侧车不再算"剥了一个"，
 	// 否则连点两次按钮日志里每次都报全量，看不出到底剥了几个。
 	if bytes.Equal(old, b) {
-		return false
+		return false, nil
 	}
 	// 原子写（C2）：侧车是"下次 compose 才读"的文件，半截 JSON = 附件静默消失或加载失败
-	return persist.AtomicWriteFile(p, string(b)) == nil
+	if err := persist.WritePath(p, string(b)); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
-// DropInjectFile 删侧车文件 + 清缓存；返回是否真删了文件
+// DropInjectFile 只删侧车文件；返回是否真删了。
+// 解析器缓存由调用方清（server 的 /strip-injects 会调 ClearResolverCacheEntry），
+// 这里不碰缓存：缓存属于 Resolver，inject 包不持有它。
 func DropInjectFile(dir, id string) bool {
 	if err := os.Remove(filepath.Join(dir, id+".json")); err == nil {
 		return true

@@ -234,104 +234,42 @@ type usageDetails struct {
 	CachedTokens int `json:"cached_tokens"`
 }
 
-func (c *OpenAiClient) Complete(ctx context.Context, messages []types.Message, tools []types.ToolSpec) (*types.Response, error) {
-	data, err := c.buildBody(messages, tools, false)
-	if err != nil {
-		return nil, err
-	}
-	cctx, cancel := context.WithTimeout(ctx, time.Duration(c.cfg.TimeoutMS)*time.Millisecond)
-	defer cancel()
-	req, err := c.newReq(cctx, data)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 10000))
-		return nil, &HTTPError{Status: resp.StatusCode, Body: string(b)}
-	}
-	var j struct {
-		Choices []struct {
-			FinishReason *string      `json:"finish_reason"`
-			Message      *wireMessage `json:"message"`
-		} `json:"choices"`
-		Usage *struct {
-			PromptTokens        int           `json:"prompt_tokens"`
-			CompletionTokens    int           `json:"completion_tokens"`
-			PromptTokensDetails *usageDetails `json:"prompt_tokens_details"`
-		} `json:"usage"`
-		Timings *struct {
-			CacheN int `json:"cache_n"`
-		} `json:"timings"`
-	}
-	cr := &cappedReader{r: resp.Body, max: c.maxRespBytes()}
-	if err := json.NewDecoder(cr).Decode(&j); err != nil {
-		if cr.over() { // 超限优先报体量（JSON 报错会掩盖真实原因）
-			return nil, cr.overErr()
-		}
-		return nil, fmt.Errorf("LLM 响应 JSON 解析失败：%v", err)
-	}
-	respOut := &types.Response{}
-	if j.Usage != nil {
-		cached := 0
-		if j.Usage.PromptTokensDetails != nil {
-			cached = j.Usage.PromptTokensDetails.CachedTokens
-		} else if j.Timings != nil {
-			cached = j.Timings.CacheN
-		}
-		respOut.Usage = types.Usage{
-			PromptTokens:     j.Usage.PromptTokens,
-			CompletionTokens: j.Usage.CompletionTokens,
-			CachedTokens:     cached,
-		}
-	}
-	if len(j.Choices) > 0 {
-		respOut.FinishReason = j.Choices[0].FinishReason
-		if m := j.Choices[0].Message; m != nil {
-			if m.Content != nil {
-				respOut.Content = *m.Content
-			}
-			respOut.ReasoningContent = m.ReasoningContent
-			var tcs []types.ToolCall
-			for _, tc := range m.ToolCalls {
-				if tc.Function == nil || tc.Function.Name == nil {
-					continue
-				}
-				id := newCallID()
-				if tc.ID != nil && *tc.ID != "" {
-					id = *tc.ID
-				}
-				args := "{}"
-				if tc.Function.Arguments != nil {
-					args = *tc.Function.Arguments
-				}
-				tcs = append(tcs, types.ToolCall{ID: id, Type: "function",
-					Function: types.Function{Name: *tc.Function.Name, Arguments: args}})
-			}
-			if len(tcs) > 0 {
-				respOut.ToolCalls = tcs
-			}
-		}
-	}
-	return respOut, nil
-}
-
 // ---------- 流式（主循环用） ----------
 
 // sseFrame llama.cpp SSE 帧（choices 为空 + usage = 尾块）
+// wireUsage / wireTimings：非流式响应与 SSE 尾块里这两段 JSON 是同一个形状，
+// 此前各自匿名声明一遍，折成 types.Usage 的代码也各写一遍（缓存命中数的优先级
+// 一改就只改一边，2026-11-12 归并）。
+type wireUsage struct {
+	PromptTokens        int           `json:"prompt_tokens"`
+	CompletionTokens    int           `json:"completion_tokens"`
+	PromptTokensDetails *usageDetails `json:"prompt_tokens_details"`
+}
+
+type wireTimings struct {
+	CacheN int `json:"cache_n"`
+}
+
+// usageOf 把 wire 上的 usage 折成 types.Usage。缓存命中优先取
+// usage.prompt_tokens_details.cached_tokens（OpenAI 形状），没有才退 llama.cpp 的
+// timings.cache_n —— 两条服务给的不是同一个字段，这个优先级是有意的，别改。
+func usageOf(u *wireUsage, t *wireTimings) types.Usage {
+	cached := 0
+	if u != nil && u.PromptTokensDetails != nil {
+		cached = u.PromptTokensDetails.CachedTokens
+	} else if t != nil {
+		cached = t.CacheN
+	}
+	return types.Usage{
+		PromptTokens:     u.PromptTokens,
+		CompletionTokens: u.CompletionTokens,
+		CachedTokens:     cached,
+	}
+}
+
 type sseFrame struct {
-	Usage *struct {
-		PromptTokens        int           `json:"prompt_tokens"`
-		CompletionTokens    int           `json:"completion_tokens"`
-		PromptTokensDetails *usageDetails `json:"prompt_tokens_details"`
-	} `json:"usage"`
-	Timings *struct {
-		CacheN int `json:"cache_n"`
-	} `json:"timings"`
+	Usage   *wireUsage   `json:"usage"`
+	Timings *wireTimings `json:"timings"`
 	Choices []struct {
 		FinishReason *string `json:"finish_reason"`
 		Delta        struct {
@@ -373,9 +311,9 @@ func (c *OpenAiClient) CompleteStream(ctx context.Context, messages []types.Mess
 	if err != nil {
 		return nil, err
 	}
-	// 空闲超时：每 wire 块重置。缺省 idleMs=0 → 取客户端配置的 stream_idle_ms
+	// 空闲超时：每 wire 块重置。缺省 idleMs=0 → 取客户端配置的 stream_idle_sec
 	//（主循环口径，2026-10-18 A5；未配则回落 max(timeout_ms, 10 分钟)）；
-	// 压缩路径显式传 context.stream_idle_ms。
+	// 压缩路径显式传 context.stream_idle_sec。
 	idleTimeout := time.Duration(idleMs) * time.Millisecond
 	if idleMs == 0 {
 		idleTimeout = c.idleFallback()
@@ -504,17 +442,7 @@ func (c *OpenAiClient) processFrame(f *sseFrame, content, reasoning *string, fin
 	tcAcc map[int]*tcBuilder, tcOrder *[]int, onDelta func(types.Delta)) {
 	// usage 块（llama.cpp 放尾块，choices 为空）
 	if f.Usage != nil {
-		cached := 0
-		if f.Usage.PromptTokensDetails != nil {
-			cached = f.Usage.PromptTokensDetails.CachedTokens
-		} else if f.Timings != nil {
-			cached = f.Timings.CacheN
-		}
-		*usage = types.Usage{
-			PromptTokens:     f.Usage.PromptTokens,
-			CompletionTokens: f.Usage.CompletionTokens,
-			CachedTokens:     cached,
-		}
+		*usage = usageOf(f.Usage, f.Timings)
 	}
 	if len(f.Choices) == 0 {
 		return

@@ -106,20 +106,38 @@ func TestLoadMigratesLegacyMsFiles(t *testing.T) {
 	}
 }
 
-// TestApplyPatchInPlaceMigrates 热更新路径也过换算（旧 webui/旧脚本发旧键不会落回默认值）。
-func TestApplyPatchInPlaceMigrates(t *testing.T) {
+// 端口这类值不能吞尾部垃圾：以前用 fmt.Sscanf，"8451x" 会被当成 8451，
+// 配置写错就静默绑到别的端口上。
+func TestParseIntRejectsTrailingGarbage(t *testing.T) {
+	for _, bad := range []string{"8451x", "84 51", "0x10", "", "  ", "８４５１"} {
+		if n, err := parseInt(bad); err == nil {
+			t.Errorf("parseInt(%q) 应报错，得 %d", bad, n)
+		}
+	}
+	for good, want := range map[string]int{"8451": 8451, " 80 ": 80, "-1": -1} {
+		n, err := parseInt(good)
+		if err != nil || n != want {
+			t.Errorf("parseInt(%q) = %d,%v，期望 %d", good, n, err, want)
+		}
+	}
+}
+
+// 我删 ApplyPatchInPlace 时把这条不变式的包内覆盖一起删了（ 复审指出）：经热更新提交的
+// 旧毫秒键必须过单位换算、且换算后不留 *_ms。活路径是 DeepMerge（server 的 /config 走它），
+// 端级别有 timeunit_test 覆盖，这里补函数级的一条，断言照搬原测试。
+func TestDeepMergeMigratesLegacyMsKeys(t *testing.T) {
 	cfg := Default()
-	ApplyPatchInPlace(cfg, map[string]interface{}{"tools": map[string]interface{}{"timeout_ms": float64(1200000)}})
-	if cfg.Tools.TimeoutSec != 1200 {
-		t.Errorf("Tools.TimeoutSec = %d，期望 1200（旧毫秒键应换算）", cfg.Tools.TimeoutSec)
+	out := DeepMerge(cfg, map[string]interface{}{
+		"tools": map[string]interface{}{"timeout_ms": float64(1200000)},
+	})
+	if out.Tools.TimeoutSec != 1200 {
+		t.Errorf("Tools.TimeoutSec = %d，期望 1200（旧毫秒键应换算）", out.Tools.TimeoutSec)
 	}
-	// 换算后的 map 再落盘不应带废弃键
-	m := cfgToMap(cfg)
-	if _, ok := m["tools"].(map[string]interface{})["timeout_ms"]; ok {
-		t.Error("cfgToMap 不应带 timeout_ms")
+	b, err := json.Marshal(cfgToMap(out))
+	if err != nil {
+		t.Fatal(err)
 	}
-	b, _ := json.Marshal(m)
 	if strings.Contains(string(b), "_ms") {
-		t.Errorf("落盘 map 里仍有 *_ms 键：%s", b)
+		t.Errorf("合并后的配置 map 里仍有 *_ms 键：%s", b)
 	}
 }

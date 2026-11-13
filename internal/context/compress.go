@@ -3,18 +3,13 @@ package context
 // 上下文滚动压缩（2026-08-24）：会话总 token 超 context.max_tokens 时，
 // 把"超出 keep_recent_chars 预算的旧消息批次"交给 LLM 压成一段总结，
 // 滚动进 summary（与旧 TS 版的 [T1]/[T2] 同构，但按字符预算自适应分批）。
-//
-// 迭代压缩（2026-09-10，移植旧 TS 版思路）：单次压缩 LLM 倾向写长（旧实例实测
-// 压缩 62k 字会话产出 6.9k 字总结）。最多 3 轮：每轮把上一轮总结再压一次，
-// 直到长度 < 基准（第 1 轮用批次原文长度，其后用上一轮输出长度）；3 轮后仍
-// 超长则取最短的一轮（保底不劣于输入）。
+// 压缩一次只覆盖本批次；不迭代、不级联（旧"最多 3 轮取最短"已删，见 doCompress 注释）。
 // 全程走流式（completeStream + 工具白名单）→ 思考块逐 token 吐出来
-// （compress_delta 事件广播给 WebUI），空闲超时按 context.stream_idle_ms
-// 算（默认 10 分钟）。
+// （compress_delta 事件广播给 WebUI），空闲超时按 context.stream_idle_sec 算
+// （单位 2026-10-18 已改秒，默认值见 config.Default()）。
 
 import (
 	"context"
-	"regexp"
 	"strings"
 
 	"okhuman/internal/llm"
@@ -22,8 +17,8 @@ import (
 	"okhuman/internal/types"
 )
 
-// CompressMarker 压缩请求的 user 指令前缀（fake/mock 识别压缩请求用）
-func CompressMarker(scope string) string { return "[压缩:" + scope + "]" }
+// CompressMarker 压缩请求的 user 指令前缀（字面量与解析方共用，见 types.CompressMarkerPrefix）
+func CompressMarker(scope string) string { return types.CompressMarkerOf(scope) }
 
 // compressPromptBody 压缩轮提示词（2026-09-09 重写：不再喂 target 文本，模型直接
 // 总结 prefix 全文）。前缀里既有 system 身份提示（要求"用 bash 干活、遵守工具纪律"
@@ -39,21 +34,6 @@ const compressPromptBody = "本轮是上下文压缩轮，不是普通对话轮�
 	"4. 保留对当前任务有用的关键实体、数字、文件路径与工具结果要点；\n" +
 	"5. 删除寒暄、重复的过程噪音与可推断的上下文；\n" +
 	"6. 忠实于原文，不得虚构；只输出总结文本，力求简洁。"
-
-var compressScopeRe = regexp.MustCompile(`^\s*\[压缩:(single|t1|t2|history)\]`)
-
-// IsCompressRequest 末条消息是否为压缩指令（fake/mock 区分普通与压缩请求用）
-func IsCompressRequest(messages []types.Message) bool {
-	if len(messages) == 0 {
-		return false
-	}
-	last := messages[len(messages)-1]
-	s, ok := last.Content.(string)
-	if !ok {
-		return false
-	}
-	return compressScopeRe.MatchString(s)
-}
 
 // CompressResult 一次压缩的结果（正文 + 思考；思考只供日志与事件，不计正文长度）
 type CompressResult struct {

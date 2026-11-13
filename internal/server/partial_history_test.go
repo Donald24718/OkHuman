@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -20,9 +19,6 @@ import (
 
 type cutClient struct{}
 
-func (cutClient) Complete(context.Context, []types.Message, []types.ToolSpec) (*types.Response, error) {
-	return nil, errors.New("unused")
-}
 func (cutClient) CompleteStream(_ context.Context, _ []types.Message, _ []types.ToolSpec, onDelta func(types.Delta), _ int) (*types.Response, error) {
 	onDelta(types.Delta{Thinking: "先想一段"})
 	onDelta(types.Delta{Text: "半截正文ABC"})
@@ -39,15 +35,11 @@ func TestPartialShowsInHistory(t *testing.T) {
 	srv := httptest.NewServer(New(st, nil))
 	defer srv.Close()
 
-	resp, err := srv.Client().Post(srv.URL+"/chat", "application/json", strings.NewReader(`{"message":"问"}`))
+	reply, err := runTurnErr(srv, "问") // 走生产的上行路径，并等这一轮收口
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	t.Logf("/chat 响应: %s", body)
-
-	sleep(300)
+	t.Logf("本轮回复: %s", reply)
 	hresp, err := srv.Client().Get(srv.URL + "/history")
 	if err != nil {
 		t.Fatal(err)

@@ -153,3 +153,39 @@ func TestGuardBlockedTextIsStable(t *testing.T) {
 		t.Error("被拦文本必须说明没有逃生门")
 	}
 }
+
+// 2026-11-12：旧正则要求 `>` 前必须有一个非 >2& 字符，行首重定向、带 fd 的
+// `2> file`、无空格 `>file` 全漏掉——而这正是"重定向会清空已有文件"的守卫。
+func TestGuardTruncationCoversLineStartAndFdForms(t *testing.T) {
+	d := t.TempDir()
+	f := filepath.Join(d, "keep.txt")
+	if err := os.WriteFile(filepath.Join(d, "a"), []byte("占位"), 0o600); err != nil {
+		t.Fatal(err) // 让本函数里的"通配不猜"两条有咬合力：前缀 a 必须真实存在
+	}
+	if err := os.WriteFile(f, []byte("有内容"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []string{
+		"> " + f,             // 行首
+		"echo x\n> " + f,     // 换行后的行首
+		"echo x 2> " + f,     // 带 fd
+		"echo x>" + f,        // 无空格
+		"echo x 2>&1 > " + f, // stdout 重定向仍在后面
+	} {
+		if blocked, _ := guardCommand(c); blocked == nil || blocked.ID != "truncate-existing" {
+			t.Errorf("应拦住（会清空已存在的 %s）: %q → %v", f, c, blocked)
+		}
+	}
+	for _, c := range []string{
+		"echo x >> " + f, // 追加不截断
+		"echo x > " + filepath.Join(d, "new.txt"), // 目标不存在
+		"echo x > /dev/null",
+		"echo x > $OUT",                             // 变量不猜
+		"echo x > " + filepath.Join(d, "a*.txt"),    // 通配不猜：同目录有 a 这个文件时也不能拦
+		"echo x > " + filepath.Join(d, "keep{1,2}"), // 花括号展开不猜
+	} {
+		if blocked, _ := guardCommand(c); blocked != nil && blocked.ID == "truncate-existing" {
+			t.Errorf("不该拦: %q → %s", c, blocked.ID)
+		}
+	}
+}

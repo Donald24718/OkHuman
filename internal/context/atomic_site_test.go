@@ -33,7 +33,10 @@ func TestDumpAndSummaryAtomicNoResidue(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		m.AddMessage(&types.RawEntry{Role: "user", Content: strings.Repeat("内容", 60)})
 	}
-	rec, n := m.DumpSessionRecord("测试")
+	rec, n, derr := m.DumpSessionRecord("测试")
+	if derr != nil {
+		t.Fatalf("存档失败：%v", derr)
+	}
 	if n == 0 || !strings.HasPrefix(filepath.Base(rec), "ctx-") {
 		t.Fatalf("存档异常：%s n=%d", rec, n)
 	}
@@ -69,4 +72,29 @@ func TestSidecarJSONValidAfterStrip(t *testing.T) {
 		t.Fatalf("侧车 JSON 解析失败（疑似半截）：%v content=%q", err, b)
 	}
 	noTmpResidue(t, dir)
+}
+
+// TestDumpSessionRecordReportsFailure（2026-11-13 复审）：旧会话全文存档是除压缩存档
+// 外唯一的全文，写失败必须回出来——/reset 靠它记日志并在响应里带 record_error。
+func TestDumpSessionRecordReportsFailure(t *testing.T) {
+	dataDir := t.TempDir()
+	m := NewManager(llm.NewFakeLLM(nil), Cfg{MaxTokens: 1000, KeepRecentChars: 1000, HardTruncChars: 2000, CharsPerToken: 1}, "sys", dataDir)
+	for i := 0; i < 2; i++ {
+		m.AddMessage(&types.RawEntry{Role: "user", Content: "要被存档的一句话"})
+	}
+	if err := os.Chmod(dataDir, 0o500); err != nil { // 只读：建不了 session-records/
+		t.Fatal(err)
+	}
+	defer os.Chmod(dataDir, 0o700)
+	path, n, err := m.DumpSessionRecord("重置会话")
+	if err == nil {
+		t.Fatalf("只读目录应报写失败，实得 path=%q err=nil", path)
+	}
+	if n != 2 {
+		t.Errorf("应把本该存档的条数带出来（供日志），实得 %d", n)
+	}
+	if path != "" {
+		t.Errorf("失败时不该返回路径，实得 %q", path)
+	}
+	t.Logf("回出的原因：%v", err)
 }

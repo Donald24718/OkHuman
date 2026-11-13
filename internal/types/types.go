@@ -215,7 +215,7 @@ type ToolOutcome struct {
 
 // 队列条目的语义类型。
 const (
-	QueueKindUser     = "user"      // 用户消息（/chat、/enqueue、心跳、定时任务）
+	QueueKindUser     = "user"      // 用户消息（/enqueue、心跳、定时任务）
 	QueueKindBGNotice = "bg_notice" // 后台任务完成通知
 )
 
@@ -266,12 +266,6 @@ type BackgroundStartArgs struct {
 // StringPtr 字符串指针（JSON omitempty 可空字段用）
 func StringPtr(s string) *string { return &s }
 
-// ContentIsParts 内容是否 parts 数组
-func ContentIsParts(c Content) bool {
-	_, ok := c.([]ContentPart)
-	return ok
-}
-
 // AsParts 取 parts（非数组返回 nil）
 func AsParts(c Content) []ContentPart {
 	if p, ok := c.([]ContentPart); ok {
@@ -287,21 +281,6 @@ func AsString(c Content) string {
 	}
 	return ""
 }
-
-// HasInjectRef 消息内容是否含附件引用
-func (e *RawEntry) HasInjectRef() bool {
-	for _, p := range AsParts(e.Content) {
-		if p.Type == "inject_ref" {
-			return true
-		}
-	}
-	return false
-}
-
-// ContentJSON 内容序列化（/history 端点原样回传用）
-func ContentJSON(c Content) interface{} { return c }
-
-var _ = json.Marshal
 
 // ToolCallIDOrUnknown tool 消息的 call id（缺失时 "unknown"，会话记录用）
 func (e *RawEntry) ToolCallIDOrUnknown() string {

@@ -173,7 +173,7 @@ func TestMakeOnCommandUnknownCmd(t *testing.T) {
 
 func newTestChannel(shared SharedCfg, bot BotCfg, onCmd func(string) (string, error)) (*QQChannel, *[]string, *[]string) {
 	var sent, fwd []string
-	c := NewQQChannel(shared, bot, t_DataDir(), nil, nil, nil, onCmd, func(string) {})
+	c := NewQQChannel(shared, bot, t_DataDir(), nil, nil, onCmd, func(string) {})
 	c.sendReplyFn = func(target, text string) error {
 		sent = append(sent, target+"|"+text)
 		return nil
