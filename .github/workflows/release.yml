@@ -87,3 +87,6 @@ jobs:
         with:
           files: artifacts/*
           fail_on_unmatched_files: true
+          # 正文由 GitHub 按上一个 tag 以来的提交生成：以前每次 Release 正文都是空的，
+          # 使用者只看得到三个包名，看不出这版改了什么。
+          generate_release_notes: true
