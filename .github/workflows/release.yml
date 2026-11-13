@@ -79,14 +79,16 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      # 顺序要紧：checkout 会清理工作区，必须在下载产物之前跑（反过来 artifacts/ 就没了，
+      # 发布步按 fail_on_unmatched_files 直接失败）。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 要读 tag 对象本身，默认浅克隆里没有
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
-
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # 要读 tag 对象本身，默认浅克隆里没有
 
       - name: 用 tag 注释作为 Release 正文
         # 打 tag 时写的那段说明就是给人看的摘要；正文为空时使用者只看到三个包名。
@@ -94,6 +96,7 @@ jobs:
         run: |
           git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > RELEASE_NOTES.md
           test -s RELEASE_NOTES.md || printf '（本次未写说明，改动见提交历史）\n' > RELEASE_NOTES.md
+          ls -l artifacts/ | head -5
           wc -c RELEASE_NOTES.md
 
       - uses: softprops/action-gh-release@v2
