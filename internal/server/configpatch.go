@@ -84,7 +84,7 @@ func applyConfigPatch(a *AgentState, patch map[string]interface{}, logf func(for
 		})
 	}
 	if has("tools") { // 工具超时热更新（2026-10-02）：重建工具表 + 新上限，下条命令生效
-		tools.Configure(nc.Tools.FgTimeoutSec*1000, nc.Tools.TimeoutSec*1000)
+		tools.Configure(nc.Tools.FgTimeoutMSOrDefault(), nc.Tools.TimeoutSec*1000)
 	}
 	// 自我生命感知输入随配置热更新（llm base_url / server 段变化）
 	a.CM().SetSelfInfo(ctxmgr.SelfInfo{Port: nc.Server.Port, DataDir: nc.Data.Dir, LLMBaseURL: nc.LLM.BaseURL})

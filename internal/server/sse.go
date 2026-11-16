@@ -16,19 +16,16 @@ func newSSE(w http.ResponseWriter) *sseConn {
 	if !ok {
 		fl = noFlusher{}
 	}
-	return &sseConn{w: w, flusher: fl, flushable: ok, done: make(chan struct{})}
+	return &sseConn{w: w, flusher: fl, flushable: ok}
 }
 
-// ---------- /enqueue ----------
-
-// sseConn SSE 连接写端（并发写加锁：事件来自 drain goroutine，心跳来自另一 goroutine）
+// sseConn SSE 连接写端（并发写加锁：事件来自 drain goroutine，5s 保活 ping 来自 handleEvents goroutine）
 type sseConn struct {
 	w         http.ResponseWriter
 	flusher   http.Flusher
 	flushable bool // false = 响应不支持 Flush（见 newSSE），事件只能等连接关闭时刷出
 	mu        sync.Mutex
 	closed    bool
-	done      chan struct{}
 }
 
 // 5s 保活 ping 现在只在 handleEvents 里发（本连接自己的 ticker）——
@@ -38,7 +35,6 @@ func (c *sseConn) close() {
 	c.mu.Lock()
 	c.closed = true
 	c.mu.Unlock()
-	close(c.done)
 }
 
 // /chat/stream 已删除（2026-10-18 健壮性复查，主人定）：它是"同步流式"端点——
@@ -51,10 +47,6 @@ func (c *sseConn) close() {
 // GET /events/poll（短轮询）——那两个通道是"内核只写内存、消费者按自己节奏取"，
 // 慢客户端只卡自己，落后超窗还会明确报 gap 让调用方走 /history 补。
 // 本机三方（QQ 桥 / 语音 / WebUI）本来就走 /enqueue + /events，删除不影响它们。
-
-// handleEnqueue 统一入队（2026-08-31）：走队列/drain 机制。
-// queuedBefore/position 在 enqueueAndWake 的同一把锁内取出（2026-09-14 起
-// 入队与取位原子化，不再有"先取位后入队"的时序要求）。
 
 // noFlusher 是不支持 Flush 时的退路（nil 接口调用会在 goroutine 里 panic）。
 type noFlusher struct{}

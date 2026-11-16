@@ -46,19 +46,6 @@ type noisyCounter struct {
 	lastLog  time.Time // 上次打汇总的时刻
 }
 
-// writeOriginOK 写请求的来源校验：0 表示放行，否则返回状态码与理由。
-//
-// 为什么要（2026-10-19）：API 没有任何鉴权，监听 127.0.0.1 时唯一的屏障是浏览器
-// 同源策略——而那道屏障对"简单请求"不设防：POST + Content-Type: text/plain 不触发
-// preflight，任何网页上的 JS 都能把 /enqueue、/config、/reset、/inject 打到
-// http://127.0.0.1:8451，服务器照样执行（响应读不到，副作用已经发生）。本机 agent
-// 有 bash 能力，于是"主人打开了一个恶意网页"可以直接变成"实例被人下指令"。
-// DNS rebinding 还能把 Host 变成 evil.example 指到本机。
-//
-// 规则：Host 必须是本机地址（挡住 rebinding）；带 Origin 的请求必须来自本机同源
-// （挡住跨站页面）。curl / 脚本 / 本机插件不带 Origin，照常放行——不改变任何
-// 现有本机调用方的用法。
-
 func (noFlusher) Flush() {}
 
 func (ap *App) handleFavicon(w http.ResponseWriter, r *http.Request) {
@@ -155,8 +142,6 @@ type Hooks struct {
 	OnConfigSaved    func(patch map[string]interface{}) error // 返回 error = 内存已生效但落盘失败
 }
 
-// App HTTP 应用（实现 http.Handler）
-
 // ---------- WebUI 静态页面（2026-08-29） ----------
 
 // favicon（浏览器自动请求；无文件时返回内联 SVG，消除 404 噪音）
@@ -173,11 +158,10 @@ const INJECT_MAX = 8
 func (ap *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 	a := ap.state.Agent
 	cfg := a.Cfg()
-	sess := a.CM().Session()
 	writeJSON(w, 200, map[string]interface{}{
 		"ok":      true,
 		"session": int(a.SessionNo.Load()),
-		"context": ctxmgr.ContextStatsOf(sess, cfg.Context.CharsPerToken, cfg.Context.AttachmentTokens, cfg.Context.KeepSummaries, cfg.Context.SummaryMaxChars),
+		"context": a.CM().Stats(),
 		"llm":     cfg.LLM.BaseURL,
 	})
 }
@@ -218,8 +202,6 @@ type App struct {
 	hooks    *Hooks
 	resolver atomic.Pointer[inject.Resolver] // /strip-injects 清缓存（读）与 /reset 重建（写）并发时原子安全（2026-09-14 审计修）
 }
-
-// New 构建单实例应用。
 
 // New 构建单实例应用。
 func New(state *AppState, hooks *Hooks) *App {
@@ -269,12 +251,6 @@ func (ap *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ap.state.logf("[http] %s %s → %d (%dms)", r.Method, path, rec.status, time.Since(start).Milliseconds())
 }
 
-// route 路由本体（与 TS 端点全集一一对应）
-
-// broadcastEvent 广播一条事件给所有 SSE 订阅者（/events 常驻通道）。
-// 每个订阅者独立隔离——某个慢客户端写失败不影响其他订阅者。
-// 同时维护"轮次缓冲"（roundBuf）：run_start→run_end 的帧逐条记录，
-// 新订阅者连上且正在跑时重放（见 /events），刷新后不丢已流出内容。
 // maxRoundFrames 轮次缓冲帧数上限（2026-09-14 审计修：旧实现无界，超长 run
 // 的 delta 帧可把内存撑大；超限后停止追加——实时流不受影响，仅新连接重放
 // 不完整）
@@ -307,17 +283,9 @@ func (ap *App) countNoisyReq(path string) {
 // eventPollTick 消费者从缓冲取批次的节奏（SSE 与 WebUI 短轮询同一口径）
 const eventPollTick = 200 * time.Millisecond
 
-// handleEventsPoll WebUI 短轮询取事件（2026-10-18 修 B：发车 + 前端自己取）。
-// since=-1（或缺省）= 新客户端：有轮在跑就从本轮开头给（界面不空白），否则只报
-// 最新号（已完成轮的历史由 /history 给）。since=N = 取 N 之后的批次。
-// gap>0 = 客户端落后超过缓冲窗口，中间 gap 批已被挤掉 → 前端必须提示并走 /history 补。
-
 // heartbeatTickMS 心跳巡检粒度：30s 一次。间隔本身以分钟配置，30s 粒度足够，
 // 且空转成本可忽略（一次配置读 + 两次原子读）。
 const heartbeatTickMS = 30000
-
-// heartbeatDue 触发判定（纯函数，可测）：开关关或正在 run → 不触发；
-// 距上次 run 结束 ≥ interval → 触发。interval <=0 退回默认值。
 
 // logf 落盘日志（Log 未注入时静默，不 panic）
 func (st *AppState) logf(format string, args ...interface{}) {
@@ -344,8 +312,6 @@ var noisyGetPaths = map[string]bool{
 // 靠的是逐条记的写操作与非 2xx，不是这些汇总行。
 const noisyLogWindow = time.Hour
 
-// noisyCounter 单个高频端点的计数与上次汇总时刻。
-
 // numChecks 数值段基础校验（与 TS 表一致）
 // 时间类配置统一以**秒**为单位（2026-10-18；旧 *_ms 键在 POST /config 入口自动
 // 换算，见 config.NormalizeTimeUnits）。上限是防"把毫秒数值填进秒键"——旧
@@ -358,6 +324,7 @@ var numChecks = map[string]func(interface{}) bool{
 	"stream_idle_sec":    func(v interface{}) bool { n, ok := v.(float64); return ok && n > 0 && n <= 3600 },      // ≤1h（秒）
 	"max_response_bytes": func(v interface{}) bool { n, ok := v.(float64); return ok && n >= 1024 && n <= 4<<30 }, // 1KB–4GiB（字节）
 	"max_tokens":         func(v interface{}) bool { n, ok := v.(float64); return ok && n > 100 },
+	"attachment_tokens":  func(v interface{}) bool { n, ok := v.(float64); return ok && n >= 0 && n <= 100000 }, // 0=不计；配 1e9 会让每轮判超预算、反复砍最旧内容
 	// keep_summaries：摘要窗口条数。下限 1：0/负值在语义上是"压掉原文却一条摘要都不留"，这个组合
 	// 没人要，而且会被 context.NormalizeCfg 静默兜成 5 —— 所以直接拒绝，不接受后再偷偷改写。
 	// 上限 20：摘要本身也吃上下文，更多只会成倍挤掉原文。
@@ -471,6 +438,10 @@ var typeChecks = map[string]struct {
 }{
 	"enabled": {func(v interface{}) bool { _, ok := v.(bool); return ok }, "布尔 true/false"},
 	"prompt":  {func(v interface{}) bool { _, ok := v.(string); return ok }, "字符串"},
+	// dir（data / system_prompt 两处）与 host（server）同属"写错类型 → 静默回落默认"键：
+	// system_prompt.dir 配成数字，重启后自定义提示词整套换回 prompts/ 出厂词（2026-11-17 交叉复查补）
+	"dir":  {func(v interface{}) bool { _, ok := v.(string); return ok }, "字符串（目录路径）"},
+	"host": {func(v interface{}) bool { _, ok := v.(string); return ok }, "字符串（主机地址）"},
 }
 
 // webui 静态脚本（2026-09-09 marked；2026-10-19 加 sanitize）：本地化随 webui/ 部署，
@@ -492,9 +463,18 @@ func (ap *App) handleWebuiAsset(w http.ResponseWriter, r *http.Request, name str
 	_, _ = w.Write(data)
 }
 
-// ---------- 工具函数 ----------
-
-// safeName 提示词文件名合法性（防穿越）
+// writeOriginOK 写请求的来源校验：0 表示放行，否则返回状态码与理由。
+//
+// 为什么要（2026-10-19）：API 没有任何鉴权，监听 127.0.0.1 时唯一的屏障是浏览器
+// 同源策略——而那道屏障对"简单请求"不设防：POST + Content-Type: text/plain 不触发
+// preflight，任何网页上的 JS 都能把 /enqueue、/config、/reset、/inject 打到
+// http://127.0.0.1:8451，服务器照样执行（响应读不到，副作用已经发生）。本机 agent
+// 有 bash 能力，于是"主人打开了一个恶意网页"可以直接变成"实例被人下指令"。
+// DNS rebinding 还能把 Host 变成 evil.example 指到本机。
+//
+// 规则：Host 必须是本机地址（挡住 rebinding）；带 Origin 的请求必须来自本机同源
+// （挡住跨站页面）。curl / 脚本 / 本机插件不带 Origin，照常放行——不改变任何
+// 现有本机调用方的用法。
 
 func (ap *App) writeOriginOK(r *http.Request) (int, string) {
 	allowed := map[string]bool{"127.0.0.1": true, "localhost": true, "::1": true, "": true}

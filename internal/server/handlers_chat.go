@@ -221,7 +221,7 @@ func (ap *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 			"files":    files,
 			"chars":    spChars,
 		},
-		"context":     ctxmgr.ContextStatsOf(sess, cfg.Context.CharsPerToken, cfg.Context.AttachmentTokens, cfg.Context.KeepSummaries, cfg.Context.SummaryMaxChars),
+		"context":     a.CM().Stats(),
 		"compress":    compress,
 		"doom":        doom,
 		"backgrounds": bgs,

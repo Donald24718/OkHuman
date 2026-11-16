@@ -106,7 +106,7 @@ const maxStoredResultBytes = 256 * 1024
 
 // OnBackgroundStart 由 Agent 的工具循环调用：注册任务 + 挂 settle 检测
 // （Promise 通道收到 types.ToolOutcome → 标记 settled/ok/durationMs → 调
-// a.OnSettled 把通知入消息队列 → 标记 Notified）
+// a.OnSettled 把通知入消息队列）
 func (o *BackgroundOrchestrator) OnBackgroundStart(a types.BackgroundStartArgs) {
 	t := &types.PendingBackgroundTask{
 		CallID:     a.CallID,
@@ -147,7 +147,6 @@ func (o *BackgroundOrchestrator) OnBackgroundStart(a types.BackgroundStartArgs) 
 			a.OnSettled(cur)
 		}
 		o.mu.Lock()
-		cur.Notified = true
 		if len(cur.Result) > maxStoredResultBytes {
 			cur.Result = capBytes(cur.Result, maxStoredResultBytes) + "\n[已截断]"
 		}
@@ -161,7 +160,13 @@ func capBytes(s string, n int) string {
 		return s
 	}
 	cut := s[:n]
-	for len(cut) > 0 && !utf8.RuneStart(cut[len(cut)-1]) {
+	// 切点可能落在 rune 中间：反复剥掉末尾不完整的 rune。旧写法只剥续字节，
+	// 末尾留下孤立首字节 = 非法 UTF-8（/backgrounds 的 JSON 里成乱码）。
+	for len(cut) > 0 {
+		r, size := utf8.DecodeLastRuneInString(cut)
+		if r != utf8.RuneError || size > 1 {
+			break
+		}
 		cut = cut[:len(cut)-1]
 	}
 	return cut

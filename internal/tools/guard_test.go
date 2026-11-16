@@ -30,12 +30,6 @@ func TestGuardBlocksByShape(t *testing.T) {
 		{`rm -f -r /`, "rm-root"},
 		{"rm " + "-RF /", "rm-root"}, // 大写簇与小写同义（第四轮 A3）；拆开写以免这条命令被自己拦下
 		{"rm " + "-R -f /", "rm-root"},
-		{"rm " + "-r -F /", "rm-root"},
-		{"rm " + "-RF /", "rm-root"}, // 大写簇与小写同义（第四轮 A3）；拆开写以免这条命令被自己拦下
-		{"rm " + "-R -f /", "rm-root"},
-		{"rm " + "-r -F /", "rm-root"},
-		{"rm " + "-RF /", "rm-root"}, // 大写簇与小写同义（第四轮 A3）；拆开写以免这条命令被自己拦下
-		{"rm " + "-R -f /", "rm-root"},
 		{"rm " + "-r -F /", "rm-root"},                                        // r/f 分开写，目标仍是根
 		{`rm --force --recursive /`, "rm-root"},                               // 长 flag 反序也一样
 		{`find /tmp/a -print >/dev/null; find /tmp/b -delete`, "find-delete"}, // 上一条的 -print 不背书
@@ -100,6 +94,9 @@ func TestGuardTruncatesExistingFile(t *testing.T) {
 	}
 	if blocked, _ := guardCommand("echo x > /dev/null"); blocked != nil {
 		t.Errorf("/dev/null 不该拦: %s", blocked.ID)
+	}
+	if blocked, _ := guardCommand("echo \"备份 > " + f + "\""); blocked != nil {
+		t.Errorf("引号里的 > 是要打印的文本，不该拦: %s", blocked.ID)
 	}
 }
 

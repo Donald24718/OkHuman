@@ -27,10 +27,11 @@ type ClientConfig struct {
 	BaseURL   string
 	Model     string
 	APIKey    string
-	TimeoutMS int // 整体请求超时（complete 非流式用；流式另有空闲超时）
+	TimeoutMS int // 非流式 Complete 已删（2026-11-12）：无整体请求超时，现在只作 idleFallback 的下限
 	// StreamIdleMS 主循环流式空闲超时（2026-10-18 A5，来自 llm.stream_idle_sec）：
-	// CompleteStream 传 idleMs=0 时用这个值；**未配置或 ≤0 时仍回落到 max(llm.timeout_sec, 10 分钟)**
-	// （见 idleFallback）。default.json 不含 stream_idle_sec，所以回落就是默认生效路径。。
+	// CompleteStream 传 idleMs≤0 时用它；**它自己 ≤0 时回落到 max(llm.timeout_sec, 10 分钟)**
+	// （见 idleFallback）。Go Default() 已设 120s，所以默认生效路径是 120s 不是回落；
+	// 回落只在显式配成 ≤0 时出现（default.json 不含此键，不会触发）。
 	StreamIdleMS int
 	// MaxResponseBytes 单次响应总量上限（字节，0 → DefaultMaxResponseBytes）
 	MaxResponseBytes int64
@@ -299,11 +300,12 @@ func (c *OpenAiClient) CompleteStream(ctx context.Context, messages []types.Mess
 	if err != nil {
 		return nil, err
 	}
-	// 空闲超时：每 wire 块重置。缺省 idleMs=0 → 取客户端配置的 stream_idle_sec
-	//（主循环口径，2026-10-18 A5；未配则回落 max(timeout_ms, 10 分钟)）；
-	// 压缩路径显式传 context.stream_idle_sec。
+	// 空闲超时：每 wire 块重置。idleMs≤0 → 取客户端配置的 stream_idle_sec
+	//（主循环口径，2026-10-18 A5；它 ≤0 再回落 max(timeout_ms, 10 分钟)）；
+	// 压缩路径显式传 context.stream_idle_sec。负值必须挡：直传 AfterFunc 负时长
+	// = 立刻执行 → 每次流式立刻报"空闲超时(-Nms)"，而不是等空闲。
 	idleTimeout := time.Duration(idleMs) * time.Millisecond
-	if idleMs == 0 {
+	if idleMs <= 0 {
 		idleTimeout = c.idleFallback()
 	}
 	// /stop（父 ctx）与空闲超时（idleTimer）两路独立 cancel 源

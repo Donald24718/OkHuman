@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"okhuman/internal/textutil"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -73,9 +72,9 @@ func runOpt(a *AgentState, state *AppState) agent.RunOptions {
 	cfg := a.Cfg()
 	return agent.RunOptions{
 		DataDir:       cfg.Data.Dir,
-		ResultLimit:   cfg.Tools.ResultLimit,
-		DoomWarnAfter: cfg.Doom.WarnAfter,
-		FgTimeoutMS:   cfg.Tools.FgTimeoutSec * 1000,
+		ResultLimit:   cfg.Tools.ResultLimitOrDefault(),
+		DoomWarnAfter: cfg.Doom.WarnAfterOrDefault(), // 非正数会让持锁计数踩空（只能重启实例）
+		FgTimeoutMS:   cfg.Tools.FgTimeoutMSOrDefault(),
 		// 轮内搭车（2026-09-14 统一）：与 drain（runDrain）共享同一队列、splice 原子取走，
 		// 携带用户追加消息 + 已 settle 后台任务的通知（同一队列、同一逻辑）。
 		// 安全：本回调只在 lock.Run 内被调用（runLoop 持锁），drain 的下一轮
@@ -94,7 +93,7 @@ func runOpt(a *AgentState, state *AppState) agent.RunOptions {
 			bg.OnSettled = func(t *types.PendingBackgroundTask) {
 				cfg := a.Cfg()
 				notice := a.Agent().FormatBackgroundNotice(t, agent.RunOptions{
-					ResultLimit: cfg.Tools.ResultLimit,
+					ResultLimit: cfg.Tools.ResultLimitOrDefault(),
 					DataDir:     cfg.Data.Dir,
 				})
 				_, _ = enqueueAndWake(state, a, notice, types.QueueKindBGNotice, makeOnEvent(state, a))
@@ -159,8 +158,8 @@ func assembleBatch(msgs []types.QueuedMessage) (message, kind string, label *str
 // enqueueAndWake 唯一入队入口（2026-09-14）：在 state.mu 内原子完成
 // "取队列位置 + 入队 + 取/起活动 drain"——入队与 drain 的终止判定同一把锁，
 // 不存在"drain 正要退出时入队落空、消息挂起"的竞态（旧 startDrain 两把锁
-// 判定之间的窗口，2026-09-14 修）。两个调用方：/enqueue 与后台 settle
-// 与后台 settle 通知（同一逻辑）。返回 handle（可等 done 读 res）+ 入队前
+// 判定之间的窗口，2026-09-14 修）。两个调用方：/enqueue 与后台 settle 通知
+// （同一逻辑）。返回 handle（可等 done 读 res）+ 入队前
 // 队列已有条数。
 // kind 决定这条消息在轮内搭车时怎么被标记（types.QueueKindUser /
 // QueueKindBGNotice，2026-10-25）——不再由正文前缀反推。
@@ -250,9 +249,7 @@ func makeOnEvent(state *AppState, a *AgentState) func(types.AgentEvent) {
 
 // copyQueue 复制一份队列快照（读侧不持锁时用；MessageQueue 会被整体替换，
 // 但复制能避免与后续 append 共享底层数组）。此前它叫 queuedItems 并被描述成
-// "结构化投影（text + kind）"——那层投影早已不存在，函数只是恒等拷贝。系统通知 /
-// 用户"气泡，不必再在前端硬编码前缀去猜。旧的 queued 字段照旧输出
-// （queuedTexts），外部消费者协议不变——新增字段向后兼容。
+// "结构化投影（text + kind）"——那层投影早已不存在，函数只是恒等拷贝。
 func copyQueue(qs []types.QueuedMessage) []types.QueuedMessage {
 	if len(qs) == 0 {
 		return nil
@@ -363,7 +360,7 @@ func startHeartbeat(state *AppState, a *AgentState, tickMS int) func() {
 				continue
 			}
 			state.LastRunEnd.Store(now)
-			fmt.Fprintf(os.Stderr, "[heartbeat] 空闲 %d 分钟无 run → 主动开启一轮（阈值 %d 分钟）\n",
+			state.logf("[heartbeat] 空闲 %d 分钟无 run → 主动开启一轮（阈值 %d 分钟）",
 				(now-last)/60000, hb.IntervalMinOrDefault())
 			// 心跳走 user：它只在空闲时起新轮（heartbeatDue 见 running 直接
 			// 不触发），不会搭车 → 行为与改动前逐字一致。

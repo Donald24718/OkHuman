@@ -105,8 +105,9 @@ func AtomicWriteFile(file string, data string) error {
 
 // Persistence 单实例落盘器
 type Persistence struct {
-	dir   string
-	logMu sync.Mutex // 只保护文件写
+	dir       string
+	logMu     sync.Mutex // 只保护文件写
+	rotWarned bool       // 轮转失败已提示过（防刷屏；logMu 保护）
 	// enqMu 保证入队顺序 = 调用顺序；logCh 由唯一一个 writer 消费，
 	// 于是落盘顺序 = 入队顺序 = 调用顺序。
 	enqMu   sync.Mutex
@@ -199,7 +200,12 @@ func (p *Persistence) appendLogLine(line string) {
 	path := filepath.Join(p.dir, LogFile)
 	fi, err := os.Stat(path)
 	if err == nil && fi.Size() > LogMaxBytes {
-		_ = os.Rename(path, path+".old")
+		// 轮转失败不能静默：失败后日志永不轮转、无界增长。只记一次（防刷屏），
+		// 走 stderr 不走 p.Log——p.Log 会再追加本文件，故障期间自我放大。
+		if rerr := os.Rename(path, path+".old"); rerr != nil && !p.rotWarned {
+			p.rotWarned = true
+			fmt.Fprintf(os.Stderr, "[persist] 日志轮转失败（%s → %s）：%v（后续重试不再提示）\n", path, path+".old", rerr)
+		}
 	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {

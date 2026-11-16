@@ -27,12 +27,10 @@ import (
 // SummaryMarker 历史总结消息的 role:user 前缀（/history 与压缩存档共用识别）
 const SummaryMarker = "[历史总结]"
 
-// RenderSummary 把一条总结渲染成注入上下文的 user 消息：
-// 表头（第几条/覆盖 seq 区间/时间）→ 硬截断提醒（若有，放在正文之前，模型先读到）
-// → 正文 → 两条原文指针（总结文本 + 被压掉的完整存档）。
-// 正文与指针分开存：正文是唯一计量口径（见 Manager 的 summary_max_chars），
-// 指针永不截断 —— 截断了更要去读原文。
-func RenderSummary(idx, total int, sm types.SummaryEntry) string {
+// RenderSummary 把一条总结渲染成注入上下文的 user 消息：marker →（若被硬截断）一行提醒
+// → 正文 → 被压掉的完整原文路径。只有正文参与计量（见 Manager 的 summary_max_chars）；
+// 提醒与路径都不截断 —— 正文被截断了更要去读原文。
+func RenderSummary(sm types.SummaryEntry) string {
 	var b []string
 	b = append(b, SummaryMarker)
 	if sm.Truncated {
@@ -47,6 +45,10 @@ func RenderSummary(idx, total int, sm types.SummaryEntry) string {
 
 // ToolResultMarker 孤儿 tool 降级 user 文本的前缀（与旧 TS 版一致，供对比）
 const ToolResultMarker = "[工具结果"
+
+// missingToolResult 补在「声明了 tool_calls 却没有结果」那一轮后面的占位结果。
+// 成因：assistant+tool_calls 先落盘、tool 结果逐条追加，进程在中间被 kill（重启/OOM）。
+const missingToolResult = "（结果缺失：进程在工具执行中被中断，这条调用的结果没有落盘）"
 
 // 全局注入解析器（server 包启动时 ConfigureInjectResolver；/reset 重建）。
 // 原子指针（2026-09-14 审计修：旧裸指针在 /inject 触发的压缩（读）与 /reset
@@ -67,16 +69,24 @@ func ClearResolverCacheEntry(id string) {
 
 // ComposeMessages 会话状态 → LLM 请求（纯函数）
 func ComposeMessages(session *types.SessionState, systemPrompt string) []types.Message {
-	// 孤儿 tool 判定：tool_call_id 不在任何 assistant.tool_calls 里
+	// 两个方向的残缺各要一条路径处理：
+	//  - tool 消息的 call_id 不在任何 assistant.tool_calls 里 → 降级成 user 文本（保 role 交替合法）；
+	//  - assistant 声明了 tool_calls 却没有对应 tool 结果 → 补一条占位结果。后者是 OpenAI
+	//    协议的硬要求（每个 tool_call 必须有对应 tool 消息，否则整个请求被拒），且没有它
+	//    模型就看不见「这次调用发生过」，会把同一条命令再跑一遍。
 	callIds := map[string]bool{}
+	answered := map[string]bool{}
 	for i := range session.Messages {
 		for _, tc := range session.Messages[i].ToolCalls {
 			callIds[tc.ID] = true
 		}
+		if session.Messages[i].Role == "tool" && session.Messages[i].ToolCallID != nil {
+			answered[*session.Messages[i].ToolCallID] = true
+		}
 	}
 	out := []types.Message{{Role: "system", Content: systemPrompt}}
-	for i, sm := range session.Summaries {
-		out = append(out, types.Message{Role: "user", Content: RenderSummary(i, len(session.Summaries), sm)})
+	for _, sm := range session.Summaries {
+		out = append(out, types.Message{Role: "user", Content: RenderSummary(sm)})
 	}
 	for _, e := range session.Messages {
 		if e.Role == "tool" {
@@ -106,6 +116,13 @@ func ComposeMessages(session *types.SessionState, systemPrompt string) []types.M
 				m.ReasoningContent = e.ReasoningContent
 			}
 			out = append(out, m)
+			for _, tc := range e.ToolCalls {
+				if answered[tc.ID] {
+					continue
+				}
+				id := tc.ID
+				out = append(out, types.Message{Role: "tool", ToolCallID: &id, Content: missingToolResult})
+			}
 		}
 	}
 	return out
@@ -141,11 +158,20 @@ type Est struct {
 	AttachTokens int
 }
 
-// NewEst 从配置造估算口径（cpl<=0 退回 1.5，负附件按 0）。
-func NewEst(cpl float64, attachTokens int) Est {
+// defaultCharsPerToken + cplOrDefault：字符↔token 的默认换算比例只在这里定义一次
+// （原先 NewEst / EstimateTokens / EstimateMessageTokens 各写了一份 1.5）。
+const defaultCharsPerToken = 1.5
+
+func cplOrDefault(cpl float64) float64 {
 	if cpl <= 0 {
-		cpl = 1.5
+		return defaultCharsPerToken
 	}
+	return cpl
+}
+
+// NewEst 从配置造估算口径（cpl 非正数退回默认，负附件按 0）。
+func NewEst(cpl float64, attachTokens int) Est {
+	cpl = cplOrDefault(cpl)
 	if attachTokens < 0 {
 		attachTokens = 0
 	}
@@ -205,10 +231,7 @@ func sessionChars(session *types.SessionState, est Est) int {
 
 // EstimateTokens 字符数估算 token（token≈chars/chars_per_token，向上取整）
 func EstimateTokens(text string, cpl float64) int {
-	if cpl <= 0 {
-		cpl = 1.5
-	}
-	return int(math.Ceil(float64(textutil.UTF16Len(text)) / cpl))
+	return int(math.Ceil(float64(textutil.UTF16Len(text)) / cplOrDefault(cpl)))
 }
 
 // EstimateMessageTokens 单条消息估算 token = 字符数 / cpl。
@@ -217,11 +240,7 @@ func EstimateTokens(text string, cpl float64) int {
 // 四方审查发现）：两条路径已经漂移，压缩预算循环走的那条会把中文参数多算 3 倍。
 // 现在非 assistant 却带 tool_calls 的条目也会被计入 —— 宁可多算也不少算。
 func EstimateMessageTokens(m types.RawEntry, e Est) int {
-	cpl := e.Cpl
-	if cpl <= 0 {
-		cpl = 1.5
-	}
-	return int(math.Ceil(float64(messageChars(m, e)) / cpl))
+	return int(math.Ceil(float64(messageChars(m, e)) / cplOrDefault(e.Cpl)))
 }
 
 // ContextStats /health 的上下文统计
@@ -238,6 +257,7 @@ type SummaryStat struct {
 
 type ContextStats struct {
 	Messages        int           `json:"messages"`
+	MaxTokens       int           `json:"max_tokens"` // 生效的 context.max_tokens（WebUI 用量条一直读这个字段，此前不存在）
 	SummaryCount    int           `json:"summary_count"`
 	SummaryLimit    int           `json:"summary_limit"`     // context.keep_summaries
 	SummaryMaxChars int           `json:"summary_max_chars"` // 单条正文硬上限
@@ -248,6 +268,17 @@ type ContextStats struct {
 	TotalTokens     int           `json:"total_tokens"`
 	MsgChars        int           `json:"msg_chars"`
 	SummaryChars    int           `json:"summary_chars"`
+}
+
+// Stats /health 与 /status 的上下文统计：会话与**生效**配置在同一把锁里一次取走。
+// 原先由 server 传 cfg.Context.*（config 原值）进来，keep_summaries 配成 5 就回显 5，
+// 而窗口实际是 1——两处口径不一致（2026-11-16 收到这里，调用方不再自己拼配置）。
+func (m *Manager) Stats() ContextStats {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st := ContextStatsOf(m.session, m.cfg.CharsPerToken, m.cfg.AttachmentTokens, m.cfg.KeepSummaries, m.cfg.SummaryMaxChars)
+	st.MaxTokens = m.cfg.MaxTokens
+	return st
 }
 
 // ContextStatsOf 会话状态 → /health 统计
