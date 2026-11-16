@@ -94,13 +94,18 @@ jobs:
         # 打 tag 时写的那段说明就是给人看的摘要；正文为空时使用者只看到三个包名。
         # 试过 GitHub 的 generate_release_notes：那一步成功但正文仍是空的，故自己写。
         run: |
-          git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > RELEASE_NOTES.md
-          test -s RELEASE_NOTES.md || printf '（本次未写说明，改动见提交历史）\n' > RELEASE_NOTES.md
-          ls -l artifacts/ | head -5
-          wc -c RELEASE_NOTES.md
+          # 取 tag 对象的正文段（头部 object/type/tag/tagger 之后到文件末尾）。
+          git cat-file tag "${GITHUB_REF_NAME}" | sed -n '/^$/,$p' | tail -n +2 > "$notes"
+          test -s "$notes" || printf '（本次未写说明，改动见提交历史）\n' > "$notes"
+          ls -l artifacts/ | head -5; wc -c "$notes"; head -3 "$notes"
+        env:
+          notes: ${{ github.workspace }}/RELEASE_NOTES.md
 
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
           fail_on_unmatched_files: true
-          body_path: RELEASE_NOTES.md
+          # 绝对路径：v0.13.0 实测这一对（%(contents) + 相对 body_path）没生效，正文退成了
+          # commit message；改成从 tag 对象取正文 + 绝对路径，并把内容打进日志便于下次确诊
+          # （本机没有 GitHub token，下载不了 Actions 日志，只能靠日志留证）。
+          body_path: ${{ github.workspace }}/RELEASE_NOTES.md
