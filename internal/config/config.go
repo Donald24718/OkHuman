@@ -109,7 +109,8 @@ type HeartbeatCfg struct {
 const DefaultHeartbeatPrompt = "（心跳：系统检测到你已空闲——最后一次 run 结束至今没有新的 run，现在由系统主动开启一轮。这不是主人发的消息，不构成新任务授权。请自查：挂起的后台任务是否出了结果、之前接下的活是否收尾、有没有明显该推进的下一步、有没有需要验证的结果。有就继续做；没有就一句话说明当前状态然后停下。不要为了找事做而执行无关操作，不要重复已完成的事，不要主动对外联系任何人。）"
 
 // Default 内置兜底：default.json 里没写的键（hard_trunc_chars、attachment_tokens、heartbeat 整段等）
-// 一直取这里的值，键写错被忽略时也回落到这里——所以两边同名的键必须一致（data.dir 例外：各实例自用）。
+// 一直取这里的值，键写错被忽略时也回落到这里，所以两边同名的键必须一致。数据目录出厂取 $HOME/.okhuman，
+// 随仓库的 config/default.json 不写 data 段；各实例由它自己的 default.json 或 OKHUMAN_DATA_DIR 指定。
 // KnownKeys 某配置段允许写的键（取自结构体的 json tag）。POST /config 用它拒绝打错字的键：
 // 未知键此前会被原样接受并落进 user.json，用户以为改了，其实什么都没生效
 // （2026-11-13 四方审计 E3）。别名（*_ms）在调用前已由 NormalizeTimeUnits 换算掉。
