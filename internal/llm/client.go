@@ -37,7 +37,7 @@ type ClientConfig struct {
 	MaxResponseBytes int64
 }
 
-// OpenAiClient 流式/非流式双方法
+// OpenAiClient 只有流式一条路（非流式 Complete 已于 2026-11-12 删除）
 type OpenAiClient struct {
 	cfg  ClientConfig
 	http *http.Client
@@ -226,9 +226,9 @@ type usageDetails struct {
 // ---------- 流式（主循环用） ----------
 
 // sseFrame llama.cpp SSE 帧（choices 为空 + usage = 尾块）
-// wireUsage / wireTimings：非流式响应与 SSE 尾块里这两段 JSON 是同一个形状，
-// 此前各自匿名声明一遍，折成 types.Usage 的代码也各写一遍（缓存命中数的优先级
-// 一改就只改一边，2026-11-12 归并）。
+// wireUsage / wireTimings：SSE 尾块与流式末帧里的 usage 是同一个形状，只声明一处、
+// 折成 types.Usage 的折叠代码也只写一份（缓存命中数的优先级一改两边同时生效，
+// 2026-11-12 归并；当时还包含非流式响应，那条路同批已删）。
 type wireUsage struct {
 	PromptTokens        int           `json:"prompt_tokens"`
 	CompletionTokens    int           `json:"completion_tokens"`
