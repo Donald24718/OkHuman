@@ -16,7 +16,7 @@
   "context": {
     "max_tokens": 150000,
     "keep_recent_chars": 60000,
-    "keep_summaries": 5,
+    "keep_summaries": 1,
     "summary_max_chars": 30000
   },
   "tools": {

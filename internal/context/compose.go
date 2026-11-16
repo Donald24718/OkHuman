@@ -19,7 +19,6 @@ import (
 	"okhuman/internal/textutil"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	"okhuman/internal/inject"
 	"okhuman/internal/types"
@@ -35,19 +34,13 @@ const SummaryMarker = "[历史总结]"
 // 指针永不截断 —— 截断了更要去读原文。
 func RenderSummary(idx, total int, sm types.SummaryEntry) string {
 	var b []string
-	b = append(b, fmt.Sprintf("%s %d/%d · 覆盖 seq %d-%d · 生成于 %s",
-		SummaryMarker, idx+1, total, sm.SeqFrom, sm.SeqTo,
-		time.UnixMilli(sm.CreatedAt).UTC().Format("2006-01-02 15:04 UTC")))
+	b = append(b, SummaryMarker)
 	if sm.Truncated {
-		b = append(b, fmt.Sprintf("⚠️ 本条总结是硬截断的：正文原有 %d 字符，只保留了前面一部分，"+
-			"更早的内容不在这里 —— 需要时按下面的原文路径去读。", sm.OrigChars))
+		b = append(b, fmt.Sprintf("⚠️ 本条总结是硬截断的：只保留了前面一部分，其余不在这里 —— 需要时按下面的原文路径去读。"))
 	}
 	b = append(b, sm.Content)
-	if sm.SummaryFile != "" {
-		b = append(b, "[本条总结文本："+sm.SummaryFile+" —— 回忆任务轨迹先看这里（时间线/关键实体/完成状态）]")
-	}
 	if sm.RecordFile != "" {
-		b = append(b, "[本条覆盖的完整原文已存档："+sm.RecordFile+" —— 需要被压掉的细节时用 bash cat/grep 按需抓回]")
+		b = append(b, "[本条覆盖的完整原文已存档："+sm.RecordFile+" —— 需要细节时用 bash cat/grep 按需抓回]")
 	}
 	return strings.Join(b, "\n")
 }

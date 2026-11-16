@@ -64,38 +64,25 @@ func TestSummaryHardTruncate(t *testing.T) {
 	}
 }
 
-// TestSummaryWindowDrop：keep_summaries=2 → 多次压缩后窗口里只剩最新 2 条，
-// 且顺序是旧→新（丢弃最旧的，不做任何合并）。
-func TestSummaryWindowDrop(t *testing.T) {
+// TestSingleSummaryReplaced：多次压缩后始终只有 1 条总结，且它的 seq 区间向前扩张
+// （新总结覆盖全场、替换旧的那条——旧 cfc5315^ 语义，不是并列窗口）。
+func TestSingleSummaryReplaced(t *testing.T) {
 	var evs []CompressEvent
-	m := newWindowManager(t, []llm.FakeStep{{Type: "compress", Scope: "history", Text: "（假压缩总结）"}}, 2, 30000)
+	m := newWindowManager(t, []llm.FakeStep{{Type: "compress", Scope: "history", Text: "（假压缩总结）"}}, 1, 30000)
 	m.AddCompressListener(func(e CompressEvent) { evs = append(evs, e) })
 	addLong(m, 12)
 	sess := m.Session()
-	if len(sess.Summaries) > 2 {
-		t.Fatalf("窗口超过 keep_summaries=2：%d 条", len(sess.Summaries))
+	if len(sess.Summaries) != 1 {
+		t.Fatalf("单条总结语义下应恰好 1 条，实得 %d", len(sess.Summaries))
 	}
 	if len(evs) < 3 {
-		t.Fatalf("压了不到 3 次（%d 次），测不出丢弃", len(evs))
+		t.Fatalf("压了不到 3 次（%d 次），测不出替换", len(evs))
 	}
-	if len(sess.Summaries) != 2 {
-		t.Fatalf("应保留 2 条，实得 %d", len(sess.Summaries))
-	}
-	if sess.Summaries[0].SeqTo >= sess.Summaries[1].SeqTo {
-		t.Fatalf("窗口顺序应为旧→新：%+v %+v", sess.Summaries[0], sess.Summaries[1])
-	}
-	droppedSeen := false
-	for _, e := range evs {
-		if strings.Contains(e.Detail, "丢弃最旧一条") {
-			droppedSeen = true
-		}
-	}
-	if !droppedSeen {
-		t.Fatalf("丢弃没有进事件日志（UI 会看不见）")
+	if sess.Summaries[0].SeqFrom != 1 {
+		t.Fatalf("新总结应从最早一段起算，实得 %+v", sess.Summaries[0])
 	}
 }
 
-// TestSummaryThinkingNotCounted：压缩轮的思考不计入正文长度，也不进摘要正文。
 func TestSummaryThinkingNotCounted(t *testing.T) {
 	think := strings.Repeat("思考", 2000)
 	m := newWindowManager(t, []llm.FakeStep{{
@@ -122,11 +109,11 @@ func TestSummaryThinkingNotCounted(t *testing.T) {
 // 否则 keep_summaries=0 会变成"无限窗口"、summary_max_chars=0 会变成"不截断"。
 func TestNormalizeCfg(t *testing.T) {
 	c := NormalizeCfg(Cfg{KeepSummaries: 0, SummaryMaxChars: -1})
-	if c.KeepSummaries != 5 || c.SummaryMaxChars != 30000 {
+	if c.KeepSummaries != 1 || c.SummaryMaxChars != 30000 {
 		t.Fatalf("未归一：%+v", c)
 	}
 	c2 := NormalizeCfg(Cfg{KeepSummaries: 3, SummaryMaxChars: 2000})
-	if c2.KeepSummaries != 3 || c2.SummaryMaxChars != 2000 {
-		t.Fatalf("合法值被改了：%+v", c2)
+	if c2.KeepSummaries != 1 || c2.SummaryMaxChars != 2000 {
+		t.Fatalf("窗口应固定为 1（单条总结语义）：%+v", c2)
 	}
 }

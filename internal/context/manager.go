@@ -62,8 +62,8 @@ type Cfg struct {
 // numChecks，而 keep_summaries=0 会让"窗口"变成不限制、summary_max_chars=0
 // 会让 textutil.UTF16Truncate 变成不截断 —— 两个都是静默失效。
 func NormalizeCfg(c Cfg) Cfg {
-	if c.KeepSummaries < 1 {
-		c.KeepSummaries = 5
+	if c.KeepSummaries != 1 {
+		c.KeepSummaries = 1 // 单条总结（旧语义）：窗口固定 1，多条并列已废弃
 	}
 	if c.SummaryMaxChars < 1000 {
 		c.SummaryMaxChars = 30000
@@ -380,19 +380,21 @@ func (m *Manager) doCompress(batch []types.RawEntry) compressOutcome {
 	streamIdleMS := m.cfg.StreamIdleMS
 	maxChars, keepWin := m.cfg.SummaryMaxChars, m.cfg.KeepSummaries
 	nMsg := len(m.session.Messages)
-	nSum := len(m.session.Summaries)
 	// 批次的真实 seq 区间：m.seq 是累计条数（只增不减），当前会话 N 条对应真实 seq
 	// 是 seq-N+1..seq，最旧 B 条是 seq-N+1..seq-N+B。旧公式写成 seq-B+1..seq，
 	// 系统性偏出 keep 窗条数 → 每条总结的注入头"覆盖 seq a-b"、压缩指令、/history、
 	// /status 全是错值（2026-11-13 第四轮 N6，错自 cfc5315）。
 	seqFrom, seqTo := batchSeqRange(m.seq, nMsg, len(batch))
+	// 新总结的真实覆盖区间与它吃掉了几段旧总结：这些账只能由代码算（模型对
+	// 自己上下文里的绝对 seq 没有可靠概念，2026-11-13 第七轮 P6 就是它自己写错），
+	// 但要把数字交给它，让它照抄成第一行——不带这段标注模型就不知道自己在复述哪一段。
+	prevFrom := seqFrom
+	if len(m.session.Summaries) > 0 && m.session.Summaries[0].SeqFrom < prevFrom {
+		prevFrom = m.session.Summaries[0].SeqFrom
+	}
 	m.mu.Unlock()
 
-	instruction := fmt.Sprintf(
-		"本次待压缩的是本会话最旧的 %d 条消息（第 1 到第 %d 条，seq %d-%d）。"+
-			"它们之后的 %d 条消息是保留的最近原文，另有 %d 条已有的历史总结："+
-			"这些只作背景，不要重写、不要把它们合并进本条总结。\n",
-		len(batch), len(batch), seqFrom, seqTo, nMsg-len(batch), nSum) + compressPromptBody
+	instruction := compressPromptBody
 
 	const scope = "history"
 	const maxAttempts = 3
@@ -461,13 +463,10 @@ func (m *Manager) doCompress(batch []types.RawEntry) compressOutcome {
 		entry := types.SummaryEntry{Content: body, CreatedAt: time.Now().UnixMilli(),
 			SeqFrom: seqFrom, SeqTo: seqTo, OrigChars: origChars, Truncated: truncated,
 			SummaryFile: summaryPath, RecordFile: recordPath}
-		m.session.Summaries = append(m.session.Summaries, entry)
-		dropped := []types.SummaryEntry(nil)
-		if keepWin > 0 && len(m.session.Summaries) > keepWin {
-			k := len(m.session.Summaries) - keepWin
-			dropped = m.session.Summaries[:k]
-			m.session.Summaries = m.session.Summaries[k:]
-		}
+		// 单条总结（旧 cfc5315^ 语义）：新总结覆盖全场，替换旧的那条；seq 区间向前扩张。
+		dropped := m.session.Summaries
+		entry.SeqFrom = prevFrom
+		m.session.Summaries = []types.SummaryEntry{entry}
 		m.mu.Unlock()
 
 		truncNote := ""
