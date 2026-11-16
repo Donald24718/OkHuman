@@ -55,7 +55,7 @@ func TestResolvePromptDirPriority(t *testing.T) {
 	if got := resolvePromptDir("", "/root", "prompts"); got != filepath.Join("/root", "prompts") {
 		t.Errorf("config 相对目录应拼到项目根，实得 %q", got)
 	}
-	if got := resolvePromptDir("", "/root", ""); got != "/root" {
-		t.Errorf("config 目录为空时拼根（prompts.LoadPromptDir 会报缺目录），实得 %q", got)
+	if got := resolvePromptDir("", "/root", ""); got != "" { // 空→内联兜底；拼项目根不报错，会把仓库根的 README 等 *.md 当提示词
+		t.Errorf("没配提示词目录应返回空、走内联兜底，实得 %q", got)
 	}
 }
