@@ -1,0 +1,1 @@
+{"name": "bg-task-watch", "summary": "我起后台长任务与等待循环的做法（错法会永挂、占住进程组）。母文档只做路由：`incident-and-causes.md` 事故与两个根因（按名字查进程自匹配、只等成功标记）、`bind-together.md` 首选：收尾与任务绑在同一个脱离进程、`polling-rules.md` 真要轮询时的硬规矩、`find-and-clean.md` 找脱管等待进程与清理。等命令超 30 秒转后台的机制下都适用。", "keywords": "后台任务 等任务 长命令 挂住 永等 pgrep 等待循环 脱离进程 超时 收尾 exit flag 脱管 bash 孤儿进程", "updated_at": "2026-11-17"}

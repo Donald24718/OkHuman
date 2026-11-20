@@ -1,4 +1,6 @@
 
+
+> **归档**：踩坑原文，现行判据已在 `run.md` / `trouble.md` / `media.md`；冲突以那些为准。
 ## 2026-09-19 / 09-20 token 获取全失败："响应无 access_token"（同一个 bug 栽了两次）
 
 现象：每次取 token 都报"响应无 access_token"，手动 curl 同一 endpoint 同一凭据却正常——77 次响应全成功、0 次解析通过。

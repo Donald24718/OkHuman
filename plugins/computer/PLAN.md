@@ -1,3 +1,4 @@
+> **归档**：选型与规划旧文，非现行依据；现行做法见同目录各文件。
 # computer use 插件规划（2026-09-12，研究 Anthropic CUA / OpenAI CUA / UI-TARS / agent-vision-toolkit 后定）
 
 ## 一句话

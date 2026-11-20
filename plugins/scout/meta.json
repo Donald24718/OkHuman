@@ -1,1 +1,1 @@
-{"summary":"关键词检索服务（无向量）：扫插件/技能树建内存索引，:8480 提供 /search /reindex /doctor /health /doc；主键 kind:name，同名不取舍只报告。","keywords":"搜索 索引 找插件 找能力 该用哪个 检索 关键词 元信息 doctor 健康"}
+{"summary": "插件/技能索引服务（Go，:8480）：/search /reindex /doctor。母文档只做路由：`corpus-and-scoring.md` 什么进索引、字段边界与打分式、`why-no-vectors-no-disk.md` 为什么不放语义向量、为什么不落盘、`api.md` 端点与参数、`build-ops.md` 构建测试与起停运维。索引只在内存，真源是各条目的 meta.json。", "keywords": "搜索 索引 找插件 找能力 该用哪个 检索 关键词 元信息 doctor 健康", "updated_at": "2026-11-17"}

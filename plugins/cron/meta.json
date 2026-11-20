@@ -1,1 +1,1 @@
-{"summary":"定时任务插件（:8601）：为多个 OkHuman 实例管理定时任务，到点把任务 prompt 作为 user 消息 POST 到对应实例的 /enqueue（只管发不等回，拿入队位置即返回，2026-10-22 改）；每实例独立 CronStore 原子落盘，自带 HTTP 管理 API（/cron/*）与独立管理页，与主程序零代码耦合","keywords":"定时 计划 提醒 每天 每周 到点 定点 定时任务 排程 调度 自动跑 延时"}
+{"summary": "定时任务插件（:8601）：为多个 OkHuman 实例管理定时任务，到点把任务 prompt 作为 user 消息 POST 到对应实例的 /enqueue（只管发不等回，拿入队位置即返回，2026-10-22 改）；每实例独立 CronStore 原子落盘，自带 HTTP 管理 API（/cron/*）与独立管理页，与主程序零代码耦合。母文档只做路由——起停重编与 config/data→run.md；增删暂停立即跑与查询→api.md；为什么不等、补跑上限、拿不到 reply→link.md；到点没跑/入队失败→trouble.md。", "keywords": "定时 计划 提醒 每天 每周 到点 定点 定时任务 排程 调度 自动跑 延时"}

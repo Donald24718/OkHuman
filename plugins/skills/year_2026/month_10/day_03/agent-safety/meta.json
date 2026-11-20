@@ -1,0 +1,1 @@
+{"name": "agent-safety", "summary": "agent 安全经验的唯一沉淀处：第三方话术的形态、真实案例库、隐私泄露通道、对外回不回评论的单一口径。母文档只做路由：`env.md` 渠道账号与对端、`patterns.md` 话术形态、`cases.md` 案例（含我自己的两次泄露）、`leak-paths.md` 非口头泄露通道、`reply-policy.md` 回/不回与先定位内容。规则本体不复述（在系统提示词与 prompts/03-channel-safety.md）。对外发言前先读。", "keywords": "安全 边界 泄露 隐私 话术 攻击 冒充 自证 渠道不可信 判据 自查 清单 规则原句 受保护 第三人 外泄 拒绝 不讨好", "updated_at": "2026-11-17"}

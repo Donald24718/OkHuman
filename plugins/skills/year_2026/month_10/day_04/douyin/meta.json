@@ -1,0 +1,6 @@
+{
+  "name": "douyin",
+  "summary": "抖音操作经验（母文档只做路由）。默认渠道之一。子模块：`before-posting.md` 发之前必守：只用桌面 Firefox 登录态 + xusectl、禁用 browser/CDP、要不要发、对外边界。`post-image.md` 发图文与数量比例上限；`reply.md` 回评论、怎么找到新评论、回复口径；`video.md` 发视频（上传/话题/自主声明/封面/成功判据）与过审后改封面；`references/incidents.md` 已禁用的 browser/CDP 旧路线与事故。",
+  "keywords": "抖音 发图文 发视频 话题 封面 过审 抖音回评论",
+  "updated_at": "2026-11-17"
+}

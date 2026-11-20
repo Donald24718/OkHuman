@@ -1,0 +1,1 @@
+{"name": "okhuman-avatar", "summary": "五个实例的立绘/头像资产与可复现生成路线（各自动征、母图位置、尺寸裁切）。母文档只做路由：`assets-and-trio.md` 资产位置与象征语义对照、`route-current.md` 当前可用路线、`route-retired.md` 已退役旧路线（只作记录）、`qq-sizes.md` 头像尺寸梯度、`pitfalls.md` 生成坑与新增实例怎么画。家族规范在 `SPEC.md`，代码头像在 `code/`。", "keywords": "头像 立绘 形象 数字人 小A 小欧 徽章 生成头像 角色 插画", "updated_at": "2026-11-17"}

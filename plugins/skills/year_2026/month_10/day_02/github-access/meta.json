@@ -1,0 +1,1 @@
+{"name": "github-access", "summary": "GitHub 访问与 push（母文档只做路由）：先直连、不通再走跳板机 SOCKS 隧道。子文档：`env.md` 当前可达性与代理归属、`setup.md` 一次性 config 与跳板机免密、`push.md` 每次操作的测直连/起隧道/干活、`pitfalls.md` 踩过的坑、`web-pr.md` 网页发 PR 评论与关闭、`peer.md` 另一台差异。含失效条件。", "keywords": "github 推送 push 直连 网络 隧道 跳板 socks 密钥 仓库 克隆 pull issue PR star fork", "updated_at": "2026-11-17"}

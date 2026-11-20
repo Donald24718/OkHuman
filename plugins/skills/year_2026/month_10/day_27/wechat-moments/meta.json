@@ -1,0 +1,1 @@
+{"name": "wechat-moments", "summary": "微信朋友圈（桌面微信 Linux 版）发视频。母文档只做路由：`env.md` 桌面微信入口与登录态、`limits.md` 时长等硬限制与成功判据、`cut-to-30s.md` 压进时长上限且讲完核心的做法。只走 computer use（xusectl），不走 browser/CDP。", "keywords": "朋友圈 微信 发朋友圈 30秒 首帧 桌面微信 朋友圈视频", "updated_at": "2026-11-17"}

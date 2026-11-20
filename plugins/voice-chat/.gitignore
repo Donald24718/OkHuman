@@ -9,3 +9,4 @@ speaker/enrollments/
 **/*.log
 data/
 *.bak-*
+config.json

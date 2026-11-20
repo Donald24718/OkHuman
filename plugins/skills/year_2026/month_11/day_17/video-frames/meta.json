@@ -1,0 +1,1 @@
+{"name": "video-frames", "summary": "看任何来源的视频里有什么：按内容选步长抽帧拼成网格图注入自己上下文。母文档只做路由：`token-budget.md` 单图预算与格数上限的实测数、`density-by-content.md` 按内容选密度（讲解/PPT、短视频、爆发动作）、`pitfalls.md` 按画面挑帧不可靠与何时回单帧。B 站取流见 bilibili，注入用法见 view_image 插件。", "keywords": "看视频 视频里有什么 这视频讲了什么 看画面 拼帧 帧网格 录像里有什么 看动作 跳舞视频 体育视频", "updated_at": "2026-11-17"}

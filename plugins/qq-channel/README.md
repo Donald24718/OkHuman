@@ -1,111 +1,25 @@
 # qq-channel/ — QQ 官方渠道桥（okhuman-qq-bridge）
 
-把 OkHuman 实例接入 QQ 的**独立常驻进程**（Go，TS 版 bridge.ts + qq.ts 的 1:1 移植）：
-QQ 消息进 agent、agent 回复回 QQ。无监听端口，只有出站连接（QQ 网关 WebSocket + 实例 HTTP/SSE）。
+把 OkHuman 实例接入 QQ 的独立常驻进程：QQ 消息进 agent、agent 回复回 QQ；无监听端口，只有出站连接。**本文件不含链路细节、参数与指令表。**
 
-## 链路（常驻转发管道）
+## 要做什么 → 去哪个文件
 
-- **上行**：QQ 消息 → `POST {实例}/enqueue { message }`（入队即返，不等回合结束）
-- **下行**：桥常驻订阅 `GET {实例}/events`（SSE 广播）→ 按事件边界整段拆气泡发：
-  - thinking 整段 ≤2950 字（`[思考]` 前缀）
-  - text 整段 ≤3000 字
-  - tool_call → `[工具]`、tool_result → `[结果]`
-  - finish → flushAll + reply 兜底、error → `[出错]`
-  - 轮内 60s 静默 → 15s 轮询 `/history` 补发回尾 → 10min 放弃
-- 多 bot：`bots[]` 每项绑定一个实例（`instance` 字段），限流 `max_msgs_per_min`（默认 20）
-- 重连自愈：QQChannel 内部自动重连/重认证（heartbeat 30s / 重连 3s / 重认证 30s）
-- 收尾：SIGINT 优雅关闭所有 WS；SIGTERM 立即退出
+| 要做 | 文件 |
+|---|---|
+| 起停、重编、改 config、看运行时数据（token/msg_seq/让位令牌） | `run.md` |
+| 上/下行链路、气泡拆分与长度、多 bot、重连、解耦契约 | `link.md` |
+| QQ 里发 `/stop` `/restart` 这类控制指令；要不要开白名单 | `commands.md` |
+| 给 QQ 发文件（attach）、收 QQ 发来的文件落在哪 | `media.md` |
+| 排障 | `trouble.md` |
+| 踩坑档案（**归档**） | `LESSONS.md` |
 
-## 启动 / 停止 / 重建
+## 遇到现象 → 去哪个文件
 
-```bash
-# 长驻跑法：systemd user unit（日志在 journal；要进程死了自动拉起就在 unit 里加 Restart=on-failure——租约让位是干净退 0，不会被拉起）
-systemctl --user restart qq-bridge.service ; journalctl --user -u qq-bridge.service -n 80
-# 临时起一个测试 = 接管租约，正在跑的那个让位退 0（11-11 踩过一次）→ 测完要 restart 交回
-cd "<本目录>" && ./okhuman-qq-bridge
-
-# 改完源码后重建（子命令与服务是同一个二进制，但子命令是另起的短命进程 → 不必重启服务）
-cd "<本目录>" && go build -o okhuman-qq-bridge okhuman-qq-bridge.go
-```
-
-**改完源码 = 没干活，重编 + 真实启动验证 = 才干完**（2026-09-20 老 bug 复发的根因就是忘了 go build，见 LESSONS.md）。
-
-## QQ 侧控制指令（2026-10-18）
-
-QQ 里发**整条恰好等于**指令的消息，桥就地处理、**不转给 agent、不入队、不发 ACK**，直接把结果回给发送者：
-
-| 指令 | 打到实例 | 干什么 |
-|---|---|---|
-| `/stop`（别名 `/停` `/停止` `/中断`） | `POST /stop` | 中断 agent 循环：取消在飞 LLM 请求；正在执行工具则本次工具跑完、在下次 LLM 调用前强停。已生成的 partial 保留进会话 |
-| `/restart`（别名 `/reset` `/重开` `/重置`） | `POST /reset` | 先停，再清未发消息队列 / 注入附件 / 未完成后台任务，换会话；旧会话全文落盘（路径只写进实例日志与 WebUI，**不进 QQ**） |
-
-要点：
-- **必须整条 = 指令**（`/stop 一下`、`帮我 /stop` 都算普通消息），防误伤。
-- `/stop` 不清队列：队列里还有未发消息的话会接着开新轮，回复里会写明条数并提示发 `/restart`。
-- `/restart` 会**等当前轮完全收尾**才换会话（长工具在飞时可能很久）。超过 180 秒没等到，回复会说明"请求已送达、实例会在当前轮结束后换会话"，不是失败。
-- 门控（config.json 顶层，与 `data_dir` 同级）：`commands_enabled`（默认 true）、`command_openids`（sender openid 白名单，空 = 该 bot 绑定的渠道内所有人可用；渠道本身已按 `channel_id` / `c2c:<openid>` 过滤）。**能发指令 = 能中断和清空该实例的会话**，接的是别人的 QQ 就把白名单填上。
-- 回复文案不带本机绝对路径（QQ 是外部渠道）。
-
-测试：`qq_commands_test.go`（识别与别名、白名单门控、端点调用与错误原样带出、旧实例无 `record` 字段的兼容、文案不泄漏本机路径、指令绝不转发给 agent、普通消息不受影响）。
-
-## 配置（本目录 config.json，config.json.example 为模板）
-
-- `data_dir`：运行时数据目录。**相对路径按可执行文件所在目录解析**（`pluginRoot()`：exe 目录里有 config.json 即用之，否则回退 `.`）；绝对路径直接用
-- `instances[]`：要接入的 OkHuman 实例（`{ id, url }`），id 不可重复
-- `bots[]`：QQ 开放平台凭据 + 绑定：`app_id` / `client_secret` / `channel_id`（c2c 形如 `c2c:<openid>`）/ `instance` / `max_msgs_per_min`
-- `markdown_enabled`：markdown 消息（md=2）开关
-- `client_secret` 不入日志；config.json 已 gitignore（真实凭据不入库）
-
-## 数据与状态（本目录 data/，已 gitignore）
-
-- `channels/qq/tokens/<botId>.json`：access_token 盘缓存（原子写；QQ 返回的 `expires_in` 兼容字符串/数字两种形态，`json.Number` 解析——2026-09-19 修的移植 bug）
-- `channels/qq/msg_seq`：c2c 消息序号持久化（QQ 要求单调递增，重启从盘恢复，归 1 可能被拒）
-- `channels/qq/bridge.gen`：单实例**让位令牌**（2026-11-08 起取代 bridge.lock；内容 = 当前持有者的随机令牌，不含 PID）。新桥写它即接管，旧桥 2s 内自检令牌不是自己就退 0 —— **再起一个不必先杀旧的**，也不会再有陈旧锁挡门（LESSONS 09→11-08）
-
-⚠️ **data_dir 在启动时算定**：移动本目录后，存活进程仍写旧绝对路径（2026-09-21 重排插件目录后数据落回 OkHuman_p 根目录就是它）。挪目录必做三件事：杀旧桥 → 迁移 data（token/msg_seq 取新的）→ 新路径重拉。
-
-## 目录
-
-```
-okhuman-qq-bridge        可执行文件（gitignore，go build 产物）
-okhuman-qq-bridge.go     全部源码（单文件）
-config.json              运行配置（gitignore，真实凭据）
-config.json.example      配置模板
-data/                    运行时数据（token / msg_seq / 让位令牌）
-archive/                 迁移前日志存档（gitignore）
-LESSONS.md               踩坑档案（token 解析 / 忘重编 / 挪目录数据落旧路径 / 日志迁 /tmp）
-```
-
-## 排障
-
-1. **"响应无 access_token"**：先对三个时间——源码 mtime、二进制 mtime、日志里 bug 出现的时间；二进制比源码旧 = 没重编（09-20 案例）。二进制是新的仍报错 = 看 QQ 原始响应体（别信错误信息，09-19 案例实际是 `expires_in` 类型不符）。详见 LESSONS.md
-2. **数据写到旧路径**（挪目录后）：见上文 ⚠️——杀进程、迁数据、新路径重拉；`readlink /proc/<pid>/cwd` 可确认进程实际位置
-3. **双份转发 / 重复入队**（让位没生效才会见）：日志里搜「让位退出」——没出现 = 旧桥卡在阻塞调用里超过 2s，手动 `kill` 它；`cat data/channels/qq/bridge.gen` 看现在谁持有
-4. **消息被 QQ 拒**：msg_seq 回退——确认 `data/channels/qq/msg_seq` 存在且比上次发送值大
-5. **QQ 发了没反应**：`journalctl --user -u qq-bridge.service -n 80` 看有没有"已订阅 /events"（每个 bot×实例一条）；再手动 `curl -X POST {实例}/enqueue` 验证实例可达
-
-## 媒体进出（outbox 2026-09-24 立 / attach 2026-11-11 / 入站按实例分 2026-11-12）
-
-发文件一律显式投递，**用子命令、不自己拼路径**：
-
-```bash
-./okhuman-qq-bridge attach <文件>   # 按 OKHUMAN_SELF_URL 认出我 = 哪个实例 → 取 config 里属于我的那个 bot
-# 可选 --bot <app_id> / --to <实例id>；--dry-run 只打印将投给谁，不落文件
-```
-
-映射写在 config（`instances[].url` + `bots[].instance`），所以不用手抄 app_id；认不出自己 /
-该实例配多个 bot / `--bot` 与实例不符 → **报错不猜**（猜错就发进别人的会话，收不回）。手写法
-`cp … "outbox/<botAppID>/"` 仍可用，但可能被 2s 轮询拾到半截文件（attach 先写 `.staging` 再 rename）。
-发出去就删掉原文件（2026-11-12 改：原先归档 `sent/`，到那天已积 475 个 / 730MB 且无 retention；要留档在 attach 前自己存一份）。失败留原位重试；图片扩展名按图片、其余按文件。
-入站（你发来的附件）落 `/tmp/qq-inbox/<实例 id>/<ts36>-<安全名>`（`/inject` 通知带绝对路径）；按实例一口 2026-11-12 起，此前两实例共用一口；目录动态建，默认留 1 天、在下次落盘时清（tmpfs 占内存）。**入站在常驻进程里跑，改这条要重启桥**。
-
-历史坑（09-24 修）：① QQ `/v2/users/{openid}/files` 返回的 `file_info` 是 **base64 字符串**
-不是对象，按 map 解析恒 nil → “缺 file_info”；② 文件消息 `msg_seq` 原用 WS 会话 seq
-（`c.seq`），与文本消息的 `c2cMsgSeq` 不同源，回退被 QQ 拒 → 统一 `nextC2CSeq()`；③ 正文里 `[File: <路径>]` 自动发文件曾存在，因纯副作用（思考段引用路径就误发）整块删除（2026-09-24）。
-
-## 解耦契约自检
-
-- [x] 独立进程、独立二进制，不 import 任何 OkHuman 模块
-- [x] 与主进程仅 HTTP 三条线：`POST /enqueue`、`GET /events`（SSE）、`GET /history`（兜底轮询）
-- [x] 数据全在本目录 `data/`，不写主进程数据目录
-- [x] 挂掉只断 QQ 渠道，主进程与其他插件不受影响
+| 现象 | 文件 |
+|---|---|
+| 改了源码行为没变 / "响应无 access_token" | `trouble.md`（先比二进制与源码 mtime） |
+| QQ 发了没反应；双份转发、重复入队 | `trouble.md`（订阅、让位令牌） |
+| 消息被 QQ 拒 | `trouble.md`（msg_seq 回退） |
+| 数据写到旧目录 | `run.md`（data_dir 启动时算定） |
+| 想发到 QQ 却没发出去 / 发错了会话 | `media.md` |
+| `/stop` 没中断、`/restart` 卡很久 | `commands.md` |

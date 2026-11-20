@@ -1,0 +1,6 @@
+{
+  "name": "xhs",
+  "summary": "小红书操作经验（母文档只做路由）。主人 2026-10-27 裁定：不再发小红书，除非明确点名，已发的不动。子模块：`before-posting.md` 动手前必守：只许 computer use（xusectl），禁用 browser/CDP 与站内签名接口、对外边界。`reply.md` 回评论与回复口径、回复字数上限；`post.md` 发图文/视频笔记与图片比例数量上限；`references/incidents.md`、`references/legacy-browserctl.md` 已禁用旧路线的事故与技术结论。",
+  "keywords": "小红书 笔记 发笔记 图文 小红书回评论",
+  "updated_at": "2026-11-17"
+}

@@ -1,0 +1,1 @@
+{"name": "hegel-series", "summary": "黑格尔人话版短片的一条完整流水线（两集实测跑通，第 3 集起有更新）。母文档只做路由：`pipeline.md` 完整顺序与现行做法、`acceptance.md` 验收判据、`script-pitfalls.md` 改脚本的硬坑、`theme-pitfalls.md` 按主题的硬坑（配音/排片时长/合成前置/音频/字幕/画面一致性/封面/verify）、`published.md` 已投清单、`peer.md` 另一台差异。模型侧见条目 minimax-h3 与 comfyui，配音见 tts。", "keywords": "黑格尔 短片 系列 流水线 旁白 配音 字幕 镜头 后期 edl", "updated_at": "2026-11-17"}
