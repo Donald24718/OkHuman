@@ -116,7 +116,7 @@ func (r *Resolver) ClearCache(id string) {
 // 返回 (是否真的改写, 失败原因)。侧车不存在或已经是剥离提示 → (false, nil)：
 // 那是"没什么可剥"，不是失败。写盘失败（盘满/只读/权限）→ (false, err)，
 // 由调用方（POST /strip-injects）把原因回给用户——早先这里折成 bool，
-// 网页上只会说"剥了 0 个"，看不出是只读还是满了（2026-11-12 审查指出）。
+// 网页上只会说"剥了 0 个"，看不出是只读还是满了（2026-11-12 小邻指出）。
 func StripSidecar(dir, id string) (bool, error) {
 	p := filepath.Join(dir, id+".json")
 	old, err := os.ReadFile(p)

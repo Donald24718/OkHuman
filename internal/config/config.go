@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -38,7 +37,7 @@ type LLMCfg struct {
 	BaseURL string `json:"base_url"`
 	Model   string `json:"model"`
 	APIKey  string `json:"api_key"`
-	// TimeoutSec 非流式 complete 已删（2026-11-12）：现在只作 idleFallback 的下限（秒）。
+	// TimeoutSec 非流式 complete 的整体请求超时（秒）。
 	TimeoutSec int `json:"timeout_sec"`
 	// StreamIdleSec 主循环流式空闲超时（秒，2026-10-18 A5）：连续这么久没有任何
 	// wire 字节（含 ": ping" 注释帧）→ 判空闲超时、本轮报错收尾。此前主循环
@@ -108,9 +107,8 @@ type HeartbeatCfg struct {
 // 操作、禁止主动对外联系（空闲时最容易出越权动作）。
 const DefaultHeartbeatPrompt = "（心跳：系统检测到你已空闲——最后一次 run 结束至今没有新的 run，现在由系统主动开启一轮。这不是主人发的消息，不构成新任务授权。请自查：挂起的后台任务是否出了结果、之前接下的活是否收尾、有没有明显该推进的下一步、有没有需要验证的结果。有就继续做；没有就一句话说明当前状态然后停下。不要为了找事做而执行无关操作，不要重复已完成的事，不要主动对外联系任何人。）"
 
-// Default 内置兜底：default.json 里没写的键（hard_trunc_chars、attachment_tokens、heartbeat 整段等）
-// 一直取这里的值，键写错被忽略时也回落到这里，所以两边同名的键必须一致。数据目录出厂取 $HOME/.okhuman，
-// 随仓库的 config/default.json 不写 data 段；各实例由它自己的 default.json 或 OKHUMAN_DATA_DIR 指定。
+// Default 出厂默认（2026-09-14 易迁移：data 目录默认 $HOME/.okhuman；
+// 部署可用 config/default.json 或 OKHUMAN_DATA_DIR 环境变量覆盖）
 // KnownKeys 某配置段允许写的键（取自结构体的 json tag）。POST /config 用它拒绝打错字的键：
 // 未知键此前会被原样接受并落进 user.json，用户以为改了，其实什么都没生效
 // （2026-11-13 四方审计 E3）。别名（*_ms）在调用前已由 NormalizeTimeUnits 换算掉。
@@ -145,54 +143,6 @@ func KnownKeys(section string) map[string]bool {
 	return out
 }
 
-// KnownSections Config 允许的顶层段名（KnownKeys 的段级版，同口径：反射 Config 的 json tag）。
-func KnownSections() map[string]bool {
-	out := map[string]bool{}
-	rt := reflect.TypeOf(Config{})
-	for i := 0; i < rt.NumField(); i++ {
-		if n := jsonName(rt.Field(i).Tag.Get("json")); n != "" {
-			out[n] = true
-		}
-	}
-	return out
-}
-
-// reportUnknownKeys 补丁里不被识别的段/键清单——只报不改：未知键照旧被忽略、
-// 生效值回落默认，但必须留痕（"用户以为改了、其实没生效"不能静默；
-// POST /config 侧 2026-11-13 起拒未知键，文件路径 2026-11-16 补齐同款留痕）。
-// 必须在 NormalizeTimeUnits 之后调用：旧 *_ms 别名已换算，不会被误报。
-func reportUnknownKeys(patch map[string]interface{}) []string {
-	var notes []string
-	sections := KnownSections()
-	for _, section := range sortedKeys(patch) {
-		if !sections[section] {
-			notes = append(notes, fmt.Sprintf("未知配置段 %q（整段被忽略，生效值回落默认）", section))
-			continue
-		}
-		sec, ok := patch[section].(map[string]interface{})
-		if !ok {
-			continue // 段不是对象：类型不符由 applyMap 的报错覆盖
-		}
-		known := KnownKeys(section)
-		for _, k := range sortedKeys(sec) {
-			if !known[k] {
-				notes = append(notes, fmt.Sprintf("未知配置键 %s.%s（被忽略，生效值回落默认）", section, k))
-			}
-		}
-	}
-	return notes
-}
-
-// sortedKeys map 键排序：stderr 输出不依赖 map 遍历序（确定性）。
-func sortedKeys(m map[string]interface{}) []string {
-	ks := make([]string, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
-	}
-	sort.Strings(ks)
-	return ks
-}
-
 func jsonName(tag string) string {
 	if tag == "" || tag == "-" {
 		return ""
@@ -213,8 +163,8 @@ func Default() *Config {
 		LLM:          LLMCfg{BaseURL: "http://127.0.0.1:8080/v1", Model: "local", TimeoutSec: 300, StreamIdleSec: 120, MaxResponseBytes: 256 << 20},
 		SystemPrompt: SystemPromptCfg{Dir: "prompts"},
 		Data:         DataCfg{Dir: filepath.Join(home, ".okhuman")},
-		Context:      ContextCfg{MaxTokens: 150000, KeepRecentChars: 60000, HardTruncChars: 150000, StreamIdleSec: 90, CharsPerToken: 1.5, AttachmentTokens: 500, KeepSummaries: 1, SummaryMaxChars: 30000},
-		Tools:        ToolsCfg{FgTimeoutSec: 30, ResultLimit: 50000, TimeoutSec: 600},
+		Context:      ContextCfg{MaxTokens: 150000, KeepRecentChars: 60000, HardTruncChars: 150000, StreamIdleSec: 90, CharsPerToken: 1.5, AttachmentTokens: 500, KeepSummaries: 5, SummaryMaxChars: 30000},
+		Tools:        ToolsCfg{FgTimeoutSec: 30, ResultLimit: 10000, TimeoutSec: 600},
 		Doom:         DoomCfg{WarnAfter: 3},
 		Heartbeat:    HeartbeatCfg{Enabled: false, IntervalMin: 30, Prompt: DefaultHeartbeatPrompt},
 	}
@@ -228,11 +178,7 @@ func Load(root string) (*Config, error) {
 		p := filepath.Join(root, filepath.FromSlash(f))
 		data, err := os.ReadFile(p)
 		if err != nil {
-			if os.IsNotExist(err) {
-				continue // 文件不存在则跳过
-			}
-			fmt.Fprintf(os.Stderr, "[config] 读 %s 失败（跳过该文件，沿用现有配置）：%v\n", f, err)
-			continue
+			continue // 文件不存在则跳过
 		}
 		var patch map[string]interface{}
 		if err := json.Unmarshal(data, &patch); err != nil {
@@ -240,9 +186,6 @@ func Load(root string) (*Config, error) {
 		}
 		for _, n := range NormalizeTimeUnits(patch) {
 			fmt.Fprintf(os.Stderr, "[config] 单位迁移：%s\n", n)
-		}
-		for _, n := range reportUnknownKeys(patch) {
-			fmt.Fprintf(os.Stderr, "[config] %s：%s\n", f, n)
 		}
 		cfg = deepMergeConfig(cfg, patch)
 	}
@@ -323,40 +266,6 @@ func (h HeartbeatCfg) IntervalMinOrDefault() int {
 		return Default().Heartbeat.IntervalMin
 	}
 	return h.IntervalMin
-}
-
-// WarnAfterOrDefault 死循环告警阈值；未配或配成非正数时退回默认值。
-// 配成 0 时消费方直接拿去做计数会在持锁路径上踩空/自死锁（整个实例只能靠重启），
-// 取值必须过这里（2026-11-16 审查）。
-func (d DoomCfg) WarnAfterOrDefault() int {
-	if d.WarnAfter <= 0 {
-		return Default().Doom.WarnAfter
-	}
-	return d.WarnAfter
-}
-
-// ResultLimitOrDefault 工具结果回填上限：非正数或不高于 1000（含 1000，与 numChecks 的
-// n > 1000 正好互补：热更进不来的值，文件这条路也不会放行）退回默认。走文件这条路没有
-// 模型看到的每条工具结果都只剩「已截断…完整结果在 <路径>」，而每次调用照旧落一个全文文件。
-func (t ToolsCfg) ResultLimitOrDefault() int {
-	if t.ResultLimit <= 1000 {
-		return Default().Tools.ResultLimit
-	}
-	return t.ResultLimit
-}
-
-// FgTimeoutMSOrDefault 前台执行超时（毫秒）：非正数退回默认 30s，
-// 且不大于 timeout_sec（命令总时长上限）换算值——前台等待不可能长过命令总寿命。
-func (t ToolsCfg) FgTimeoutMSOrDefault() int {
-	fg := t.FgTimeoutSec
-	if fg <= 0 {
-		fg = Default().Tools.FgTimeoutSec
-	}
-	ms := fg * 1000
-	if t.TimeoutSec > 0 && ms > t.TimeoutSec*1000 {
-		ms = t.TimeoutSec * 1000
-	}
-	return ms
 }
 
 func parseInt(s string) (int, error) {
@@ -472,12 +381,7 @@ func cfgToMap(cfg *Config) map[string]interface{} {
 
 func applyMap(cfg *Config, m map[string]interface{}) {
 	data, _ := json.Marshal(m)
-	// 类型不符的键被 json 跳过、该字段回落默认值——必须报出来：静默忽略就是
-	// "用户以为改了、其实没生效"（与未知键同口径）。但一次 Unmarshal 只带回**第一条**类型错，
-	// 同一文件里写错两处时另一条仍会静默回落；报错串自带字段路径（如 llm.stream_idle_sec）。
-	if err := json.Unmarshal(data, cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "[config] 配置字段类型不符（该键被忽略，回落默认值）：%v\n", err)
-	}
+	_ = json.Unmarshal(data, cfg)
 }
 
 func deepMergeConfig(base *Config, patch map[string]interface{}) *Config {
@@ -492,8 +396,6 @@ func deepMergeConfig(base *Config, patch map[string]interface{}) *Config {
 // 旧条数键（keep_recent / t1_trigger / t1_batch / t2_trigger / char_limit）与
 // compress_thinking 已废弃；map 层清理在 Load/热更新路径完成（见 Patch 校验），
 // 此处仅兜底类型校验。
-// migrateContext 只在「读配置文件」这条路径上跑；POST /config 热更走 DeepMerge，同样的
-// 坏值靠 server 侧 numChecks 的取值范围挡。往这里加钳制，那边要同步加，否则坏值只能从热更进来。
 func migrateContext(ctx *ContextCfg) {
 	if ctx.MaxTokens <= 0 {
 		ctx.MaxTokens = Default().Context.MaxTokens

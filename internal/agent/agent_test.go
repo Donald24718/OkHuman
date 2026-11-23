@@ -21,6 +21,10 @@ func testRunOpt() RunOptions {
 		DoomWarnAfter: 3,
 		FgTimeoutMS:   30000,
 		Kind:          "user",
+		// 收笔判定默认关：旧行为（无工具调用即收笔）。开启后正文必须含停止指令，
+		// 多数既有夹具的第一步不带指令 → 会多一轮追问，请求数断言全得重算。
+		// 收笔判定专项测试用 testRunOptStop 显式开（fake 步骤耗尽会带停止指令收笔，
+		// 不会无限追问，见 llm/fake.go nextStep）。
 	}
 }
 

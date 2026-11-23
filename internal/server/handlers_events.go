@@ -148,10 +148,6 @@ func (ap *App) handleInject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dir := ap.injectDirOf()
-	// 会话管理器只取一次快照，本次注入全程写这个快照。**不持 RunLock**：RunLock 贯穿
-	// 整个 run（runq.go:305），持它会把「向正在跑的会话追加附件」排队到 run 结束——
-	// 而那正是这条接口的用途（WebUI 跑着发附件、微信送进来的附件都靠它）。
-	cm := a.CM()
 	// 先无锁扫描（2026-09-14 审计修：旧实现在 state.mu 内调 sessionHasInjectRef
 	// （取 cm.mu）→ 锁序 state.mu→cm.mu；而 compose 侧 resolve 失败回调是
 	// cm.mu→state.mu → 反向锁序，并发 /inject 与在飞 run 可死锁。现在扫描
@@ -163,7 +159,7 @@ func (ap *App) handleInject(w http.ResponseWriter, r *http.Request) {
 	// 回写快照会把别人刚加的那条抹掉（2026-11-13 第四轮 A2：16 路并发只剩 8 条）。
 	dropped := make(map[string]bool)
 	for _, x := range pending {
-		if ap.injectInFlight(x.ID) || sessionHasInjectRef(cm, x.ID) {
+		if ap.injectInFlight(x.ID) || sessionHasInjectRef(a.CM(), x.ID) {
 			continue
 		}
 		// 预算修复（2026-09-12 破案）：只清"会话里已无引用"的侧车（被压缩吃掉的附件留着就是永久占用）
@@ -181,7 +177,7 @@ func (ap *App) handleInject(w http.ResponseWriter, r *http.Request) {
 	overLimit := n > INJECT_MAX
 	ap.state.mu.Unlock()
 	if overLimit {
-		ap.state.logf("[inject] 活跃附件 %d 超软上限 %d（引用仍在会话，保留不清）", n, INJECT_MAX)
+		fmt.Fprintf(os.Stderr, "[inject] 活跃附件 %d 超软上限 %d（引用仍在会话，保留不清）\n", n, INJECT_MAX)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		writeJSON(w, 500, map[string]interface{}{"error": "inject 目录创建失败：" + err.Error()})
@@ -220,7 +216,7 @@ func (ap *App) handleInject(w http.ResponseWriter, r *http.Request) {
 	if notePtr != nil && *notePtr != "" {
 		label = *notePtr
 	}
-	cm.AddMessage(&types.RawEntry{
+	a.CM().AddMessage(&types.RawEntry{
 		Role: "user",
 		Content: []types.ContentPart{
 			types.TextPart("[okattach] " + label),
@@ -230,13 +226,5 @@ func (ap *App) handleInject(w http.ResponseWriter, r *http.Request) {
 	ap.state.mu.Lock()
 	delete(ap.state.injectInFlight, id) // 已进会话，之后按引用判据清扫
 	ap.state.mu.Unlock()
-	// 与 /reset 相撞只可能是它：它持 RunLock 换运行时三件套（server.go:105）。写完发现
-	// 快照被换掉，说明这条进不了新会话——回明确错误，不静默给 ok（侧车留着，下一次
-	// 注入会按「会话里无引用」把它清掉）。窗口就是它换三件套那几毫秒。
-	if a.CM() != cm {
-		ap.state.logf("[inject] %s 写入期间会话被 /reset 换代，未进入新会话", id)
-		writeJSON(w, 409, map[string]interface{}{"error": "会话在本次注入期间被重置，这条未进入新会话，请重发", "id": id})
-		return
-	}
 	writeJSON(w, 200, map[string]interface{}{"ok": true, "id": id})
 }

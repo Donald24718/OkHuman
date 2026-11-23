@@ -122,7 +122,7 @@ func TestParseIntRejectsTrailingGarbage(t *testing.T) {
 	}
 }
 
-// 我删 ApplyPatchInPlace 时把这条不变式的包内覆盖一起删了（ 复审指出）：经热更新提交的
+// 我删 ApplyPatchInPlace 时把这条不变式的包内覆盖一起删了（小邻指出）：经热更新提交的
 // 旧毫秒键必须过单位换算、且换算后不留 *_ms。活路径是 DeepMerge（server 的 /config 走它），
 // 端级别有 timeunit_test 覆盖，这里补函数级的一条，断言照搬原测试。
 func TestDeepMergeMigratesLegacyMsKeys(t *testing.T) {

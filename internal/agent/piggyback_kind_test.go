@@ -3,7 +3,7 @@ package agent
 // 轮内搭车的消息标记必须看 types.QueuedMessage.Kind，不能看正文前缀。
 // 旧实现是 strings.HasPrefix(m, bgNoticePrefix)：用户消息恰好以
 // "（系统通知：后台任务完成" 开头就被当成系统通知 → 丢掉【用户追加】标记
-// = 把用户的指令降级成系统事件；通知文案一改判定就静默失效。
+// = 把主人的指令降级成系统事件；通知文案一改判定就静默失效。
 import (
 	"context"
 	"strings"

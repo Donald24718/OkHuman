@@ -216,10 +216,10 @@ func toolBash(args map[string]interface{}) (string, error) {
 	// guard（2026-11-08）：只硬拦「可低成本换成更安全写法」的灾难形状，无逃生门
 	// ——不给 agent 留 --force 出口，要放开只能改 guard.go。语义上必须如此的（rsync --delete、
 	// git reset --hard、mkfs、dd、down -v）不在此列，见 guard.go 头注释与 fixture 测试。
-	blocked, sideNotes := guardCommand(command)
-	if blocked != nil {
+	if blocked, _ := guardCommand(command); blocked != nil {
 		return "", fmt.Errorf("bash 未执行（被 guard 拦下）\n%s", blocked.String())
 	}
+	guardNotes := guardNotes(command)
 
 	// 上限来自配置 tools.timeout_sec（2026-10-02；旧为硬编码 600）
 	limitSec := int(toolTimeoutMS.Load()) / 1000
@@ -292,8 +292,8 @@ func toolBash(args map[string]interface{}) (string, error) {
 		}
 	}
 	head := fmt.Sprintf("退出码: %d", code)
-	if len(sideNotes) > 0 { // 不拦，只把看不见的连带后果说出来（一次输出，不多一轮）
-		head = strings.Join(sideNotes, "\n") + "\n" + head
+	if len(guardNotes) > 0 { // 不拦，只把看不见的连带后果说出来（一次输出，不多一轮）
+		head = strings.Join(guardNotes, "\n") + "\n" + head
 	}
 	if timedOut {
 		// 光说"已超时"不够：模型分不清"命令自己失败"与"被上限杀掉"，会误判重试。

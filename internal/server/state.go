@@ -22,10 +22,16 @@ import (
 func (a *AgentState) CM() *ctxmgr.Manager { return a.rt.Load().CM }
 
 // Agent 当前 agent 运行时（/reset 后指向新实例）
+
+// Agent 当前 agent 运行时（/reset 后指向新实例）
 func (a *AgentState) Agent() *agent.Agent { return a.rt.Load().Agent }
 
 // BG 当前后台编排器（/reset 后指向新实例）
+
+// BG 当前后台编排器（/reset 后指向新实例）
 func (a *AgentState) BG() *background.BackgroundOrchestrator { return a.rt.Load().BG }
+
+// roundBuf 轮次事件缓冲（重放用）
 
 // roundBuf 轮次事件缓冲（重放用）
 type roundBuf struct {
@@ -86,6 +92,8 @@ type AgentState struct {
 	DoomLog        []DoomLogEntry
 }
 
+// Cfg 当前配置（COW 读：拿到的是不可变对象，无需再锁）
+
 // AppState 单实例服务状态
 type AppState struct {
 	Root      string // 项目根（webui 静态文件 / config/user.json 落盘用）
@@ -119,8 +127,12 @@ type AppState struct {
 	Log func(string)
 }
 
+// logf 落盘日志（Log 未注入时静默，不 panic）
+
 // Cfg 当前配置（COW 读：拿到的是不可变对象，无需再锁）
 func (a *AgentState) Cfg() *config.Config { return a.CfgRef.Load() }
+
+// CM 当前上下文管理器（/reset 后指向新会话）
 
 // CompressLogEntry 压缩日志条目（/status compress 字段）
 type CompressLogEntry struct {
@@ -149,7 +161,7 @@ type InjectInfo struct {
 }
 
 // NewAppState AppState 工厂（2026-08-31）：统一初始化事件广播集 + 消息队列 + 活动 drain + 轮次缓冲。
-// cfg 仅用于定位 inject 目录与启动抬序号（配置本体在 AgentState.CfgRef）。
+// cfg 参数保留兼容（配置统一存于 AgentState.CfgRef）。
 func NewAppState(cfg *config.Config, root string, agent *AgentState) *AppState {
 	st := &AppState{
 		Root:         root,
@@ -200,7 +212,9 @@ type agentRuntime struct {
 	BG    *background.BackgroundOrchestrator
 }
 
-// drainHandle 活动 drain 句柄（enqueueAndWake 返回；done 关闭即本轮结束）
+// AgentState 单个 agent 的全部运行时状态（单实例）
+
+// drainHandle 活动 drain 句柄（enqueueAndWake 返回；done 关闭即本轮结束））
 type drainHandle struct {
 	done chan struct{}
 }
@@ -269,3 +283,9 @@ func pushCompressLog(a *AgentState, e ctxmgr.CompressEvent) {
 	})
 	a.logMu.Unlock()
 }
+
+// ---------- run 入口（对应 TS runOpt / drainLoop / startDrain；Go 侧 2026-09-14 起为 runBatch / runDrain / enqueueAndWake） ----------
+
+// runOpt 本实例的 run 选项（用户消息 / 插件经 POST /enqueue 投递共用；每轮现取最新配置）
+
+// AppState 单实例服务状态

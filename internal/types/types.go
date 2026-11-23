@@ -244,6 +244,8 @@ type PendingBackgroundTask struct {
 	DurationMs int64
 	OK         bool
 	Result     string
+	// Notified settle 通知已入队（2026-09-14：与用户追加同一队列）
+	Notified bool
 }
 
 // BackgroundStartArgs 工具转后台时的回调参数

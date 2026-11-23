@@ -60,14 +60,11 @@ func promptDirFromArgs(args []string) (string, error) {
 }
 
 // resolvePromptDir 提示词目录优先级：命令行给的目录 > config 里的绝对目录 >
-// 相对目录按仓库根解析 > 没配目录就用内联兜底。
 // root + config 里的相对目录（旧布局：default 即项目根 prompts/）。
 func resolvePromptDir(argDir, root, cfgDir string) string {
 	switch {
 	case argDir != "":
 		return argDir
-	case cfgDir == "":
-		return "" // 没配目录就用内联兜底；Join(root, "") 会把仓库根下的 *.md 当提示词
 	case strings.HasPrefix(cfgDir, "/"):
 		return cfgDir
 	default:
@@ -91,7 +88,7 @@ func main() {
 	// 执行上限与注入给模型的描述文本同源生成——改配置即改模型看到的数字，
 	// 不再出现"配置可改、描述写死"的不一致。
 	// 配置以秒为单位（2026-10-18 单位统一）→ 内部仍按毫秒计时，这里换算一次
-	tools.Configure(cfg.Tools.FgTimeoutMSOrDefault(), cfg.Tools.TimeoutSec*1000)
+	tools.Configure(cfg.Tools.FgTimeoutSec*1000, cfg.Tools.TimeoutSec*1000)
 
 	// ---------- 可选提示词目录（命令行第一个非 flag 参数） ----------
 	// 指定则覆盖 cfg.system_prompt.dir（解析为绝对路径）；缺省用 config 里的相对目录。
@@ -272,7 +269,7 @@ func main() {
 	}
 	log(fmt.Sprintf("[OkHuman] http://%s:%d | LLM=%s | data=%s（%s 日志；%s 会话，实时落盘） | maxTokens=%d resultLimit=%d",
 		cfg.Server.Host, cfg.Server.Port, llmLabel, dataDir, persist.LogFile, persist.SessionFile,
-		cfg.Context.MaxTokens, cfg.Tools.ResultLimitOrDefault()))
+		cfg.Context.MaxTokens, cfg.Tools.ResultLimit))
 
 	// HTTP 服务启动（2026-08-29）：
 	// IdleTimeout 不设（=0 禁用）：Bun.serve 默认 idleTimeout=10s，SSE 流式聊天在

@@ -9,7 +9,7 @@ import (
 	"okhuman/internal/types"
 )
 
-// 会话快照写失败必须留痕（复审指出这条没有回归保护）。此前两处都是 `_ = p.SaveSession(...)`：
+// 会话快照写失败必须留痕（小邻指出这条没有回归保护）。此前两处都是 `_ = p.SaveSession(...)`：
 // 盘满或目录只读时会话再也不更新，日志里一个字都没有。
 func TestPersistSaveFailureIsLogged(t *testing.T) {
 	dir := t.TempDir()

@@ -1,6 +1,7 @@
 package context
 
 import (
+	"fmt"
 	"okhuman/internal/textutil"
 	"os"
 	"path/filepath"
@@ -139,14 +140,10 @@ func TestSummaryFilePairing(t *testing.T) {
 			joined += types.AsString(msg.Content) + "\n"
 		}
 	}
-	for _, want := range []string{SummaryMarker, "[本条覆盖的完整原文已存档：" + recPath} {
+	suffix := fmt.Sprintf("/%d ·", len(sess.Summaries)) // 表头形如 "[历史总结] 2/2 · 覆盖 seq …"
+	for _, want := range []string{"[本条覆盖的完整原文已存档：" + recPath, "[本条总结文本：" + sumPath, SummaryMarker + " ", suffix} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("注入的总结消息缺少 %q\n%s", want, joined)
-		}
-	}
-	for _, bad := range []string{"覆盖 seq", "[本条总结文本：", "含此前"} {
-		if strings.Contains(joined, bad) {
-			t.Fatalf("注入里不该带 %q：模型用不上，只会照着复述错（主人 2026-11-16）\n%s", bad, joined)
 		}
 	}
 	data, err := os.ReadFile(sumPath)

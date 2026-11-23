@@ -176,12 +176,8 @@ func (f *FakeLLM) CompleteStream(ctx context.Context, messages []types.Message, 
 	// 与 Complete 各记一次 → 破坏 Requests 长度断言（2026-09-01，压缩改流式后）。
 	if scope, ok := f.compressScope(messages); ok {
 		// 压缩请求也走流式：按脚本吐增量（OnDelta → 压缩事件流），响应仍由 Complete 出
-		// （Requests 仍只记一次，既有断言不破）。f.steps 与消费侧同口径持锁读
-		//（2026-11-16 审查：此处原先裸读，并发用 FakeLLM 时是数据竞争）。
-		f.mu.Lock()
-		step, ok2 := findCompressStep(f.steps, scope)
-		f.mu.Unlock()
-		if ok2 && onDelta != nil {
+		// （Requests 仍只记一次，既有断言不破）。
+		if step, ok2 := findCompressStep(f.steps, scope); ok2 && onDelta != nil {
 			for _, d := range step.Deltas {
 				onDelta(d)
 			}

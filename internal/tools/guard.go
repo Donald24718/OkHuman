@@ -70,14 +70,18 @@ var reLineCont = regexp.MustCompile(`\\\r?\n[ \t]*`)
 func guardCommand(command string) (blocked *guardFinding, notes []string) {
 	command = reLineCont.ReplaceAllString(command, " ")
 	command = stripMessageBodies(command) // 说明文字不是待执行的命令
+	seen := map[string]bool{}
 	var scan func(text string)
 	scan = func(text string) {
 		for _, line := range strings.Split(text, "\n") {
 			if reComment.MatchString(line) || strings.TrimSpace(line) == "" {
 				continue
 			}
-			if blocked == nil { // 第一条命中即止（旧 seen map 在这道门控下永远只收到第一条）
-				blocked = matchLine(line)
+			if f := matchLine(line); f != nil && blocked == nil {
+				if !seen[f.ID] {
+					seen[f.ID] = true
+					blocked = f
+				}
 			}
 		}
 	}
@@ -135,27 +139,6 @@ func forcePushRequested(cmd string) bool {
 	return false
 }
 
-// maskQuoted 把引号内的字符换成空格（长度与下标都不变）：需要「引号外的形状」才作数
-// 的判定（reTrunc）先过它一遍——引号里的 `> /path` 是要打印的文本，不是重定向。
-func maskQuoted(s string) string {
-	out := []byte(s)
-	var q byte
-	for i := 0; i < len(out); i++ {
-		c := out[i]
-		switch {
-		case q == 0 && (c == 0x27 || c == 0x22 || c == 0x60): // ' " ` 各自闭合
-			q = c
-		case c == 0x5c && q != 0x27: // 反斜杠跳过下一位（单引号内 bash 不认转义）
-			i++
-		case q != 0 && c == q:
-			q = 0
-		case q != 0:
-			out[i] = 0x20
-		}
-	}
-	return string(out)
-}
-
 func listedBefore(cmd, action string) bool {
 	i := strings.Index(cmd, action)
 	if i < 0 {
@@ -196,17 +179,15 @@ func matchLine(line string) *guardFinding {
 		return &guardFinding{ID: "git-push-force", Why: "`git push -f` 会覆盖别人已推的提交，远端不可回退",
 			Span: clip(t), Fix: `git push --force-with-lease（远端变了就拒绝，不覆盖）`}
 	}
-	// 重定向截断已存在的文件：> 一执行就先清空，失败时内容已经没了。
-	// 只看引号外的 >（遮引号不改长度，下面下标仍对得上原文）：echo "备份 > /x" 不拦。
-	uq := maskQuoted(t)
-	for _, m := range reTrunc.FindAllStringSubmatchIndex(uq, -1) {
-		p := uq[m[2]:m[3]]
+	// 重定向截断已存在的文件：> 一执行就先清空，失败时内容已经没了
+	for _, m := range reTrunc.FindAllStringSubmatchIndex(t, -1) {
+		p := t[m[2]:m[3]]
 		if strings.HasPrefix(p, "/dev/") {
 			continue
 		}
 		// 通配/花括号目标不判：reTrunc 的字符类停在元字符处，截下来的前缀会撞上另一个
 		// 已存在的同名文件（重定向到 "/tmp/a*.txt" 被按前缀 "/tmp/a" 拦下，2026-11-13 实测）。
-		if m[3] < len(uq) && strings.ContainsRune("*?[{", rune(uq[m[3]])) {
+		if m[3] < len(t) && strings.ContainsRune("*?[{", rune(t[m[3]])) {
 			continue
 		}
 		if st, err := os.Stat(p); err == nil && st.Mode().IsRegular() && st.Size() > 0 {
@@ -216,6 +197,9 @@ func matchLine(line string) *guardFinding {
 	}
 	return nil
 }
+
+// guardNotes：只算副作用预览（调用方已确认未被拦）。
+func guardNotes(command string) []string { return sideEffects(command) }
 
 // sideEffects 不拦，只把看不见的连带后果说出来（一次输出，不是多一轮）。
 // 本机真实需要过的一条：重启 user 单元会连带收走同 cgroup 里 agent 起的进程。
@@ -264,9 +248,8 @@ func cgroupProcs(cg string) []string {
 
 func clip(s string) string {
 	s = strings.TrimSpace(s)
-	r := []rune(s) // 按字节切会切在 rune 中间，提示语里就多一个乱码字符
-	if len(r) > 160 {
-		return string(r[:160]) + "…"
+	if len(s) > 160 {
+		return s[:160] + "…"
 	}
 	return s
 }

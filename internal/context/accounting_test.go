@@ -35,25 +35,26 @@ func TestEstMessageCharsIsTheOneRuler(t *testing.T) {
 // keep 窗口的边界：正好等于预算要继续收，超一个字符就停；且至少保留最新一条。
 func TestKeepWindowKeepsLatestWithinBudget(t *testing.T) {
 	mk := func(s string) types.RawEntry { return types.RawEntry{Role: "user", Content: s} }
-	newMgr := func(msgs []types.RawEntry) *Manager {
+	newMgr := func(keepChars int, msgs []types.RawEntry) *Manager {
 		m := &Manager{est: NewEst(1.0, 0), session: &types.SessionState{}}
+		m.cfg.KeepRecentChars = keepChars
 		m.session.Messages = msgs
 		return m
 	}
 	msgs := []types.RawEntry{mk("aaaa"), mk("bb"), mk("c")} // 从旧到新
-	if got, _ := newMgr(msgs).keepWindowLocked(1); got != 1 {
+	if got := newMgr(1, msgs).keepWindowLocked(); got != 1 {
 		t.Errorf("预算只够最新一条时应为 1，得 %d", got)
 	}
-	if got, _ := newMgr(msgs).keepWindowLocked(3); got != 2 { // "c"+"bb"=3 正好等于预算 → 收
+	if got := newMgr(3, msgs).keepWindowLocked(); got != 2 { // "c"+"bb"=3 正好等于预算 → 收
 		t.Errorf("累计正好等于预算时应继续收，得 %d", got)
 	}
-	if got, _ := newMgr(msgs).keepWindowLocked(2); got != 1 { // "c"+"bb"=3 > 2 → 停
+	if got := newMgr(2, msgs).keepWindowLocked(); got != 1 { // "c"+"bb"=3 > 2 → 停
 		t.Errorf("超预算一个字符即应停，得 %d", got)
 	}
-	if got, _ := newMgr(msgs).keepWindowLocked(99); got != 3 {
+	if got := newMgr(99, msgs).keepWindowLocked(); got != 3 {
 		t.Errorf("预算足够时应全部保留，得 %d", got)
 	}
-	if got, _ := newMgr(nil).keepWindowLocked(0); got != 0 {
+	if got := newMgr(0, nil).keepWindowLocked(); got != 0 {
 		t.Errorf("空会话应为 0，得 %d", got)
 	}
 }

@@ -409,7 +409,7 @@
 "use strict";
 /* ================= 全局状态 ================= */
 const $ = (id) => document.getElementById(id);
-// 单实例（2026-09-09 多 agent 移除）：一个聊天框 DOM + 流式状态 + 事件短轮询（/events/poll）。
+// 单实例（2026-09-09 多 agent 移除）：一个聊天框 DOM + 流式状态 + 常驻 /events 流。
 const state = { box: null, busy: false, seenRuns: [], stream: null, compressLive: new Map(), events: null };
 
 function getBox() {
@@ -445,7 +445,7 @@ async function restoreChatBox() {
     b.el.innerHTML = "";
     // 滚动总结（压缩后的历史，2026-09-07）：置顶一张可折叠卡片
     for (const [i, sm] of (j.summaries || []).entries()) {
-      const multi = (j.summaries || []).length > 1; const head = `🗜️ 历史总结${multi ? ` ${i + 1}/${(j.summaries || []).length}` : ""} · 覆盖 seq ${sm.seq_from}-${sm.seq_to} · ${new Date(sm.created_at).toISOString().slice(0, 16)} · ${sm.chars} 字符` +
+      const head = `🗜️ 历史总结 ${i + 1}/${(j.summaries || []).length} · seq ${sm.seq_from}-${sm.seq_to} · ${new Date(sm.created_at).toISOString().slice(0, 16)} · ${sm.chars} 字符` +
         (sm.truncated ? ` · ⚠️ 硬截断（原 ${sm.orig_chars}）` : "");
       const paths = [sm.summary_file && `总结文本：${sm.summary_file}`, sm.record_file && `完整原文：${sm.record_file}`].filter(Boolean).join("\n");
       const body = md(sm.content) + (paths ? `<br><br><code>${esc(paths)}</code>` : "");
@@ -949,7 +949,7 @@ function handleChatEvent(type, data) {
       break;
     case "compress": {
       compressLiveEnd(data.scope);
-      const badge = `${fmtBytes(data.before_chars)} → ${fmtBytes(data.after_chars)}${data.truncated ? " · ⚠正文超单条摘要上限已硬截断" : ""}`;
+      const badge = `${fmtBytes(data.before_chars)} → ${fmtBytes(data.after_chars)}${data.truncated ? ` · ⚠正文超 ${data.sum_window ? "" : ""}上限已硬截断` : ""}${data.forced ? " · ⚠强制截断" : ""}`;
       let body = "";
       if (data.thinking) body += `【压缩轮思考】\n${data.thinking}\n\n`;
       if (data.text) body += `【压缩后内容】\n${data.text}`;
@@ -1010,6 +1010,10 @@ function eventsFor() {
   if (state.events) return state.events;
   const h = {};
   const on = (name, fn) => { h[name] = (d) => { try { fn(d); } catch (e) { console.error("[events]", name, e); } }; };
+  on("hello", (d) => {
+    syncUi(d.running);
+    for (const it of queueItems(d)) isBgMsg(it) ? chatSysHtml(it.text, true) : chatUserHtml(it.text, true);
+  });
   on("enqueued", (d) => {
     if (d.running) {
       const b = getBox();
@@ -1090,7 +1094,7 @@ function eventsFor() {
 }
 
 /* 队列状态轮询（2s）：running 以服务端为准（含活动 drain，多轮间隙不闪），
- * 排队消息补显"排队中"气泡（漏掉 enqueued 帧的兜底，如刷新后）。事件驱动为主，轮询只做对齐。 */
+ * 排队消息补显"排队中"气泡（重连/hello 错过的兜底）。事件驱动为主，轮询只做对齐。 */
 let queueTimer = null;
 function refreshQueue() {
   api("/queue")
@@ -1195,13 +1199,9 @@ async function resetSession() {
   try {
     const j = await apiPost("/reset", {});
     // record 缺失 = 后端是旧版（不返回该字段），此时不说"未落盘"，免得谎报
-    // record_error/inject_error = 旧会话全文存档 / 接收目录清理失败（必须看得见）
-    let msg = `会话已重置 → #${j.session}`;
-    if (j.record_error) msg += `｜⚠旧会话全文存档失败：${j.record_error}`;
-    else if (j.record) msg += `｜旧会话全文：${j.record}`;
-    else if (j.record !== undefined) msg += `（空会话，未落盘）`;
-    if (j.inject_error) msg += `｜⚠接收目录清理失败：${j.inject_error}`;
-    toast(msg);
+    toast(j.record ? `会话已重置 → #${j.session}｜旧会话全文：${j.record}`
+      : (j.record === undefined ? `会话已重置 → #${j.session}`
+                                 : `会话已重置 → #${j.session}（空会话，未落盘）`));
     const b = state.box;
     if (b) { b.el.innerHTML = ""; b.loaded = false; b.session = j.session; }
     state.seenRuns = [];
@@ -1220,7 +1220,7 @@ async function loadStatus() {
   await getCtxLimit();
   $("stContext").innerHTML = `
     <div class="kv"><b>消息</b><span>${s.context.messages} 条（${fmtBytes(s.context.msg_chars)}）</span></div>
-    <div class="kv"><b>历史总结（单条，每次重写全场）</b><span>${s.context.summary_count || 0} / 1 条（正文合计 ${fmtBytes(s.context.summary_chars)}）${s.context.summary_truncated ? ` · 其中 ${s.context.summary_truncated} 条已硬截断（上限 ${s.context.summary_max_chars} 字符/条）` : ""}</span></div>
+    <div class="kv"><b>历史总结（窗口）</b><span>${s.context.summary_count || 0} / ${s.context.summary_limit ?? "-"} 条（正文合计 ${fmtBytes(s.context.summary_chars)}）${s.context.summary_truncated ? ` · 其中 ${s.context.summary_truncated} 条已硬截断（上限 ${s.context.summary_max_chars} 字符/条）` : ""}</span></div>
     ${(s.context.summaries || []).map(sm => `<div class="kv"><b>·</b><span class="mono" style="font-size:12px">seq ${sm.seq_from}-${sm.seq_to} · ${sm.chars} 字符${sm.truncated ? ` · ⚠硬截断（原 ${sm.orig_chars}）` : ""} · ${new Date(sm.created_at).toISOString().slice(0,16)} · 原文 ${esc(sm.record_file || "-")}</span></div>`).join("")}
     <div class="kv"><b>总 token（估算）</b><span class="mono">${s.context.total_tokens}${ctxLimitHint(s.context.total_tokens)}（消息 ${s.context.msg_tokens} + 总结 ${s.context.summary_tokens}）</span></div>
     <div class="kv"><b>上下文构成</b><span class="mono" style="font-size:12px">[summaries ×${s.context.summary_count || 0}] → [messages ×${s.context.messages}]</span></div>`;
@@ -1253,7 +1253,7 @@ async function loadStatus() {
   $("stCompress").innerHTML = s.compress.length
     ? s.compress.slice().reverse().map((e) => `<div style="padding:5px 0;border-bottom:1px solid rgba(42,52,68,.5);font-size:12.5px">
         <span class="tag" style="color:var(--purple)">${esc(e.scope)}</span> <span class="dim">${timeAgo(e.at)}</span>
-        <div style="font-size:12px">${esc(e.detail)} · <span class="mono">${fmtBytes(e.before)} → ${fmtBytes(e.after)} · ${e.window} 条${e.truncated ? " · ⚠硬截断" : ""}</span></div></div>`).join("")
+        <div style="font-size:12px">${esc(e.detail)} · <span class="mono">${fmtBytes(e.before)} → ${fmtBytes(e.after)} · ${e.rounds} 轮${e.forced ? " · ⚠强制截断" : ""}</span></div></div>`).join("")
     : '<div class="empty">暂无压缩记录</div>';
   $("stDoom").innerHTML = s.doom.length
     ? s.doom.slice().reverse().map((e) => `<div style="padding:5px 0;border-bottom:1px solid rgba(42,52,68,.5);font-size:12.5px">
@@ -1299,7 +1299,7 @@ async function pfOpen(name) {
 function pfNew() {
   const name = $("pfNewName").value.trim();
   if (!name) return toast("请填写文件名", true);
-  if (!/^[\w.\-]+$/.test(name) || name.startsWith(".") || name.includes("..")) return toast("文件名非法", true);
+  if (!/^[A-Za-z0-9_\-][A-Za-z0-9_\- .]*$/.test(name) || name.includes("..")) return toast("文件名非法", true);
   if (pfCurrent !== null && $("pfText").dataset.dirty === "1") {
     if (!confirm(`当前 "${pfCurrent}" 有未保存修改，放弃并新建？`)) return;
   }
@@ -1347,7 +1347,7 @@ const CFG_SCHEMA = [
     { key: "api_key", label: "api_key（可空）", type: "text" },
     { key: "timeout_sec", label: "timeout_sec：非流式请求整体超时（秒）", type: "number", note: "1–86400" },
     { key: "stream_idle_sec", label: "stream_idle_sec：主循环流式空闲超时（秒，连续这么久没有任何 wire 字节含 ping 帧 → 本轮报错收尾）", type: "number", note: "1–3600；此前主循环不可配，卡住会白挂 max(timeout,10 分钟)" },
-    { key: "max_response_bytes", label: "max_response_bytes：单次 LLM 响应总量上限（字节，超限本轮报错终止）", type: "number", note: "1024–4294967296；留空 = 不改这一项（0 非法，回内置 256MB 需直接改 config/user.json）。此前这一路无界——工具输出封顶 32MB、入站请求体封顶 256MB，唯独模型往回吐不设防，上游出 bug 疯狂吐内容会把内存吃光" },
+    { key: "max_response_bytes", label: "max_response_bytes：单次 LLM 响应总量上限（字节，超限本轮报错终止）", type: "number", note: "1024–4294967296；留空/0 用内置 268435456（256MB）。此前这一路无界——工具输出封顶 32MB、入站请求体封顶 256MB，唯独模型往回吐不设防，上游出 bug 疯狂吐内容会把内存吃光" },
   ]},
   { section: "context", title: "上下文压缩（总 token 超阈 → 压最旧一批为一条总结；总结按滑动窗口保留 N 条）", fields: [
     { key: "max_tokens", label: "max_tokens：总 token 估算超此值触发压缩（token = 字符 ÷ chars_per_token）", type: "number" },
@@ -1356,7 +1356,7 @@ const CFG_SCHEMA = [
     { key: "stream_idle_sec", label: "stream_idle_sec：压缩流空闲超时（秒，无 wire 字节含 ping 帧 → 重试）", type: "number", note: "1–3600" },
     { key: "chars_per_token", label: "chars_per_token：字符→token 估算比例（字符/token，中文≈1.57，英文≈4）", type: "number", step: 0.1 },
     { key: "attachment_tokens", label: "attachment_tokens：一个附件（图片/音频等非文本 part）按多少 token 计（直接按 token 记，0=不计；llama.cpp mtmd 下 1920×1080 原图实际约 2000）", type: "number" },
-    { key: "keep_summaries", label: "keep_summaries：已固定为 1（单条总结：每次把完整上下文含旧总结合并重写为一条）——保留仅为兼容旧 user.json，改它无效", type: "number", note: "固定 1" },
+    { key: "keep_summaries", label: "keep_summaries：上下文里保留几条历史总结（滑动窗口：超过就丢弃最旧一条，不做合并）", type: "number", note: "1–20" },
     { key: "summary_max_chars", label: "summary_max_chars：单条总结正文的硬上限（超出直接截断，并在上下文里提醒模型这条是硬截断的；压缩轮的思考不计入正文）", type: "number", note: "1000–200000" },
   ]},
   { section: "tools", title: "工具", fields: [
@@ -1456,6 +1456,7 @@ async function saveConfig() {
   });
   health();
   setInterval(health, 8000);
+  eventsFor(); // 常驻 /events 流（2026-08-31 方案A）：刷新/重开页面后续接
   startHb();   // 心跳倒计时常驻侧栏左下角（2026-10-18）：不按页开关
   startQueuePolling(); // /queue 2s 对齐
   await showBox(); // 页面加载 / 刷新后显示聊天框（含历史）

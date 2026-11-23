@@ -51,7 +51,7 @@ func TestResetReportsInjectCleanupFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 删除失败时计数**不能**归零：否则新会话的附件从 inj-1 重新编号，盖住删不掉的旧侧车。
-	// （变异检验：只断言 inject_error 时"无条件归零"也全绿 → 这半没有钉。）
+	// （小影 M7：只断言 inject_error 时"无条件归零"也全绿 → 这半没有钉。）
 	ap.state.mu.Lock()
 	seq := ap.state.InjectSeq
 	ap.state.mu.Unlock()

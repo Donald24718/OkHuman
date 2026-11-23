@@ -347,28 +347,16 @@ func (a *Agent) FormatBackgroundNotice(task *types.PendingBackgroundTask, opt Ru
 	}
 	status = fmt.Sprintf("%s（耗时 %ss）", status, durSec)
 	head := fmt.Sprintf("%s——你此前调用 %s 时前台等待超时，已转入后台继续执行，现%s。结果如下：\n", bgNoticePrefix, task.ToolName, status)
-	// head 也占额度：整条通知总长严格不超过 ResultLimit（口径见 truncateResult）
-	body, _ := a.truncateResult(opt, result, opt.ResultLimit-textutil.UTF16Len(head))
-	return head + body
-}
-
-// truncateResult 超长工具结果的统一口径（轮内回填与后台完成通知共用，2026-11-16）：
-// 全文落 <dataDir>/tool-results；回填正文 = 原文前若干字符 + 一句 log 路径提示，
-// 额度 = limit - len(说明) → 回填正文总长严格不超过 limit。此前两处各写一遍且口径
-// 不同：轮内是「留满 limit 再追加说明」（总长超 limit），后台通知是「从 limit 里扣」。
-// 返回（回填正文, 是否截断）。
-func (a *Agent) truncateResult(opt RunOptions, raw string, limit int) (string, bool) {
-	total := textutil.UTF16Len(raw)
-	if total <= limit {
-		return raw, false
+	if textutil.UTF16Len(result) > opt.ResultLimit {
+		logPath := a.writeToolLog(opt, result)
+		tail := fmt.Sprintf("\n[已截断：完整结果 %d 字符在 %s，用 bash 的 cat / grep / tail 查看。]", textutil.UTF16Len(result), logPath)
+		budget := opt.ResultLimit - textutil.UTF16Len(head) - textutil.UTF16Len(tail)
+		if budget < 0 {
+			budget = 0
+		}
+		return head + textutil.UTF16Slice(result, budget) + tail
 	}
-	logPath := a.writeToolLog(opt, raw)
-	tail := fmt.Sprintf("\n[已截断：完整结果 %d 字符在 %s，用 bash 的 cat / grep / tail 查看。]", total, logPath)
-	budget := limit - textutil.UTF16Len(tail)
-	if budget < 0 {
-		budget = 0
-	}
-	return textutil.UTF16Slice(raw, budget) + tail, true
+	return head + result
 }
 
 // toolLogSeq 工具结果文件名序号（2026-09-14 审计修：旧文件名仅秒精度，同一秒
@@ -550,18 +538,25 @@ func (a *Agent) runLoop(ctx context.Context, resp *types.Response, emit func(typ
 
 			emit(types.AgentEvent{"type": "tool_call", "name": tc.Function.Name, "args": args, "call_id": tc.ID})
 			execDone := make(chan types.ToolOutcome, 1)
-			startedAt := time.Now().UnixMilli() // 工具真实启动时刻（转后台后的耗时以此为起点）
 			go func() { execDone <- execToolSafe(tc.Function.Name, args) }()
 			// §7.3 前台赛跑：超时前完成 → 正常回填；超时 → 转后台，回填"已转后台"通知
 			select {
 			case outcome := <-execDone:
-				totalChars := textutil.UTF16Len(outcome.Text)
-				raw, truncated := a.truncateResult(opt, outcome.Text, opt.ResultLimit)
+				raw := outcome.Text
+				totalChars := textutil.UTF16Len(raw)
+				truncated := false
+				if totalChars > opt.ResultLimit {
+					// 截断：全文落 log 文件，正文留前 resultLimit 字符 + 一句 log 路径提示（模型用 bash 抓回）
+					logPath := a.writeToolLog(opt, raw)
+					truncated = true
+					raw = textutil.UTF16Slice(raw, opt.ResultLimit) + fmt.Sprintf("\n[已截断：完整结果 %d 字符在 %s，用 bash 的 cat / grep / tail 查看。]", totalChars, logPath)
+				}
 				a.cm.AddMessage(&types.RawEntry{Role: "tool", ToolCallID: &tc.ID, Content: raw})
-				// content = 回填给模型的内容（超长时 = 正文前若干字符 + log 路径提示，总长不超过 result_limit）
+				// content = 截断后 agent 实际回填给模型的内容（超长时 = 前 resultLimit 字符 + log 路径提示）
 				emit(types.AgentEvent{"type": "tool_result", "name": tc.Function.Name, "call_id": tc.ID, "truncated": truncated, "total_chars": totalChars, "content": raw})
 			case <-time.After(time.Duration(opt.FgTimeoutMS) * time.Millisecond):
-				// 转后台（不取消）：立即回填通知，模型不必傻等；耗时从上面记的 startedAt 起算
+				// 转后台（不取消）：立即回填通知，模型不必傻等
+				startedAt := time.Now().UnixMilli()
 				bgNotice := bgStartedNotice(opt.FgTimeoutMS / 1000)
 				a.cm.AddMessage(&types.RawEntry{Role: "tool", ToolCallID: &tc.ID, Content: bgNotice})
 				emit(types.AgentEvent{"type": "tool_result", "name": tc.Function.Name, "call_id": tc.ID, "truncated": false, "total_chars": 0, "backgrounded": true, "content": bgNotice})
@@ -708,7 +703,14 @@ func parseArgs(s string) map[string]interface{} {
 
 // stableKey 稳定序列化（Go map JSON 序列化自动键排序）→ 逐字符比较（§8 参数比较口径）
 func stableKey(name string, args map[string]interface{}) string {
-	// args 来自已解析的 JSON，marshal 不会失败；出错也只影响重复检测的签名，不值得分支。
-	b, _ := json.Marshal(args)
+	b, err := json.Marshal(args)
+	if err != nil {
+		return name + sJSON(args)
+	}
 	return name + string(b)
+}
+
+func sJSON(v interface{}) string {
+	b, _ := json.Marshal(v)
+	return string(b)
 }
